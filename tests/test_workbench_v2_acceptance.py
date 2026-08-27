@@ -538,6 +538,56 @@ def test_v2_mutations_emit_audit_and_matter_events(client: TestClient) -> None:
     assert json.loads(event["payload_json"])["after"] == "completed"
 
 
+def test_work_package_apply_rolls_back_when_audit_write_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login(client)
+    matter = seed_matter(client, matter_id="matter-package-audit-rollback")
+    generated = client.post(f"/api/matters/{matter['id']}/work-package/generate")
+    package = package_body(generated)
+    updated = client.patch(
+        f"/api/matters/{matter['id']}/work-package",
+        json={"draft": work_package_draft(), "expected_updated_at": package["updated_at"]},
+    )
+    updated_package = package_body(updated)
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    monkeypatch.setattr(client.app.state.database, "audit", fail_audit)
+    with pytest.raises(RuntimeError, match="synthetic audit failure"):
+        client.app.state.service.apply_work_package(
+            matter["id"], [0], updated_package["updated_at"], "合成测试"
+        )
+
+    assert child_snapshot(client, matter["id"])["actions"] == []
+    stored = client.app.state.database.fetch_one(
+        "SELECT status FROM work_packages WHERE matter_id = ?", (matter["id"],)
+    )
+    assert stored == {"status": "draft"}
+
+
+def test_close_rolls_back_when_audit_write_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login(client)
+    matter = seed_matter(client, matter_id="matter-close-audit-rollback")
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    monkeypatch.setattr(client.app.state.database, "audit", fail_audit)
+    with pytest.raises(RuntimeError, match="synthetic audit failure"):
+        client.app.state.service.close_matter(
+            matter["id"], "合成测试收尾说明", matter["updated_at"], "合成测试"
+        )
+
+    stored = client.app.state.database.fetch_one(
+        "SELECT status FROM matters WHERE id = ?", (matter["id"],)
+    )
+    assert stored == {"status": "active"}
+
+
 def test_action_and_reminder_human_edits_are_audited_and_conflict_safe(
     client: TestClient,
 ) -> None:

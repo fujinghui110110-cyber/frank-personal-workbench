@@ -4,7 +4,7 @@ const SHELL = [
   "/static/index.html",
   "/static/app.css?v=72",
   "/static/app.js?v=72",
-  "/manifest.webmanifest?v=29",
+  "/manifest.webmanifest?v=72",
 ];
 
 self.addEventListener("install", (event) => {

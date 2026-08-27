@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,7 @@ def test_direct_work_email_preserves_original_material(client: TestClient) -> No
     assert response.status_code == 200, response.text
     saved = response.json()
     assert saved["material_id"]
+    assert client.get(f"/api/matters/{saved['matter_id']}").json()["status"] == "needs_decision"
     material = client.app.state.database.fetch_one(
         "SELECT matter_id, text_note, status FROM materials WHERE id = ?",
         (saved["material_id"],),
@@ -119,11 +121,15 @@ def test_direct_work_email_preserves_original_material(client: TestClient) -> No
         "text_note": payload["source_text"],
         "status": "processed",
     }
-    action = client.app.state.database.fetch_one(
-        "SELECT material_id FROM actions WHERE created_by = ?",
-        (f"email:{saved['id']}",),
+    suggestion = client.app.state.database.fetch_one(
+        "SELECT material_id, kind, status FROM review_items WHERE material_id = ?",
+        (saved["material_id"],),
     )
-    assert action == {"material_id": saved["material_id"]}
+    assert suggestion == {
+        "material_id": saved["material_id"],
+        "kind": "action_suggestion",
+        "status": "pending",
+    }
 
 
 def test_email_sync_filters_nonwork_and_merges_open_thread(client: TestClient) -> None:
@@ -177,7 +183,8 @@ def test_email_sync_filters_nonwork_and_merges_open_thread(client: TestClient) -
 
     email_matters = client.get("/api/email/matters").json()
     assert len(email_matters) == 1
-    assert email_matters[0]["open_action_count"] == 2
+    assert email_matters[0]["open_action_count"] == 0
+    assert email_matters[0]["pending_review_count"] == 2
 
     finished = client.post(
         f"/api/email/sync/{claimed['id']}/finish",
@@ -246,7 +253,7 @@ def test_pending_email_waits_for_manual_analysis_and_creates_work(client: TestCl
     assert client.get("/api/analysis/status").json()["pending"] == 0
 
 
-def test_irrelevant_email_analysis_erases_content_and_attachment(
+def test_irrelevant_email_analysis_preserves_content_and_attachment(
     client: TestClient, tmp_path: Path
 ) -> None:
     owner_login(client)
@@ -280,12 +287,14 @@ def test_irrelevant_email_analysis_erases_content_and_attachment(
     )
     assert completed.status_code == 200, completed.text
     assert completed.json()["status"] == "ignored"
-    assert not attachment.exists()
+    assert attachment.exists()
     material = client.app.state.database.fetch_one(
         "SELECT text_note, size, metadata_json FROM materials WHERE id = ?",
         (pending["material_id"],),
     )
-    assert material == {"text_note": "", "size": 0, "metadata_json": "{}"}
+    assert material["text_note"] == pending_message(21)["source_text"]
+    assert material["size"] > 0
+    assert str(attachment) in material["metadata_json"]
 
 
 def test_forwarding_metadata_is_removed_from_email_work(client: TestClient) -> None:
@@ -318,8 +327,15 @@ def test_forwarding_metadata_is_removed_from_email_work(client: TestClient) -> N
     matter = client.get(f"/api/matters/{saved['matter_id']}").json()
     assert matter["title"] == "【重要】成本费用投入案例收集的说明"
     assert matter["summary"] == "要求8月25日前提交案例。"
-    assert matter["actions"][0]["title"] == "提交成本投入案例"
-    assert matter["actions"][0]["detail"] == "截止8月25日。"
+    assert matter["actions"] == []
+    suggestion = client.app.state.database.fetch_one(
+        "SELECT title, payload_json FROM review_items WHERE matter_id = ?",
+        (saved["matter_id"],),
+    )
+    assert suggestion["title"] == "建议行动：提交成本投入案例"
+    suggestion_payload = json.loads(suggestion["payload_json"])
+    assert suggestion_payload["title"] == "提交成本投入案例"
+    assert suggestion_payload["detail"] == "截止8月25日。"
 
     static_js = (Path(__file__).parents[1] / "app/static/app.js").read_text(
         encoding="utf-8"
@@ -337,8 +353,11 @@ def test_completed_matter_is_not_reused_and_false_positive_closes_action(
         "/api/email/messages", json=message(10, work=True), headers=worker_headers()
     ).json()
     matter = client.get(f"/api/matters/{first['matter_id']}").json()
-    for action in matter["actions"]:
-        response = client.post(f"/api/actions/{action['id']}/resolve", json={"status": "done"})
+    for review in matter["reviews"]:
+        response = client.post(
+            f"/api/reviews/{review['id']}/resolve",
+            json={"resolution": "rejected", "note": "合成测试：无需形成正式行动"},
+        )
         assert response.status_code == 200, response.text
     ready = client.get(f"/api/matters/{first['matter_id']}/close-preview").json()
     assert ready["can_close"] is True
@@ -365,7 +384,8 @@ def test_completed_matter_is_not_reused_and_false_positive_closes_action(
     assert ignored.status_code == 200, ignored.text
     assert ignored.json()["status"] == "ignored"
     later_matter = client.get(f"/api/matters/{later_saved['matter_id']}").json()
-    assert all(action["status"] == "dismissed" for action in later_matter["actions"])
+    assert later_matter["actions"] == []
+    assert all(review["status"] == "dismissed" for review in later_matter["reviews"])
 
 
 def test_stale_email_sync_is_reclaimed(client: TestClient) -> None:
@@ -437,7 +457,8 @@ def test_ignored_email_can_be_restored(client: TestClient) -> None:
     assert restored.status_code == 200, restored.text
     assert restored.json()["status"] == "active"
     matter = client.get(f"/api/matters/{saved['matter_id']}").json()
-    assert any(action["status"] == "open" for action in matter["actions"])
+    assert matter["actions"] == []
+    assert any(review["status"] == "pending" for review in matter["reviews"])
 
 
 def test_frontend_exposes_failure_review_and_email_undo() -> None:

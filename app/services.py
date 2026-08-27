@@ -1628,28 +1628,28 @@ class WorkbenchService:
         )
         if not material:
             raise RuntimeError("任务材料不存在")
-        matter_id = result.get("matter_id") or material["matter_id"]
-        if matter_id and not self.database.fetch_one(
-            "SELECT id FROM matters WHERE id = ?", (matter_id,)
-        ):
-            raise KeyError("事项不存在")
+        matter_id = material["matter_id"]
         facts = result.get("facts", [])
         for fact in facts:
             if not fact.get("source_locator"):
                 raise ValueError("财务事实必须提供原文定位")
         self.reserve_job_result(job_id, worker_id, lease_token)
-        matter_id = result.get("matter_id") or material["matter_id"]
         if matter_id:
             matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
             if not matter:
                 raise KeyError("事项不存在")
         else:
             matter = self.create_matter(
-                result.get("matter_title") or material["filename"] or "待归并事项",
+                result.get("matter_title") or material["filename"] or "待确认事项建议",
                 worker_id,
                 result.get("summary", ""),
             )
             matter_id = matter["id"]
+            with self.database.connect() as connection:
+                connection.execute(
+                    "UPDATE matters SET status = 'needs_decision' WHERE id = ?",
+                    (matter_id,),
+                )
 
         inferences = result.get("inferences", [])
         actions = result.get("actions", [])
@@ -2453,28 +2453,55 @@ class WorkbenchService:
             )
             if updated.rowcount != 1:
                 raise StaleWriteError("工作包已被更新，请刷新后再应用")
-        for action in created:
-            payload = {"work_package_id": package["id"], "step_index": action["step_index"]}
+            for action in created:
+                payload = {
+                    "work_package_id": package["id"],
+                    "step_index": action["step_index"],
+                }
+                self.database.audit(
+                    new_id("audit"),
+                    actor,
+                    "action.created",
+                    "action",
+                    action["id"],
+                    matter_id,
+                    payload,
+                    connection=connection,
+                )
+                self.record_matter_event(
+                    matter_id,
+                    "action.created",
+                    actor,
+                    "action",
+                    action["id"],
+                    f"已从工作包创建行动：{action['title']}",
+                    payload,
+                    connection=connection,
+                )
+            payload = {
+                "selected_step_indexes": indexes,
+                "created_action_ids": [action["id"] for action in created],
+            }
             self.database.audit(
-                new_id("audit"), actor, "action.created", "action", action["id"], matter_id,
+                new_id("audit"),
+                actor,
+                "work_package.applied",
+                "work_package",
+                package["id"],
+                matter_id,
                 payload,
+                connection=connection,
             )
             self.record_matter_event(
-                matter_id, "action.created", actor, "action", action["id"],
-                f"已从工作包创建行动：{action['title']}", payload,
+                matter_id,
+                "work_package.applied",
+                actor,
+                "work_package",
+                package["id"],
+                "事项工作包已应用",
+                payload,
+                connection=connection,
             )
-        payload = {
-            "selected_step_indexes": indexes,
-            "created_action_ids": [action["id"] for action in created],
-        }
-        self.database.audit(
-            new_id("audit"), actor, "work_package.applied", "work_package", package["id"],
-            matter_id, payload,
-        )
-        self.record_matter_event(
-            matter_id, "work_package.applied", actor, "work_package", package["id"],
-            "事项工作包已应用", payload,
-        )
         result = self.get_work_package(matter_id)
         if not result:
             raise RuntimeError("工作包应用失败")
@@ -2585,96 +2612,6 @@ class WorkbenchService:
         if not updated:
             raise RuntimeError("事项更新失败")
         return updated
-        if "status" in changes:
-            status = changes.get("status")
-            if status not in {"active", "completed"}:
-                raise ValueError("事项状态只能是 active 或 completed")
-            now = utc_now()
-            with self.database.connect() as connection:
-                if status == "completed":
-                    connection.execute(
-                        "UPDATE actions SET status = 'done', flow_state = 'completed', "
-                        "completion_evidence = CASE WHEN TRIM(COALESCE(completion_evidence, '')) = '' "
-                        "THEN '事项由用户直接标记完成' ELSE completion_evidence END, updated_at = ? "
-                        "WHERE matter_id = ? AND status = 'open'",
-                        (now, matter_id),
-                    )
-                    connection.execute(
-                        "UPDATE reminders SET status = 'done', updated_at = ? "
-                        "WHERE matter_id = ? AND status NOT IN ('done', 'dismissed')",
-                        (now, matter_id),
-                    )
-                connection.execute(
-                    "UPDATE review_items SET status = 'dismissed', resolved_at = ? "
-                    "WHERE matter_id = ? AND status = 'pending'",
-                    (now, matter_id),
-                )
-                connection.execute(
-                    "UPDATE action_assignees SET status = 'superseded', updated_at = ? "
-                    "WHERE status = 'pending' AND action_id IN "
-                    "(SELECT id FROM actions WHERE matter_id = ?)",
-                    (now, matter_id),
-                )
-                connection.execute(
-                    "UPDATE matters SET status = ?, status_override = 1, updated_at = ? WHERE id = ?",
-                    (status, now, matter_id),
-                )
-            payload = {"before": matter.get("status"), "after": status}
-            self.database.audit(
-                new_id("audit"),
-                actor,
-                "matter.status.updated",
-                "matter",
-                matter_id,
-                matter_id,
-                payload,
-            )
-            self.record_matter_event(
-                matter_id,
-                "matter.status.updated",
-                actor,
-                "matter",
-                matter_id,
-                "事项已标记为已完成" if status == "completed" else "事项已重新打开",
-                payload,
-            )
-        if "target_date" not in changes:
-            if "status" in changes:
-                updated = self.get_matter(matter_id)
-                if not updated:
-                    raise RuntimeError("事项更新失败")
-                return updated
-            raise ValueError("请提供事项状态或要求闭环日期")
-        target_date = changes.get("target_date") or None
-        if target_date:
-            try:
-                date.fromisoformat(str(target_date))
-            except ValueError as exc:
-                raise ValueError("要求闭环日期格式不正确") from exc
-        now = utc_now()
-        with self.database.connect() as connection:
-            connection.execute(
-                "UPDATE matters SET target_date = ?, updated_at = ? WHERE id = ?",
-                (target_date, now, matter_id),
-            )
-        payload = {"before": matter.get("target_date"), "after": target_date}
-        self.database.audit(
-            new_id("audit"), actor, "matter.target_date.updated", "matter", matter_id,
-            matter_id, payload,
-        )
-        self.record_matter_event(
-            matter_id,
-            "matter.target_date.updated",
-            actor,
-            "matter",
-            matter_id,
-            "要求闭环日期已调整" if target_date else "已清除要求闭环日期",
-            payload,
-        )
-        updated = self.get_matter(matter_id)
-        if not updated:
-            raise RuntimeError("事项更新失败")
-        return updated
 
     def close_preview(self, matter_id: str) -> dict[str, Any]:
         matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
@@ -2746,6 +2683,11 @@ class WorkbenchService:
         if not preview["can_close"]:
             raise ValueError("仍有未处理的行动、提醒、待确认项或后台任务")
         now = utc_now()
+        payload = {
+            "before": matter["status"],
+            "after": "completed",
+            "completion_note": note,
+        }
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             locked_row = connection.execute(
@@ -2766,29 +2708,26 @@ class WorkbenchService:
             )
             if updated.rowcount != 1:
                 raise StaleWriteError("事项已被更新，请重新执行收尾检查")
-        payload = {
-            "before": matter["status"],
-            "after": "completed",
-            "completion_note": note,
-        }
-        self.database.audit(
-            new_id("audit"),
-            actor,
-            "matter.closed",
-            "matter",
-            matter_id,
-            matter_id,
-            payload,
-        )
-        self.record_matter_event(
-            matter_id,
-            "matter.closed",
-            actor,
-            "matter",
-            matter_id,
-            "事项已完成收尾检查并关闭",
-            payload,
-        )
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "matter.closed",
+                "matter",
+                matter_id,
+                matter_id,
+                payload,
+                connection=connection,
+            )
+            self.record_matter_event(
+                matter_id,
+                "matter.closed",
+                actor,
+                "matter",
+                matter_id,
+                "事项已完成收尾检查并关闭",
+                payload,
+                connection=connection,
+            )
         closed = self.get_matter(matter_id)
         if not closed:
             raise RuntimeError("事项关闭失败")

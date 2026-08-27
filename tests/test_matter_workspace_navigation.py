@@ -7,6 +7,8 @@ STATIC = Path(__file__).parents[1] / "app" / "static"
 def test_matter_workspace_has_a_clear_ledger_and_detail_history() -> None:
     script = (STATIC / "app.js").read_text(encoding="utf-8")
     index = (STATIC / "index.html").read_text(encoding="utf-8")
+    manifest = (STATIC / "manifest.webmanifest").read_text(encoding="utf-8")
+    service_worker = (STATIC / "sw.js").read_text(encoding="utf-8")
 
     assert "全部推进事项" in script
     assert "当前需要推进" in script
@@ -24,6 +26,10 @@ def test_matter_workspace_has_a_clear_ledger_and_detail_history() -> None:
     assert script.index('window.location.hash === "#/today"') < script.index("const route = routeFromHash()")
     assert 'route.name === "matters" ? "新增材料" : "交给贾维斯"' in script
     assert 'label = "修改信息"' in script
+    assert '"start_url": "/#/matters"' in manifest
+    assert 'frank-personal-workbench-shell-v72' in service_worker
+    assert '/manifest.webmanifest?v=72' in index
+    assert '/manifest.webmanifest?v=72' in service_worker
 
 
 def test_intake_returns_to_the_current_workspace() -> None:

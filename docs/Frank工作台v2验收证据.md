@@ -1,6 +1,6 @@
 # Frank 工作台 v2 验收证据
 
-最后核对：2026-08-28 01:05（Asia/Shanghai）
+最后核对：2026-08-28 01:47（Asia/Shanghai）
 
 ## 验收结论
 
@@ -25,7 +25,7 @@
 
 ## 自动验证
 
-- `.venv/bin/pytest -p no:cacheprovider -q`：203 项测试全部通过。
+- `.venv/bin/pytest -q`：207 项测试全部通过。
 - `.venv/bin/python -m py_compile app/services.py`：通过。
 - `node --check app/static/app.js`：通过。
 - `node --check app/static/sw.js`：通过。
@@ -38,7 +38,7 @@
 - 实际结果：地址与界面均直接进入 `#/matters`；左侧显示全部 47 项进行中事项，右侧显示当前事项办理内容。
 - 切换事项：点击另一事项后，URL 更新为 `#/matters/{id}`，左侧完整清单、分组与滚动位置保留，右侧更新为新事项。
 - 控制台：无脚本错误；仅有登录表单缺少 username 字段的浏览器建议，不影响运行。
-- 截图：`/private/tmp/frank-workbench-v72-final.png`。
+- 截图：`/private/tmp/frank-workbench-live.png`、`/private/tmp/frank-workbench-switch.png`。
 - 按 Frank 最新要求，本轮不做手机端验收。
 
 ## 数据安全与备份

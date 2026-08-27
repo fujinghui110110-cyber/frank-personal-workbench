@@ -38,7 +38,7 @@ MCP_SCOPES = frozenset(
         "materials:read",
         "matters:read",
         "reminders:read",
-        "reminders:write",
+        "work_packages:write",
         "nodes:write",
         "wechat:read",
         "wechat:write",

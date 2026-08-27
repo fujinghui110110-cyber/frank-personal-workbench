@@ -503,7 +503,6 @@ class WechatService:
         ).replace("+00:00", "Z")
         ignored = 0
         merged = 0
-        keeper_ids: list[str] = []
         with self.database.connect() as connection:
             rows = connection.execute(
                 "SELECT x.*, m.text_note FROM wechat_candidates x "
@@ -563,16 +562,7 @@ class WechatService:
                     merged += 1
                 else:
                     keepers.append(row)
-            keeper_ids = [str(row["id"]) for row in keepers]
-        continued = 0
-        for candidate_id in keeper_ids:
-            candidate = self.database.fetch_one(
-                "SELECT * FROM wechat_candidates WHERE id = ? AND status = 'pending'",
-                (candidate_id,),
-            )
-            if candidate and self._auto_continue_open_matter(candidate, "jarvis-batch"):
-                continued += 1
-        return {"ignored": ignored, "merged": merged, "continued": continued}
+        return {"ignored": ignored, "merged": merged, "continued": 0}
 
     def request_sync(
         self,
@@ -1083,25 +1073,6 @@ class WechatService:
             "error = NULL, updated_at = excluded.updated_at",
             (account_fingerprint, session_id, source, sort_seq, create_time, local_id, now, now),
         )
-
-    def _auto_continue_open_matter(
-        self, candidate: dict[str, Any], actor: str
-    ) -> dict[str, Any] | None:
-        if candidate.get("classification") != "relevant":
-            return None
-        try:
-            confidence = float(candidate.get("confidence") or 0)
-        except (TypeError, ValueError):
-            confidence = 0
-        if confidence < 0.9 or candidate.get("uncertainty_reason"):
-            return None
-        extracted = _json(candidate.get("extracted_json"), {})
-        if extracted.get("conflict") or extracted.get("conflicts"):
-            return None
-        matter_id = self._find_open_matter(candidate, require_unique=True)
-        if not matter_id:
-            return None
-        return self.resolve_candidate(candidate["id"], "accept", actor, matter_id)
 
     def complete_classification(
         self,

@@ -466,7 +466,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/matters/{matter_id}/work-package/generate")
     def generate_work_package(
         matter_id: str,
-        context: AuthContext = Depends(require_scope("reminders:write")),
+        context: AuthContext = Depends(require_scope("work_packages:write")),
     ) -> dict[str, Any]:
         return service.generate_work_package(matter_id, context.actor)
 
@@ -474,7 +474,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_work_package(
         matter_id: str,
         payload: WorkPackageUpdateRequest,
-        context: AuthContext = Depends(require_scope("reminders:write")),
+        context: AuthContext = Depends(require_scope("work_packages:write")),
     ) -> dict[str, Any]:
         return service.update_work_package(
             matter_id,
@@ -550,14 +550,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def resolve_review(
         review_id: str,
         payload: ReviewResolveRequest,
-        context: AuthContext = Depends(auth_context),
+        context: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, Any]:
         return service.resolve_review(review_id, payload.resolution, payload.note, context.actor)
 
     @app.post("/api/review-queue/resolve")
     def resolve_review_queue(
         payload: ReviewQueueResolveRequest,
-        context: AuthContext = Depends(auth_context),
+        context: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, Any]:
         review_ids = payload.review_ids or [payload.review_id or payload.item_id]
         review_ids = [review_id for review_id in review_ids if review_id]
@@ -633,7 +633,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_learning_rule(
         rule_id: str,
         payload: LearningRuleUpdateRequest,
-        context: AuthContext = Depends(auth_context),
+        context: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, Any]:
         return service.update_learning_rule(rule_id, payload.enabled, context.actor)
 

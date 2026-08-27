@@ -33,6 +33,47 @@ def worker_headers() -> dict[str, str]:
     return {"Authorization": "Bearer worker-token"}
 
 
+def mcp_headers() -> dict[str, str]:
+    return {"Authorization": "Bearer mcp-token"}
+
+
+def test_mcp_can_prepare_work_package_but_cannot_change_business_state(
+    client: TestClient,
+) -> None:
+    matter = client.app.state.service.create_matter("合成权限边界事项", "仅用于权限测试")
+
+    generated = client.post(
+        f"/api/matters/{matter['id']}/work-package/generate",
+        headers=mcp_headers(),
+    )
+    assert generated.status_code == 200, generated.text
+
+    forbidden_requests = [
+        client.post(
+            f"/api/matters/{matter['id']}/work-package/apply",
+            json={"step_indexes": [0]},
+            headers=mcp_headers(),
+        ),
+        client.post(
+            f"/api/matters/{matter['id']}/close",
+            json={"completion_note": "不应由 MCP 关闭"},
+            headers=mcp_headers(),
+        ),
+        client.post(
+            "/api/actions/synthetic-action/resolve",
+            json={"status": "done"},
+            headers=mcp_headers(),
+        ),
+        client.post(
+            "/api/reviews/synthetic-review/resolve",
+            json={"resolution": "accepted", "note": ""},
+            headers=mcp_headers(),
+        ),
+    ]
+
+    assert [response.status_code for response in forbidden_requests] == [403, 403, 403, 403]
+
+
 def start_analysis(client: TestClient) -> dict:
     received = client.post(
         "/api/intake",

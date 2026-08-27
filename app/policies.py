@@ -169,11 +169,6 @@ class PolicyService:
                     now,
                 ),
             )
-        if change_type == "evidence" and matched_policy_id and confidence >= 0.85 and is_authority:
-            try:
-                return self.resolve_candidate(candidate_id, "apply", "贾维斯", matched_policy_id, auto=True)
-            except OSError as error:
-                self.record_sync_error(candidate_id, error)
         return self.get_candidate(candidate_id)
 
     def _matched_policy_id(

@@ -50,6 +50,12 @@ def complete_result(
         headers={"Idempotency-Key": key},
     )
     assert received.status_code == 201, received.text
+    if result.get("matter_id"):
+        assigned = client.post(
+            f"/api/materials/{received.json()['material']['id']}/assign",
+            json={"matter_id": result["matter_id"]},
+        )
+        assert assigned.status_code == 200, assigned.text
     released = client.post("/api/analysis/run")
     assert released.status_code == 200, released.text
     claimed = client.post(
@@ -73,6 +79,72 @@ def complete_result(
     )
     assert completed.status_code == 200, completed.text
     return completed.json()
+
+
+def test_ai_result_cannot_reassign_unbound_material_or_create_actions(
+    client: TestClient,
+) -> None:
+    login(client)
+    existing = client.app.state.service.create_matter(
+        "既有事项",
+        "test",
+        "不得由 AI 自动归属",
+    )
+    received = client.post(
+        "/api/intake",
+        data={"source_type": "text", "text_note": "一条尚未人工归属的新材料"},
+        headers={"Idempotency-Key": "ai-matter-boundary"},
+    )
+    assert received.status_code == 201, received.text
+    material_id = received.json()["material"]["id"]
+
+    assert client.post("/api/analysis/run").status_code == 200
+    claimed = client.post(
+        "/api/jobs/claim",
+        json={"worker_id": "ai-matter-boundary"},
+        headers=worker_headers(),
+    )
+    job = claimed.json()["job"]
+    lease = {
+        "worker_id": "ai-matter-boundary",
+        "lease_token": job["lease_token"],
+    }
+    assert client.post(f"/api/jobs/{job['id']}/start", json=lease).status_code == 200
+    completed = client.post(
+        f"/api/jobs/{job['id']}/complete",
+        json={
+            **lease,
+            "result": {
+                "matter_id": existing["id"],
+                "matter_title": "AI 建议的新事项",
+                "summary": "仅作为待确认事项草稿",
+                "facts": [],
+                "inferences": [],
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "AI 建议动作",
+                        "detail": "不得直接创建正式行动",
+                    }
+                ],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert completed.status_code == 200, completed.text
+
+    material = client.app.state.database.fetch_one(
+        "SELECT matter_id FROM materials WHERE id = ?",
+        (material_id,),
+    )
+    assert material["matter_id"] != existing["id"]
+    drafted = client.get(f"/api/matters/{material['matter_id']}").json()
+    assert drafted["status"] == "needs_decision"
+    assert not [
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == material["matter_id"]
+    ]
 
 
 def complete_material(
