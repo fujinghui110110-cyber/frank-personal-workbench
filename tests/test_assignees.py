@@ -80,7 +80,18 @@ def _complete_action(client: TestClient, action: dict, *, key: str = "assignee-f
         headers=worker_headers(),
     )
     assert completed.status_code == 200, completed.text
-    return completed.json()["actions"][0]
+    matter = completed.json()
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    applied = client.post(
+        f"/api/matters/{matter['id']}/work-package/apply",
+        json={"step_indexes": [0], "expected_updated_at": package["updated_at"]},
+    )
+    assert applied.status_code == 200, applied.text
+    refreshed = client.get(f"/api/matters/{matter['id']}")
+    assert refreshed.status_code == 200, refreshed.text
+    return refreshed.json()["actions"][0]
 
 
 def test_people_seed_is_idempotent_and_contains_required_aliases(client: TestClient) -> None:

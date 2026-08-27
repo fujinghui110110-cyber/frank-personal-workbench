@@ -99,6 +99,33 @@ def claim_email_analysis(client: TestClient, worker_id: str = "mac-air") -> dict
     return claimed.json()["job"]
 
 
+def test_direct_work_email_preserves_original_material(client: TestClient) -> None:
+    owner_login(client)
+    client.post("/api/email/accounts/register", json=ACCOUNT, headers=worker_headers())
+    payload = message(2, work=True)
+    payload["source_text"] = "主题：预算复核要求\n正文：请于本周内复核预算差异并回复。"
+
+    response = client.post("/api/email/messages", json=payload, headers=worker_headers())
+
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["material_id"]
+    material = client.app.state.database.fetch_one(
+        "SELECT matter_id, text_note, status FROM materials WHERE id = ?",
+        (saved["material_id"],),
+    )
+    assert material == {
+        "matter_id": saved["matter_id"],
+        "text_note": payload["source_text"],
+        "status": "processed",
+    }
+    action = client.app.state.database.fetch_one(
+        "SELECT material_id FROM actions WHERE created_by = ?",
+        (f"email:{saved['id']}",),
+    )
+    assert action == {"material_id": saved["material_id"]}
+
+
 def test_email_sync_filters_nonwork_and_merges_open_thread(client: TestClient) -> None:
     owner_login(client)
     assert client.get("/api/email/status").json()["configured"] is False
@@ -313,6 +340,16 @@ def test_completed_matter_is_not_reused_and_false_positive_closes_action(
     for action in matter["actions"]:
         response = client.post(f"/api/actions/{action['id']}/resolve", json={"status": "done"})
         assert response.status_code == 200, response.text
+    ready = client.get(f"/api/matters/{first['matter_id']}/close-preview").json()
+    assert ready["can_close"] is True
+    closed = client.post(
+        f"/api/matters/{first['matter_id']}/close",
+        json={
+            "expected_updated_at": ready["updated_at"],
+            "completion_note": "邮件事项的待办已逐项完成。",
+        },
+    )
+    assert closed.status_code == 200, closed.text
     assert client.get("/api/email/matters").json()[0]["is_completed"] is True
     assert client.get(f"/api/matters/{first['matter_id']}").json()["status"] == "completed"
     assert client.get("/api/email/messages").json() == []

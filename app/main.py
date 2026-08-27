@@ -36,30 +36,40 @@ from .schemas import (
     EmailAccountRegisterRequest,
     EmailAnalysisCompleteRequest,
     EmailMessageRequest,
+    EmailMessageUpdateRequest,
     EmailSyncClaimRequest,
     EmailSyncFinishRequest,
+    FactCorrectionRequest,
     JobClaimRequest,
     JobCompleteRequest,
     JobFailRequest,
     JobLeaseRequest,
     LearningRuleUpdateRequest,
     LoginRequest,
+    MatterCloseRequest,
+    MaterialReassignRequest,
     MatterProgressRequest,
     MatterUpdateRequest,
     NodeHeartbeatRequest,
     PolicyCandidateIngestRequest,
     PolicyCandidateResolveRequest,
+    PolicyCandidateUpdateRequest,
+    PolicyUpdateRequest,
     ReminderResolveRequest,
+    ReminderUpdateRequest,
     ReviewResolveRequest,
     ReviewQueueResolveRequest,
     TranscriptSaveRequest,
     WechatCandidateResolveRequest,
+    WechatCandidateUpdateRequest,
     WechatExportReportRequest,
     WechatSyncClaimRequest,
     WechatSyncFinishRequest,
     WechatSyncRunRequest,
     WechatUnblockRequest,
     WechatWindowRequest,
+    WorkPackageApplyRequest,
+    WorkPackageUpdateRequest,
 )
 from .security import (
     AuthContext,
@@ -69,7 +79,7 @@ from .security import (
     require_scope,
     session_value,
 )
-from .services import WorkbenchService
+from .services import StaleWriteError, WorkbenchService
 from .wechat import WechatService
 
 
@@ -88,8 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def refresh_loop() -> None:
         while True:
-            await asyncio.to_thread(service.refresh_reminders)
             await asyncio.sleep(60)
+            await asyncio.to_thread(service.refresh_reminders)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -167,6 +177,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(PermissionError)
     async def permission_error_handler(_: Request, error: PermissionError):
         return JSONResponse({"detail": str(error)}, status_code=status.HTTP_403_FORBIDDEN)
+
+    @app.exception_handler(StaleWriteError)
+    async def stale_write_error_handler(_: Request, error: StaleWriteError):
+        return JSONResponse({"detail": str(error)}, status_code=status.HTTP_409_CONFLICT)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -268,6 +282,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return service.assign_material(
             material_id, context.actor, payload.matter_id, payload.title
+        )
+
+    @app.get("/api/materials/{material_id}/reassign-preview")
+    def reassign_material_preview(
+        material_id: str,
+        matter_id: str,
+        _: AuthContext = Depends(require_scope("materials:read")),
+    ) -> dict[str, Any]:
+        return service.reassign_material_preview(material_id, matter_id)
+
+    @app.post("/api/materials/{material_id}/reassign")
+    def reassign_material(
+        material_id: str,
+        payload: MaterialReassignRequest,
+        context: AuthContext = Depends(require_scope("materials:write")),
+    ) -> dict[str, Any]:
+        return service.reassign_material(
+            material_id,
+            payload.matter_id,
+            payload.reason,
+            payload.expected_updated_at,
+            context.actor,
+        )
+
+    @app.post("/api/evidence/{evidence_id}/correct")
+    def correct_fact(
+        evidence_id: str,
+        payload: FactCorrectionRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.correct_fact(
+            evidence_id,
+            payload.value,
+            payload.field_type,
+            payload.reason,
+            payload.expected_created_at,
+            context.actor,
         )
 
     @app.post("/api/materials/{material_id}/transcript")
@@ -385,6 +436,66 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             matter_id, payload.model_dump(exclude_unset=True), context.actor
         )
 
+    @app.get("/api/matters/{matter_id}/close-preview")
+    def close_preview(
+        matter_id: str,
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.close_preview(matter_id)
+
+    @app.post("/api/matters/{matter_id}/close")
+    def close_matter(
+        matter_id: str,
+        payload: MatterCloseRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.close_matter(
+            matter_id,
+            payload.completion_note,
+            payload.expected_updated_at,
+            context.actor,
+        )
+
+    @app.get("/api/matters/{matter_id}/work-package")
+    def get_work_package(
+        matter_id: str,
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any] | None:
+        return service.get_work_package(matter_id)
+
+    @app.post("/api/matters/{matter_id}/work-package/generate")
+    def generate_work_package(
+        matter_id: str,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.generate_work_package(matter_id, context.actor)
+
+    @app.patch("/api/matters/{matter_id}/work-package")
+    def update_work_package(
+        matter_id: str,
+        payload: WorkPackageUpdateRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.update_work_package(
+            matter_id,
+            payload.draft,
+            payload.expected_updated_at,
+            context.actor,
+        )
+
+    @app.post("/api/matters/{matter_id}/work-package/apply")
+    def apply_work_package(
+        matter_id: str,
+        payload: WorkPackageApplyRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.apply_work_package(
+            matter_id,
+            payload.step_indexes,
+            payload.expected_updated_at,
+            context.actor,
+        )
+
     @app.post("/api/matters/{matter_id}/progress")
     def add_matter_progress(
         matter_id: str,
@@ -484,6 +595,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         date_from: str = "",
         date_to: str = "",
         amount: str = "",
+        include_answer: bool = False,
         _: AuthContext = Depends(require_scope("matters:read")),
     ) -> dict[str, Any]:
         return service.search(
@@ -494,6 +606,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             date_from=date_from,
             date_to=date_to,
             amount=amount,
+            include_answer=include_answer,
         )
 
     @app.get("/api/activity/receipts")
@@ -531,6 +644,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         context: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, Any]:
         return service.resolve_reminder(reminder_id, payload.status, context.actor)
+
+    @app.patch("/api/reminders/{reminder_id}")
+    def update_reminder(
+        reminder_id: str,
+        payload: ReminderUpdateRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.update_reminder(
+            reminder_id,
+            payload.model_dump(exclude_unset=True),
+            context.actor,
+        )
 
     @app.post("/api/actions/{action_id}/resolve")
     def resolve_action(
@@ -650,6 +775,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return email_work.ingest_message(payload.model_dump())
 
+    @app.patch("/api/email/messages/{message_id}")
+    def update_email_message(
+        message_id: str,
+        payload: EmailMessageUpdateRequest,
+        context: AuthContext = Depends(require_scope("wechat:write")),
+    ) -> dict[str, Any]:
+        return email_work.update_message(
+            message_id,
+            payload.model_dump(
+                exclude_unset=True, exclude={"expected_updated_at", "reason"}
+            ),
+            payload.expected_updated_at,
+            payload.reason,
+            context.actor,
+        )
+
     @app.post("/api/email/jobs/{job_id}/complete")
     def complete_email_analysis(
         job_id: str,
@@ -711,6 +852,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return policies.ingest_candidate(payload.model_dump())
 
+    @app.patch("/api/policy-candidates/{candidate_id}")
+    def update_policy_candidate(
+        candidate_id: str,
+        payload: PolicyCandidateUpdateRequest,
+        context: AuthContext = Depends(require_scope("wechat:write")),
+    ) -> dict[str, Any]:
+        return policies.update_candidate(
+            candidate_id,
+            payload.model_dump(
+                exclude_unset=True, exclude={"expected_updated_at", "reason"}
+            ),
+            payload.expected_updated_at or "",
+            payload.reason,
+            context.actor,
+        )
+
     @app.get("/api/policies/status")
     def policy_status(
         _: AuthContext = Depends(require_scope("wechat:read")),
@@ -731,6 +888,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _: AuthContext = Depends(require_scope("wechat:read")),
     ) -> list[dict[str, Any]]:
         return policies.versions(policy_id)
+
+    @app.patch("/api/policies/{policy_id}")
+    def update_policy(
+        policy_id: str,
+        payload: PolicyUpdateRequest,
+        context: AuthContext = Depends(require_scope("wechat:write")),
+    ) -> dict[str, Any]:
+        return policies.update_policy(
+            policy_id,
+            payload.model_dump(
+                exclude_unset=True, exclude={"expected_updated_at", "reason"}
+            ),
+            payload.expected_updated_at or "",
+            payload.reason,
+            context.actor,
+        )
 
     @app.get("/api/policies/identity/hint")
     def policy_identity_hint(
@@ -880,6 +1053,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return wechat.resolve_candidate(
             candidate_id, payload.action, context.actor, payload.matter_id
+        )
+
+    @app.patch("/api/wechat/candidates/{candidate_id}")
+    def update_wechat_candidate(
+        candidate_id: str,
+        payload: WechatCandidateUpdateRequest,
+        context: AuthContext = Depends(require_scope("wechat:write")),
+    ) -> dict[str, Any]:
+        return wechat.update_candidate(
+            candidate_id,
+            payload.model_dump(
+                exclude_unset=True, exclude={"expected_updated_at", "reason"}
+            ),
+            payload.expected_updated_at or "",
+            payload.reason,
+            context.actor,
         )
 
     @app.get("/api/wechat/conversations")

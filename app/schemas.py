@@ -20,14 +20,49 @@ class AssignmentRequest(BaseModel):
         return self
 
 
+class MaterialReassignRequest(BaseModel):
+    matter_id: str = Field(min_length=1, max_length=160)
+    reason: str = Field(min_length=1, max_length=500)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+
+
+class FactCorrectionRequest(BaseModel):
+    value: str = Field(min_length=1, max_length=2000)
+    field_type: str | None = Field(default=None, max_length=160)
+    reason: str = Field(min_length=1, max_length=500)
+    expected_created_at: str | None = Field(default=None, max_length=80)
+
+
 class MatterUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    summary: str | None = Field(default=None, max_length=2000)
+    goal: str | None = Field(default=None, max_length=2000)
+    completion_criteria: str | None = Field(default=None, max_length=2000)
+    owner: str | None = Field(default=None, max_length=160)
     target_date: str | None = Field(default=None, max_length=10)
     status: Literal["active", "completed"] | None = None
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    reason: str = Field(default="", max_length=500)
 
 
 class MatterProgressRequest(BaseModel):
     summary: str = Field(min_length=1, max_length=200)
     detail: str = Field(default="", max_length=2000)
+
+
+class MatterCloseRequest(BaseModel):
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    completion_note: str = Field(min_length=1, max_length=2000)
+
+
+class WorkPackageUpdateRequest(BaseModel):
+    draft: dict[str, Any]
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+
+
+class WorkPackageApplyRequest(BaseModel):
+    step_indexes: list[int] = Field(default_factory=list, max_length=50)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
 
 
 class JobClaimRequest(BaseModel):
@@ -64,11 +99,24 @@ class ReminderResolveRequest(BaseModel):
     status: Literal["done", "dismissed", "snoozed"]
 
 
+class ReminderUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    reason: str | None = Field(default=None, max_length=1000)
+    due_at: str | None = Field(default=None, max_length=80)
+    action_id: str | None = Field(default=None, max_length=160)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    change_reason: str = Field(default="", max_length=500)
+
+
 class ActionResolveRequest(BaseModel):
     status: Literal["open", "done", "dismissed"]
 
 
 class ActionPlanningStateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    detail: str | None = Field(default=None, max_length=2000)
+    kind: Literal["conclusion", "task", "risk", "decision", "waiting"] | None = None
+    due_date: str | None = Field(default=None, max_length=10)
     flow_state: Literal["needs_action", "waiting", "blocked", "needs_decision"] | None = None
     waiting_on: str | None = Field(default=None, max_length=160)
     blocked_reason: str | None = Field(default=None, max_length=500)
@@ -77,6 +125,8 @@ class ActionPlanningStateRequest(BaseModel):
     pinned: bool | None = None
     snoozed_until: str | None = Field(default=None, max_length=80)
     completion_evidence: list[str] | None = Field(default=None, max_length=12)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    change_reason: str = Field(default="", max_length=500)
 
 
 class ReviewQueueResolveRequest(BaseModel):
@@ -143,6 +193,16 @@ class EmailMessageRequest(BaseModel):
     attachment_paths: list[str] = Field(default_factory=list, max_length=20)
 
 
+class EmailMessageUpdateRequest(BaseModel):
+    subject: str | None = Field(default=None, max_length=300)
+    summary: str | None = Field(default=None, max_length=1000)
+    classification: str | None = Field(default=None, max_length=40)
+    needs_follow_up: bool | None = None
+    matter_id: str | None = Field(default=None, max_length=160)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class EmailAnalysisCompleteRequest(JobLeaseRequest):
     message_id: str = Field(min_length=4, max_length=160)
     result: dict[str, Any]
@@ -160,6 +220,34 @@ class PolicyCandidateIngestRequest(BaseModel):
 class PolicyCandidateResolveRequest(BaseModel):
     action: Literal["apply", "ignore", "merge", "temporary", "undo"]
     policy_id: str | None = Field(default=None, max_length=160)
+
+
+class PolicyCandidateUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=160)
+    publisher: str | None = Field(default=None, max_length=160)
+    topic: str | None = Field(default=None, max_length=160)
+    scope: str | None = Field(default=None, max_length=500)
+    summary: str | None = Field(default=None, max_length=2000)
+    requirements: list[str] | None = Field(default=None, max_length=20)
+    change_summary: str | None = Field(default=None, max_length=1000)
+    effective_date: str | None = Field(default=None, max_length=40)
+    change_type: str | None = Field(default=None, max_length=40)
+    matched_policy_id: str | None = Field(default=None, max_length=160)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class PolicyUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=160)
+    publisher: str | None = Field(default=None, max_length=160)
+    topic: str | None = Field(default=None, max_length=160)
+    scope: str | None = Field(default=None, max_length=500)
+    summary: str | None = Field(default=None, max_length=2000)
+    requirements: list[str] | None = Field(default=None, max_length=20)
+    effective_date: str | None = Field(default=None, max_length=40)
+    change_type: str | None = Field(default=None, max_length=40)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class NodeHeartbeatRequest(BaseModel):
@@ -230,6 +318,17 @@ class WechatWindowRequest(BaseModel):
 class WechatCandidateResolveRequest(BaseModel):
     action: Literal["accept", "ignore", "merge", "restore", "undo"]
     matter_id: str | None = Field(default=None, max_length=160)
+
+
+class WechatCandidateUpdateRequest(BaseModel):
+    summary: str | None = Field(default=None, max_length=1000)
+    classification: str | None = Field(default=None, max_length=40)
+    uncertainty_reason: str | None = Field(default=None, max_length=500)
+    extracted: dict[str, Any] | None = None
+    evidence: list[dict[str, Any] | str] | None = Field(default=None, max_length=20)
+    matter_id: str | None = Field(default=None, max_length=160)
+    expected_updated_at: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class WechatUnblockRequest(BaseModel):

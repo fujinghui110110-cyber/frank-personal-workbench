@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .config import Settings
 from .db import Database, utc_now
+from .services import StaleWriteError
 
 
 POLICY_CHANGES = {"new", "revision", "repeal", "interpretation", "evidence"}
@@ -81,6 +82,12 @@ def _safe_name(value: str, fallback: str = "未命名规定") -> str:
 
 def _date_stamp() -> str:
     return datetime.now().astimezone().strftime("%Y%m%d")
+
+
+def _next_updated_at(current: str) -> str:
+    now = datetime.now(UTC)
+    previous = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    return max(now, previous + timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 class PolicyService:
@@ -637,6 +644,113 @@ class PolicyService:
         )
         return [self._policy_public(row) for row in rows]
 
+    def update_policy(
+        self,
+        policy_id: str,
+        changes: dict[str, Any],
+        expected_updated_at: str,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        policy = self.database.fetch_one(
+            "SELECT * FROM company_policies WHERE id = ?", (policy_id,)
+        )
+        if not policy:
+            raise KeyError("现行规定不存在")
+        if policy["status"] != "active":
+            raise ValueError("只能人工修改当前有效的规定")
+        if not expected_updated_at:
+            raise ValueError("请提供规定更新时间")
+        if expected_updated_at != policy["updated_at"]:
+            raise StaleWriteError("规定已被更新，请刷新后再保存")
+        reason = _clean(reason, 500)
+        if not reason:
+            raise ValueError("请说明修改原因")
+
+        changes = dict(changes)
+        change_type = _clean(changes.pop("change_type", "revision"), 40)
+        if change_type not in {"revision", "interpretation"}:
+            raise ValueError("人工修改类型只能是修订规定或解释口径")
+        allowed = {
+            "title", "publisher", "topic", "scope", "summary", "requirements", "effective_date"
+        }
+        changes = {key: value for key, value in changes.items() if key in allowed}
+        if not changes:
+            raise ValueError("请提供需要修改的规定内容")
+
+        values: dict[str, Any] = {}
+        for field, limit in (
+            ("title", 160), ("publisher", 160), ("topic", 160),
+            ("scope", 500), ("summary", 2000), ("effective_date", 40),
+        ):
+            if field in changes:
+                values[field] = _clean(changes[field], limit) or (None if field == "effective_date" else "")
+        if "title" in values and not values["title"]:
+            raise ValueError("规定标题不能为空")
+        if "summary" in values and not values["summary"]:
+            raise ValueError("规定摘要不能为空")
+        if "requirements" in changes:
+            if not isinstance(changes["requirements"], list):
+                raise ValueError("具体要求必须是文本数组")
+            values["requirements_json"] = json.dumps(_list(changes["requirements"], 20), ensure_ascii=False)
+
+        before = self._policy_snapshot(policy)
+        updated = {**policy, **values}
+        updated["canonical_key"] = _canonical_key(
+            updated["publisher"], updated["topic"], updated["scope"], updated["title"]
+        )
+        updated["version"] = int(policy["version"]) + 1
+        updated["last_verified_at"] = _next_updated_at(policy["updated_at"])
+        updated["updated_at"] = updated["last_verified_at"]
+        candidate_id = _id("policy_candidate")
+
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO company_policy_candidates "
+                "(id, source_type, source_ref, source_label, change_type, title, publisher, topic, "
+                "scope, summary, requirements_json, change_summary, effective_date, confidence, "
+                "is_authority, evidence_json, attachments_json, matched_policy_id, status, "
+                "created_at, updated_at, resolved_at) "
+                "VALUES (?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '[]', '[]', ?, "
+                "'applied', ?, ?, ?)",
+                (
+                    candidate_id, f"manual:{candidate_id}", actor, change_type,
+                    updated["title"], updated["publisher"], updated["topic"], updated["scope"],
+                    updated["summary"], updated["requirements_json"], reason,
+                    updated["effective_date"], policy_id, updated["updated_at"],
+                    updated["updated_at"], updated["updated_at"],
+                ),
+            )
+            result = connection.execute(
+                "UPDATE company_policies SET canonical_key = ?, title = ?, publisher = ?, topic = ?, "
+                "scope = ?, summary = ?, requirements_json = ?, effective_date = ?, version = ?, "
+                "last_verified_at = ?, updated_at = ? WHERE id = ? AND status = 'active' AND updated_at = ?",
+                (
+                    updated["canonical_key"], updated["title"], updated["publisher"], updated["topic"],
+                    updated["scope"], updated["summary"], updated["requirements_json"],
+                    updated["effective_date"], updated["version"], updated["last_verified_at"],
+                    updated["updated_at"], policy_id, expected_updated_at,
+                ),
+            )
+            if result.rowcount != 1:
+                raise StaleWriteError("规定已被更新，请刷新后再保存")
+            after = self._policy_snapshot(updated)
+            connection.execute(
+                "INSERT INTO company_policy_versions "
+                "(id, policy_id, version, change_type, snapshot_json, evidence_json, "
+                "attachments_json, candidate_id, created_at) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?)",
+                (
+                    _id("policy_version"), policy_id, updated["version"], change_type,
+                    json.dumps(after, ensure_ascii=False), candidate_id, updated["updated_at"],
+                ),
+            )
+        self.database.audit(
+            _id("audit"), actor, "policy.updated", "company_policy", policy_id,
+            metadata={"before": before, "after": after, "reason": reason, "candidate_id": candidate_id},
+        )
+        row = self.database.fetch_one("SELECT * FROM company_policies WHERE id = ?", (policy_id,))
+        return self._policy_public(row or updated)
+
     def versions(self, policy_id: str) -> list[dict[str, Any]]:
         rows = self.database.fetch_all(
             "SELECT version, change_type, snapshot_json, evidence_json, attachments_json, created_at "
@@ -683,6 +797,89 @@ class PolicyService:
         if not row:
             raise KeyError("规定候选不存在")
         return self._candidate_public(row)
+
+    def update_candidate(
+        self,
+        candidate_id: str,
+        changes: dict[str, Any],
+        expected_updated_at: str,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        candidate = self.database.fetch_one(
+            "SELECT * FROM company_policy_candidates WHERE id = ?", (candidate_id,)
+        )
+        if not candidate:
+            raise KeyError("规定候选不存在")
+        if candidate["status"] not in {"pending", "undone"}:
+            raise ValueError("已处理的规定候选不能再修改")
+        if not expected_updated_at:
+            raise ValueError("请提供候选更新时间")
+        if expected_updated_at != candidate["updated_at"]:
+            raise StaleWriteError("规定候选已被更新，请刷新后再保存")
+        reason = _clean(reason, 500)
+        if not reason:
+            raise ValueError("请说明修改原因")
+
+        allowed = {
+            "title", "publisher", "topic", "scope", "summary", "requirements",
+            "change_summary", "effective_date", "change_type", "matched_policy_id",
+        }
+        changes = {key: value for key, value in changes.items() if key in allowed}
+        if not changes:
+            raise ValueError("请提供需要修改的候选内容")
+        values: dict[str, Any] = {}
+        for field, limit in (
+            ("title", 160), ("publisher", 160), ("topic", 160), ("scope", 500),
+            ("summary", 2000), ("change_summary", 1000), ("effective_date", 40),
+        ):
+            if field in changes:
+                values[field] = _clean(changes[field], limit) or (None if field == "effective_date" else "")
+        if "title" in values and not values["title"]:
+            raise ValueError("规定标题不能为空")
+        if "summary" in values and not values["summary"]:
+            raise ValueError("规定摘要不能为空")
+        if "requirements" in changes:
+            if not isinstance(changes["requirements"], list):
+                raise ValueError("具体要求必须是文本数组")
+            values["requirements_json"] = json.dumps(_list(changes["requirements"], 20), ensure_ascii=False)
+        if "change_type" in changes:
+            change_type = _clean(changes["change_type"], 40)
+            if change_type not in POLICY_CHANGES:
+                raise ValueError("不支持的规定变化类型")
+            values["change_type"] = change_type
+        if "matched_policy_id" in changes:
+            matched_policy_id = _clean(changes["matched_policy_id"], 160) or None
+            if matched_policy_id and not self.database.fetch_one(
+                "SELECT id FROM company_policies WHERE id = ? AND status = 'active'",
+                (matched_policy_id,),
+            ):
+                raise ValueError("关联的现行规定不存在")
+            values["matched_policy_id"] = matched_policy_id
+
+        before = {
+            key: (_json(candidate["requirements_json"], []) if key == "requirements" else candidate.get(key))
+            for key in allowed if key in changes
+        }
+        after = {
+            key: (_json(values["requirements_json"], []) if key == "requirements" else values.get(key))
+            for key in changes
+        }
+        updated_at = _next_updated_at(candidate["updated_at"])
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        with self.database.connect() as connection:
+            result = connection.execute(
+                f"UPDATE company_policy_candidates SET {assignments}, updated_at = ? "
+                "WHERE id = ? AND updated_at = ? AND status IN ('pending', 'undone')",
+                (*values.values(), updated_at, candidate_id, expected_updated_at),
+            )
+            if result.rowcount != 1:
+                raise StaleWriteError("规定候选已被更新，请刷新后再保存")
+        self.database.audit(
+            _id("audit"), actor, "policy.candidate.updated", "company_policy_candidate", candidate_id,
+            metadata={"before": before, "after": after, "reason": reason},
+        )
+        return self.get_candidate(candidate_id)
 
     def status(self) -> dict[str, Any]:
         counts = self.database.fetch_one(

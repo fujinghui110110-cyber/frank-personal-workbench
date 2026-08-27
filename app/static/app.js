@@ -16,6 +16,8 @@
     policyTab: "pending",
     matterTab: "all",
     matterStatus: "open",
+    selectedMatterId: null,
+    matterWorkspaceQuery: "",
     reviewTab: "business",
     people: [],
     assigneeReviews: [],
@@ -23,7 +25,8 @@
     queueCount: 0,
 searchQuery: "",
 searchIndex: [],
-searchResults: null,
+    searchResults: null,
+    searchAnswerVisible: false,
 searchTimer: null,
 searchFocus: false,
 searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
@@ -32,6 +35,19 @@ searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
     todayDisclosures: { weekly: false, rules: false },
     sourceSyncRunning: false,
     sourceReceiptDismissed: false,
+    manualEditRecords: {
+      emails: [],
+      wechat: [],
+      policyCandidates: [],
+      policies: [],
+      repealedPolicies: [],
+      matter: null,
+      matters: [],
+      actions: [],
+      reminders: [],
+      facts: [],
+      materials: [],
+    },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -145,6 +161,8 @@ function emailSummary(value, fallback, maxLength) {
 }
 
 function friendlyError(error, fallback = "暂时无法完成，请稍后再试") {
+    if (Number(error?.status) === 409)
+      return "内容已被后台更新，请核对后再保存。";
     const text = String(error?.message || "").trim();
     if (
       !text ||
@@ -378,12 +396,400 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     return badge(value[0], value[1]);
   }
 
-  function toast(message, tone = "") {
-    const node = document.createElement("div");
-    node.className = `toast ${tone}`;
-    node.textContent = message;
-    $("#toast-region").append(node);
-    window.setTimeout(() => node.remove(), 4200);
+function toast(message, tone = "", action = null) {
+  const node = document.createElement("div");
+  node.className = `toast ${tone}`;
+  const text = document.createElement("span");
+  text.textContent = message;
+  node.append(text);
+  if (action?.label && typeof action.onClick === "function") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await action.onClick();
+      } finally {
+        node.remove();
+      }
+    });
+    node.append(button);
+  }
+  $("#toast-region").append(node);
+  window.setTimeout(() => node.remove(), action ? 30000 : 4200);
+}
+
+  let manualEditSession = null;
+
+  const manualEditTitles = {
+    email: "修改邮件工作内容",
+    wechat: "修改聊天线索",
+    policyCandidate: "修改规定线索",
+    policy: "修改现行规定",
+    matter: "修改事项基本信息",
+    action: "修改行动",
+    reminder: "修改提醒",
+    fact: "修正事实依据",
+    material: "重新归属原始材料",
+  };
+
+  const manualEditMessages = {
+    email: "邮件工作内容已保存",
+    wechat: "聊天线索已保存",
+    policyCandidate: "规定线索已保存",
+    policy: "现行规定已保存",
+    matter: "事项基本信息已保存",
+    action: "行动已保存",
+    reminder: "提醒已保存",
+    fact: "事实依据已修正",
+    material: "原始材料已重新归属",
+  };
+
+  function manualEditText(label, name, value, { type = "text", placeholder = "", required = false } = {}) {
+    return `<label class="manual-edit-field"><span>${escapeHtml(label)}${required ? "（必填）" : ""}</span><input name="${escapeHtml(name)}" type="${escapeHtml(type)}" value="${escapeHtml(value)}"${placeholder ? ` placeholder="${escapeHtml(placeholder)}"` : ""}${required ? " required" : ""}></label>`;
+  }
+
+  function manualEditArea(label, name, value, { rows = 3, placeholder = "", required = false } = {}) {
+    return `<label class="manual-edit-field"><span>${escapeHtml(label)}${required ? "（必填）" : ""}</span><textarea name="${escapeHtml(name)}" rows="${rows}"${placeholder ? ` placeholder="${escapeHtml(placeholder)}"` : ""}${required ? " required" : ""}>${escapeHtml(value)}</textarea></label>`;
+  }
+
+  function manualEditSelect(label, name, options, selected) {
+    return `<label class="manual-edit-field"><span>${escapeHtml(label)}</span><select name="${escapeHtml(name)}">${options.map(([value, text]) => `<option value="${escapeHtml(value)}"${String(value) === String(selected) ? " selected" : ""}>${escapeHtml(text)}</option>`).join("")}</select></label>`;
+  }
+
+  function manualEditCheck(label, name, checked) {
+    return `<label class="manual-edit-check"><input name="${escapeHtml(name)}" type="checkbox"${checked ? " checked" : ""}><span>${escapeHtml(label)}</span></label>`;
+  }
+
+  function manualEditLines(values) {
+    return Array.isArray(values) ? values.filter(Boolean).join("\n") : "";
+  }
+
+  function manualEditDateTime(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value).slice(0, 16);
+    const pad = (item) => String(item).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function manualEditFields(type, item) {
+    const records = state.manualEditRecords || {};
+    if (type === "email") {
+      return [
+        manualEditText("邮件主题", "subject", item.subject || item.matter_title || "", { required: true }),
+        manualEditArea("工作摘要", "summary", item.summary || "", { rows: 4, placeholder: "只修改工作摘要，不修改邮件原文" }),
+        manualEditSelect("处理判断", "classification", [["pending", "待确认"], ["work", "需要推进"], ["irrelevant", "不是工作"]], item.classification || "work"),
+        manualEditCheck("需要继续跟进", "needs_follow_up", item.needs_follow_up),
+      ].join("");
+    }
+    if (type === "wechat") {
+      return [
+        manualEditArea("工作摘要", "summary", item.summary || "", { rows: 4, placeholder: "只修改整理结果，不修改聊天原文" }),
+        manualEditSelect("处理判断", "classification", [["relevant", "工作相关"], ["uncertain", "可能相关"], ["irrelevant", "不是工作"]], item.classification || "relevant"),
+        manualEditArea("需要说明的疑点", "uncertainty_reason", item.uncertainty_reason || "", { rows: 2, placeholder: "没有疑点可以留空" }),
+      ].join("");
+    }
+    if (type === "policyCandidate") {
+      return [
+        manualEditText("规定标题", "title", item.title || "", { required: true }),
+        manualEditText("发布单位", "publisher", item.publisher || ""),
+        manualEditText("业务主题", "topic", item.topic || ""),
+        manualEditArea("适用范围", "scope", item.scope || "", { rows: 2 }),
+        manualEditArea("规定摘要", "summary", item.summary || "", { rows: 4, required: true }),
+        manualEditArea("本次变化", "change_summary", item.change_summary || "", { rows: 3 }),
+        manualEditArea("具体要求（每行一项）", "requirements", manualEditLines(item.requirements), { rows: 4 }),
+        manualEditText("生效日期", "effective_date", item.effective_date || "", { type: "date" }),
+        manualEditSelect("变化类型", "change_type", [["new", "新增"], ["revision", "修订"], ["repeal", "废止"], ["interpretation", "解释"], ["evidence", "补充依据"]], item.change_type || "new"),
+      ].join("");
+    }
+    if (type === "policy") {
+      return [
+        manualEditText("规定标题", "title", item.title || "", { required: true }),
+        manualEditText("发布单位", "publisher", item.publisher || ""),
+        manualEditText("业务主题", "topic", item.topic || ""),
+        manualEditArea("适用范围", "scope", item.scope || "", { rows: 2 }),
+        manualEditArea("规定摘要", "summary", item.summary || "", { rows: 4, required: true }),
+        manualEditArea("具体要求（每行一项）", "requirements", manualEditLines(item.requirements), { rows: 4 }),
+        manualEditText("生效日期", "effective_date", item.effective_date || "", { type: "date" }),
+        manualEditSelect("修改类型", "change_type", [["revision", "修订规定"], ["interpretation", "解释口径"]], "revision"),
+      ].join("");
+    }
+    if (type === "matter") {
+      return [
+        manualEditText("事项名称", "title", item.title || "", { required: true }),
+        manualEditArea("事项摘要", "summary", item.summary || "", { rows: 3 }),
+        manualEditArea("事项目标", "goal", item.goal || "", { rows: 3 }),
+        manualEditArea("完成条件", "completion_criteria", item.completion_criteria || "", { rows: 3 }),
+        manualEditText("负责人", "owner", item.owner || ""),
+        manualEditText("要求闭环日期", "target_date", item.target_date || "", { type: "date" }),
+      ].join("");
+    }
+    if (type === "action") {
+      return [
+        manualEditText("行动名称", "title", item.title || item.next_step || "", { required: true }),
+        manualEditArea("办理说明", "detail", item.detail || item.summary || "", { rows: 4 }),
+        manualEditSelect("行动类型", "kind", [["conclusion", "明确结论"], ["task", "下一步"], ["risk", "风险"], ["decision", "待拍板"], ["waiting", "等反馈"]], item.kind || "task"),
+        manualEditText("截止日期", "due_date", item.due_date || "", { type: "date" }),
+        manualEditSelect("推进状态", "flow_state", [["needs_action", "待办理"], ["waiting", "等待反馈"], ["blocked", "暂时受阻"], ["needs_decision", "等待拍板"]], item.flow_state || "needs_action"),
+        manualEditText("等待对象", "waiting_on", item.waiting_on || ""),
+        manualEditArea("受阻说明", "blocked_reason", item.blocked_reason || "", { rows: 2 }),
+        manualEditText("预计分钟数", "estimated_minutes", item.estimated_minutes || "", { type: "number" }),
+        manualEditCheck("固定在优先事项", "pinned", item.pinned),
+      ].join("");
+    }
+    if (type === "reminder") {
+      return [
+        manualEditText("提醒名称", "title", item.title || "", { required: true }),
+        manualEditArea("提醒依据", "reason", item.reason || "", { rows: 3 }),
+        manualEditText("提醒时间", "due_at", manualEditDateTime(item.due_at), { type: "datetime-local" }),
+      ].join("");
+    }
+    if (type === "fact") {
+      return `<input name="field_type" type="hidden" value="${escapeHtml(item.field_type || "")}">${manualEditArea("确认后的事实", "value", item.value || "", { rows: 4, required: true })}`;
+    }
+    if (type === "material") {
+      const matters = Array.isArray(records.matters) ? records.matters : [];
+      const options = matters.length
+        ? matters.map((matter) => [matter.id, matterTitle(matter.title)])
+        : [[records.matter?.id || "", matterTitle(records.matter?.title)]];
+      return manualEditSelect("归入事项", "matter_id", options, item.matter_id || records.matter?.id || "");
+    }
+    return "";
+  }
+
+  function ensureManualEditPanel() {
+    let panel = $("#manual-edit-panel");
+    if (panel) return panel;
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<aside id="manual-edit-panel" class="manual-edit-panel" hidden aria-labelledby="manual-edit-title"><div class="manual-edit-backdrop" data-manual-edit-close></div><section class="manual-edit-sheet"><header><div><p>人工办理</p><h2 id="manual-edit-title" data-manual-edit-title>修改内容</h2><span data-manual-edit-help></span></div><button class="button button-quiet manual-edit-close" type="button" data-manual-edit-close aria-label="关闭编辑">关闭</button></header><form data-manual-edit-form><div class="manual-edit-fields"></div><label class="manual-edit-field manual-edit-reason"><span data-manual-edit-reason-label>修改说明（可不填）</span><textarea name="manual_reason" rows="3" maxlength="500" placeholder="简要说明本次调整依据"></textarea></label><div class="manual-edit-impact" data-manual-edit-impact hidden aria-live="polite"></div><p class="manual-edit-note">原始材料只读保留，不会被覆盖；本次调整会留下可回查的修改记录。</p><footer><button class="button button-secondary" type="button" data-manual-edit-close>取消</button><button class="button button-primary" type="submit" data-manual-save>保存修改</button></footer></form></section></aside>`,
+    );
+    panel = $("#manual-edit-panel");
+    panel.addEventListener("click", (event) => {
+      if (event.target.closest("[data-manual-edit-close]")) closeManualEditor();
+    });
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeManualEditor();
+    });
+    $("[data-manual-edit-form]", panel).addEventListener("submit", saveManualEdit);
+    return panel;
+  }
+
+  async function refreshManualEditImpact(panel) {
+    const impact = $("[data-manual-edit-impact]", panel);
+    if (!impact || !manualEditSession) return;
+    const { type, item } = manualEditSession;
+    impact.hidden = false;
+    if (type === "fact") {
+      impact.innerHTML = `<strong>保存后的影响</strong><p>系统会建立一条修正版事实，并将当前事实标记为“已替代”；原记录和引用依据继续保留。</p>`;
+      return;
+    }
+    if (["policy", "policyCandidate"].includes(type)) {
+      impact.innerHTML = `<strong>保存后的影响</strong><p>本次修改会形成新的业务版本，原版本和发布历史继续保留，不会覆盖原始规定材料。</p>`;
+      return;
+    }
+    if (type !== "material") {
+      impact.hidden = true;
+      impact.replaceChildren();
+      return;
+    }
+    const targetId = $("[name=matter_id]", panel)?.value;
+    if (!targetId || String(targetId) === String(item.matter_id)) {
+      impact.innerHTML = `<strong>影响范围</strong><p>当前仍归属于原事项；选择其他事项后会显示随材料移动的记录。</p>`;
+      return;
+    }
+    impact.innerHTML = `<strong>正在核对影响范围…</strong>`;
+    try {
+      const preview = await api(`/api/materials/${encodeURIComponent(item.id)}/reassign-preview?matter_id=${encodeURIComponent(targetId)}`);
+      const counts = preview.counts || {};
+      impact.innerHTML = `<strong>保存后将归入“${escapeHtml(preview.to_matter_title || "目标事项")}”</strong><p>随材料一并移动：${Number(counts.facts || 0)} 条事实、${Number(counts.actions || 0)} 项行动、${Number(counts.reminders || 0)} 条提醒、${Number(counts.reviews || 0)} 条待确认、${Number(counts.email_records || 0)} 条邮件记录、${Number(counts.chat_records || 0)} 条聊天线索。其他事项内容不受影响。</p>`;
+    } catch (error) {
+      impact.innerHTML = `<strong>暂时无法核对影响范围</strong><p>${escapeHtml(friendlyError(error))}</p>`;
+    }
+  }
+
+  function openManualEditor(type, item, trigger) {
+    const panel = ensureManualEditPanel();
+    manualEditSession = { type, item, trigger, requiresReason: ["fact", "material", "policyCandidate", "policy"].includes(type) };
+    $("[data-manual-edit-title]", panel).textContent = manualEditTitles[type] || "修改内容";
+    $("[data-manual-edit-help]", panel).textContent = type === "material" ? "只调整材料所属事项" : "只修改系统生成内容，原始正文保持不变";
+    $(".manual-edit-fields", panel).innerHTML = manualEditFields(type, item);
+    const reasonLabel = $("[data-manual-edit-reason-label]", panel);
+    reasonLabel.textContent = manualEditSession.requiresReason ? "修改说明（必填）" : "修改说明（可不填）";
+    $("[name=manual_reason]", panel).required = manualEditSession.requiresReason;
+    $("[name=matter_id]", panel)?.addEventListener("change", () => refreshManualEditImpact(panel));
+    refreshManualEditImpact(panel);
+    panel.hidden = false;
+    document.body.classList.add("manual-edit-open");
+    $("[data-manual-edit-form] input:not([type=hidden]), [data-manual-edit-form] textarea, [data-manual-edit-form] select", panel)?.focus({ preventScroll: true });
+  }
+
+  function closeManualEditor(restoreFocus = true) {
+    const panel = $("#manual-edit-panel");
+    const trigger = manualEditSession?.trigger;
+    manualEditSession = null;
+    if (panel) panel.hidden = true;
+    document.body.classList.remove("manual-edit-open");
+    if (restoreFocus && trigger?.isConnected) trigger.focus({ preventScroll: true });
+  }
+
+  function manualEditPayload(type, form, item) {
+    const value = (name) => form.elements[name]?.value ?? "";
+    const lines = (name) => value(name).split("\n").map((line) => line.trim()).filter(Boolean);
+    const reason = value("manual_reason").trim();
+    if (type === "email") {
+      return { subject: value("subject").trim(), summary: value("summary").trim(), classification: value("classification"), needs_follow_up: form.elements.needs_follow_up.checked, expected_updated_at: item.updated_at || null, reason };
+    }
+    if (type === "wechat") {
+      return { summary: value("summary").trim(), classification: value("classification"), uncertainty_reason: value("uncertainty_reason").trim(), expected_updated_at: item.updated_at || null, reason };
+    }
+    if (type === "policyCandidate") {
+      return { title: value("title").trim(), publisher: value("publisher").trim(), topic: value("topic").trim(), scope: value("scope").trim(), summary: value("summary").trim(), change_summary: value("change_summary").trim(), requirements: lines("requirements"), effective_date: value("effective_date") || null, change_type: value("change_type"), expected_updated_at: item.updated_at || null, reason };
+    }
+    if (type === "policy") {
+      return { title: value("title").trim(), publisher: value("publisher").trim(), topic: value("topic").trim(), scope: value("scope").trim(), summary: value("summary").trim(), requirements: lines("requirements"), effective_date: value("effective_date") || null, change_type: value("change_type"), expected_updated_at: item.updated_at || null, reason };
+    }
+    if (type === "matter") {
+      return { title: value("title").trim(), summary: value("summary").trim(), goal: value("goal").trim(), completion_criteria: value("completion_criteria").trim(), owner: value("owner").trim(), target_date: value("target_date") || null, expected_updated_at: item.updated_at || null, reason };
+    }
+    if (type === "action") {
+      const minutes = value("estimated_minutes");
+      return { title: value("title").trim(), detail: value("detail").trim(), kind: value("kind"), due_date: value("due_date") || null, flow_state: value("flow_state"), waiting_on: value("waiting_on").trim(), blocked_reason: value("blocked_reason").trim(), estimated_minutes: minutes ? Number(minutes) : null, pinned: form.elements.pinned.checked, expected_updated_at: item.updated_at || null, change_reason: reason };
+    }
+    if (type === "reminder") {
+      return { title: value("title").trim(), reason: value("reason").trim(), due_at: value("due_at") || null, expected_updated_at: item.updated_at || null, change_reason: reason };
+    }
+    if (type === "fact") {
+      return { value: value("value").trim(), field_type: value("field_type") || null, reason, expected_created_at: item.created_at || null };
+    }
+    if (type === "material") {
+      return { matter_id: value("matter_id"), reason, expected_updated_at: item.updated_at || null };
+    }
+    return {};
+  }
+
+  function manualEditRequest(type, item) {
+    const id = encodeURIComponent(item.id);
+    const requests = {
+      email: [`/api/email/messages/${id}`, "PATCH"],
+      wechat: [`/api/wechat/candidates/${id}`, "PATCH"],
+      policyCandidate: [`/api/policy-candidates/${id}`, "PATCH"],
+      policy: [`/api/policies/${id}`, "PATCH"],
+      matter: [`/api/matters/${id}`, "PATCH"],
+      action: [`/api/actions/${id}/planning-state`, "PATCH"],
+      reminder: [`/api/reminders/${id}`, "PATCH"],
+      fact: [`/api/evidence/${id}/correct`, "POST"],
+      material: [`/api/materials/${id}/reassign`, "POST"],
+    };
+    return requests[type];
+  }
+
+function manualEditUndo(type, item, saved) {
+  const expected = saved?.updated_at || null;
+  const reason = "撤销上次人工修改";
+  const id = encodeURIComponent(item.id);
+  if (type === "email") return [`/api/email/messages/${id}`, "PATCH", { subject: item.subject, summary: item.summary, classification: item.classification, needs_follow_up: Boolean(item.needs_follow_up), matter_id: item.matter_id || null, expected_updated_at: expected, reason }];
+  if (type === "wechat") return [`/api/wechat/candidates/${id}`, "PATCH", { summary: item.summary, classification: item.classification, uncertainty_reason: item.uncertainty_reason, expected_updated_at: expected, reason }];
+  if (type === "policyCandidate") return [`/api/policy-candidates/${id}`, "PATCH", { title: item.title, publisher: item.publisher, topic: item.topic, scope: item.scope, summary: item.summary, change_summary: item.change_summary, requirements: item.requirements || [], effective_date: item.effective_date || null, change_type: item.change_type, expected_updated_at: expected, reason }];
+  if (type === "policy") return [`/api/policies/${id}`, "PATCH", { title: item.title, publisher: item.publisher, topic: item.topic, scope: item.scope, summary: item.summary, requirements: item.requirements || [], effective_date: item.effective_date || null, change_type: item.change_type, expected_updated_at: expected, reason }];
+  if (type === "matter") return [`/api/matters/${id}`, "PATCH", { title: item.title, summary: item.summary, goal: item.goal, completion_criteria: item.completion_criteria, owner: item.owner, target_date: item.target_date || null, expected_updated_at: expected, reason }];
+  if (type === "action") return [`/api/actions/${id}/planning-state`, "PATCH", { title: item.title, detail: item.detail, kind: item.kind, due_date: item.due_date || null, flow_state: item.flow_state, waiting_on: item.waiting_on, blocked_reason: item.blocked_reason, estimated_minutes: item.estimated_minutes || null, pinned: Boolean(item.pinned), expected_updated_at: expected, change_reason: reason }];
+  if (type === "reminder") return [`/api/reminders/${id}`, "PATCH", { title: item.title, reason: item.reason, due_at: item.due_at, action_id: item.action_id || null, expected_updated_at: expected, change_reason: reason }];
+  if (type === "fact") return [`/api/evidence/${encodeURIComponent(saved?.id || "")}/correct`, "POST", { value: item.value, field_type: item.field_type, reason, expected_created_at: saved?.created_at || null }];
+  if (type === "material") {
+    if (saved?.changed === false) return null;
+    return [`/api/materials/${id}/reassign`, "POST", { matter_id: item.matter_id, reason, expected_updated_at: saved?._material_updated_at || null }];
+  }
+  return null;
+}
+
+async function saveManualEdit(event) {
+    event.preventDefault();
+    if (!manualEditSession) return;
+    const { type, item, requiresReason } = manualEditSession;
+    const form = event.currentTarget;
+    const reason = form.elements.manual_reason.value.trim();
+    if (requiresReason && !reason) {
+      form.elements.manual_reason.focus({ preventScroll: true });
+      toast("请说明本次修改依据", "error");
+      return;
+    }
+    const saveButton = form.querySelector("[data-manual-save]");
+    saveButton.disabled = true;
+    saveButton.textContent = "保存中…";
+    const request = manualEditRequest(type, item);
+    try {
+      const saved = await api(request[0], {
+        method: request[1],
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(manualEditPayload(type, form, item)),
+      });
+      const focusSelector = `[data-manual-edit-type="${CSS.escape(type)}"][data-manual-edit-id="${CSS.escape(String(item.id))}"]`;
+      closeManualEditor(false);
+      const undo = manualEditUndo(type, item, saved);
+    const successMessage = type === "material" && saved?.changed === false
+      ? "材料仍归属于当前事项，无需调整"
+      : manualEditMessages[type] || "内容已保存";
+    toast(successMessage, "success", undo ? {
+      label: "撤销本次修改",
+      onClick: async () => {
+        try {
+          await api(undo[0], {
+            method: undo[1],
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(undo[2]),
+          });
+          toast("已撤销本次修改", "success");
+          await refreshRouteWithoutJump(focusSelector);
+        } catch (error) {
+          toast(friendlyError(error), "error");
+          await refreshRouteWithoutJump(focusSelector);
+        }
+      },
+      } : null);
+      await refreshRouteWithoutJump(focusSelector);
+    } catch (error) {
+      saveButton.disabled = false;
+      saveButton.textContent = "保存修改";
+      toast(friendlyError(error), "error");
+    }
+  }
+
+  function addManualEditButton(container, type, item, label = "修改信息") {
+    if (!container || !item?.id || container.querySelector("[data-manual-edit]")) return;
+    const button = document.createElement("button");
+    button.className = "button button-quiet manual-edit-button";
+    button.type = "button";
+    button.textContent = label;
+    button.dataset.manualEdit = type;
+    button.dataset.manualEditType = type;
+    button.dataset.manualEditId = String(item.id);
+    button.addEventListener("click", () => openManualEditor(type, item, button));
+    const host = container.querySelector(".source-actions, .action-controls, footer, aside") || container;
+    host.append(button);
+  }
+
+  function manualEditRecord(items, id) {
+    return (Array.isArray(items) ? items : []).find((item) => String(item.id) === String(id));
+  }
+
+  function bindManualCorrectionEntrances() {
+    const surface = page();
+    if (!surface) return;
+    const records = state.manualEditRecords || {};
+    $$('[data-email-message]', surface).forEach((card) => addManualEditButton(card, "email", manualEditRecord(records.emails, card.dataset.emailMessage)));
+    $$('[data-wechat-candidate]', surface).forEach((card) => addManualEditButton(card, "wechat", manualEditRecord(records.wechat, card.dataset.wechatCandidate)));
+    $$('[data-policy-candidate]', surface).forEach((card) => addManualEditButton(card, "policyCandidate", manualEditRecord(records.policyCandidates, card.dataset.policyCandidate)));
+    $$('[data-policy-panel="active"] .policy-row', surface).forEach((row, index) => addManualEditButton(row, "policy", records.policies?.[index]));
+    if (records.matter) {
+      addManualEditButton($(".matter-hero > div", surface), "matter", records.matter);
+      $$('[data-action-row]', surface).forEach((row) => addManualEditButton(row, "action", manualEditRecord(records.actions, row.dataset.actionRow)));
+      $$('[data-reminder-id]', surface).map((button) => button.closest(".matter-reminder")).filter(Boolean).forEach((row) => addManualEditButton(row, "reminder", manualEditRecord(records.reminders, row.querySelector("[data-reminder-id]")?.dataset.reminderId)));
+      $$('.fact-card', surface).forEach((card, index) => addManualEditButton(card, "fact", records.facts?.[index], "修正"));
+      $$('.source-row', surface).forEach((row, index) => addManualEditButton(row, "material", records.materials?.[index], "重新归属"));
+    }
   }
 
   function setConnection(online = state.online) {
@@ -506,15 +912,15 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
   }
 
   function routeFromHash() {
-    const raw = window.location.hash.replace(/^#\/?/, "") || "today";
+    const raw = window.location.hash.replace(/^#\/?/, "") || "matters";
     const parts = raw.split("/").filter(Boolean);
-    if (parts[0] === "matter" && parts[1])
-      return { name: "matter", id: decodeURIComponent(parts[1]) };
-    const name = ["today", "intake", "wechat", "email", "policies", "matters", "reviews", "nodes", "search"].includes(
+    if (["matters", "matter"].includes(parts[0]) && parts[1])
+      return { name: "matters", id: decodeURIComponent(parts[1]) };
+    const name = ["intake", "wechat", "email", "policies", "matters", "reviews", "nodes", "search"].includes(
       parts[0],
     )
       ? parts[0]
-      : "today";
+      : "matters";
     return { name };
   }
 
@@ -522,23 +928,24 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     if (state.homeRefreshTimer) window.clearTimeout(state.homeRefreshTimer);
     state.homeRefreshTimer = null;
     state.route = route.name;
-    const active = route.name === "matter" ? "matters" : route.name;
+    document.body.dataset.page = route.name;
     $$("[data-route]").forEach((link) =>
-      link.classList.toggle("active", link.dataset.route === active),
+        link.classList.toggle("active", link.dataset.route === route.name),
     );
     const titles = {
-      today: "今天",
+      today: "工作概览",
       intake: "随手投递",
       wechat: "聊天线索",
       email: "邮件工作",
       policies: "公司规定",
       matters: "事项推进",
-      matter: "事项详情",
       reviews: "需要我拍板",
       nodes: "助理状态",
       search: "搜索",
     };
     $("#page-title").textContent = titles[route.name] || "工作台";
+    const intakeLabel = $(".handoff-fab strong");
+    if (intakeLabel) intakeLabel.textContent = route.name === "matters" ? "新增材料" : "交给贾维斯";
     $("#page-kicker").textContent = new Intl.DateTimeFormat("zh-CN", {
       month: "long",
       day: "numeric",
@@ -550,8 +957,11 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     page().replaceChildren($("#loading-template").content.cloneNode(true));
   }
 
-  async function renderRoute({ quiet = false, preserveScroll = false } = {}) {
-    const route = routeFromHash();
+async function renderRoute({ quiet = false, preserveScroll = false } = {}) {
+  if (window.location.hash === "#/today") {
+    window.history.replaceState(null, "", "#/matters");
+  }
+  const route = routeFromHash();
     const scrollTop = preserveScroll ? window.scrollY : 0;
     setRoute(route);
     if (!quiet) showLoading();
@@ -598,20 +1008,25 @@ renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeRevi
         ]);
         renderPolicies(policyStatus, candidates, activePolicies, repealedPolicies);
       } else if (route.name === "matters") {
-        const [matters, people, openActions, doneActions] = await Promise.all([
+        const [matters, people] = await Promise.all([
           api("/api/matters?limit=100"),
           apiOptional("/api/people", []),
-          apiOptional("/api/actions?status=open", []),
-          apiOptional("/api/actions?status=done", []),
         ]);
-        renderMatters(matters, people, { open: openActions, done: doneActions });
-} else if (route.name === "matter") {
-const [matter, people, timeline] = await Promise.all([
-api(`/api/matters/${encodeURIComponent(route.id)}`),
-apiOptional("/api/people", []),
-apiOptional(`/api/matters/${encodeURIComponent(route.id)}/timeline`, []),
-]);
-renderMatter(matter, people, timeline);
+        state.matters = matters;
+      const selected = route.id
+        ? matters.find((item) => String(item.id) === String(route.id))
+        : matters.find((item) => !item.is_completed) || matters[0] || null;
+      if (!selected) {
+        state.selectedMatterId = null;
+        renderMatters(matters, people);
+      } else {
+        const [matter, timeline, workPackage] = await Promise.all([
+            api(`/api/matters/${encodeURIComponent(selected.id)}`),
+            apiOptional(`/api/matters/${encodeURIComponent(selected.id)}/timeline`, []),
+            apiOptional(`/api/matters/${encodeURIComponent(selected.id)}/work-package`, null),
+          ]);
+          renderMatter(matter, people, timeline, matters, workPackage);
+        }
       } else if (route.name === "reviews") {
         const [reviews, assigneeReviews, people] = await Promise.all([
           api("/api/reviews?review_status=pending"),
@@ -636,6 +1051,9 @@ renderSearch();
 async function refreshRouteWithoutJump(focusSelectorOverride = null) {
   const surface = page();
   const scrollTop = window.scrollY;
+  const detailSurface = surface.querySelector(".matter-workspace-detail");
+  const detailScrollTop = detailSurface?.scrollTop ?? null;
+  const detailScrollLeft = detailSurface?.scrollLeft ?? 0;
     const active = document.activeElement;
     const focusAttribute = active && [...active.attributes].find((item) => item.name.startsWith("data-") && item.value && item.name !== "data-enabled");
     const focusSelector = focusSelectorOverride || (active?.id
@@ -649,6 +1067,11 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
     const focusTarget = focusSelector ? surface.querySelector(focusSelector) : null;
     if (focusTarget instanceof HTMLElement) focusTarget.focus({ preventScroll: true });
     await new Promise((resolve) => requestAnimationFrame(resolve));
+    const refreshedDetailSurface = page().querySelector(".matter-workspace-detail");
+    if (refreshedDetailSurface && detailScrollTop !== null) {
+      refreshedDetailSurface.scrollTop = detailScrollTop;
+      refreshedDetailSurface.scrollLeft = detailScrollLeft;
+    }
     window.scrollTo(0, scrollTop);
     } finally {
       requestAnimationFrame(() => {
@@ -736,7 +1159,7 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
       )
       .join("");
     const href = item.matter_id
-      ? `#/matter/${encodeURIComponent(item.matter_id)}`
+      ? `#/matters/${encodeURIComponent(item.matter_id)}`
       : "#/matters";
     return `<article class="work-card ${stage.key}">
       <div class="work-card-top"><span class="source-icon">${escapeHtml(sourceLabel(item.source_type).slice(0, 1))}</span><div><small>${escapeHtml(sourceLabel(item.source_type))} · ${fmtDate(item.received_at)}</small><h3>${escapeHtml(materialTitle(item))}</h3></div><span class="live-state"><i></i>${escapeHtml(stage.label)}</span></div>
@@ -748,7 +1171,7 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
 
 function planHref(item) {
 const matterId = item.matter_id || item.matter?.id;
-if (matterId) return `#/matter/${encodeURIComponent(matterId)}`;
+if (matterId) return `#/matters/${encodeURIComponent(matterId)}`;
 if (item.item_type === "review" || ["review", "decision"].includes(item.kind)) return "#/reviews";
 return "#/matters";
 }
@@ -795,7 +1218,9 @@ const people = (review.people || []).slice(0, 8);
 }
 
   function renderIgnoredConversationRules(rules) {
-    const rows = Array.isArray(rules) ? rules : [];
+    const rows = Array.isArray(rules)
+      ? rules.filter((item) => item.rule_type !== "conversation_ignore")
+      : [];
     return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作规则</span><strong>${rows.filter((item) => item.enabled).length} 条正在使用</strong></summary><div class="learning-rule-list">${rows.length ? rows.map((item) => `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "正在使用，可随时停用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`).join("") : `<div class="plan-empty"><span>✓</span><div><strong>还没有形成个人规则</strong><p>屏蔽会话和后续纠正会在这里变成可查看的规则。</p></div></div>`}</div></details>`;
 }
 
@@ -832,9 +1257,9 @@ toast(friendlyError(error), "error");
 function attentionHref(item) {
   if (item?.target === "reviews") return "#/reviews";
   if (item?.matter_id) {
-    return `#/matter/${encodeURIComponent(item.matter_id)}`;
+    return `#/matters/${encodeURIComponent(item.matter_id)}`;
   }
-  return "#/today";
+    return "#/matters";
 }
 
 function attentionTypeLabel(type) {
@@ -891,75 +1316,26 @@ updateWechatCount(Number(wechatStatus?.counts?.pending || 0));
     ? "在线，自动读取；整理需手工启动"
     : "本机未连接，材料会等待读取";
 
-const next = Array.isArray(brief?.next) ? brief.next : [];
-const waiting = Array.isArray(brief?.waiting) ? brief.waiting : [];
-const risks = Array.isArray(brief?.risks) ? brief.risks : [];
-const decisions = Array.isArray(brief?.decisions) ? brief.decisions : [];
-const policyPending = Number(policyStatus?.counts?.pending || 0);
-
-page().innerHTML = `<section class="today-page"><header class="today-heading"><div><p class="eyebrow">${greeting()}，Frank</p><h2>今天只看下一步。</h2><span>贾维斯已根据截止时间、风险、责任人和跟进日期自动排序。</span></div><div class="today-status"><span class="status-dot ${nodeOnline ? "online" : "offline"}"></span>${nodeOnline ? "本机在线" : "等待本机接手"}</div></header><section class="today-now"><div class="section-title"><div><p>现在</p><h2>只处理一件最重要的事</h2></div><span>更新于 ${escapeHtml(fmtDate(brief?.generated_at))}</span></div>${renderNowCard(brief?.now)}</section><section class="today-plan-grid"><section class="plan-card plan-next"><header><div><p>接下来</p><h2>接下来三项</h2></div><span>${next.length} 件</span></header><div class="plan-list">${renderPlanList(next, "暂时没有排好的下一步", "有新行动后会自动排到这里，最多显示三件。")}</div></section><section class="plan-card"><header><div><p>等待</p><h2>正在等别人</h2></div><span>${waiting.length} 项</span></header><div class="plan-list">${renderPlanList(waiting, "目前没有等待反馈", "等待事项到了跟进日期后会自动回到优先队列。")}</div></section><section class="plan-card"><header><div><p>风险</p><h2>延期或失控风险</h2></div><span>${risks.length} 项</span></header><div class="plan-list">${renderPlanList(risks, "目前没有明显风险", "逾期、阻塞和风险行动会留在这里。")}</div></section><section class="plan-card"><header><div><p>拍板</p><h2>需要你确认</h2></div><span>${decisions.length} 项</span></header><div class="plan-list">${renderPlanList(decisions, "目前没有需要拍板的内容", "付款、审批、对外发送和重大规定变化始终由你确认。")}</div>${pendingReviews ? `<a class="plan-review-link" href="#/reviews">还有 ${pendingReviews} 条负责人或业务判断</a>` : ""}</section></section><section class="today-alerts">${Number(wechatStatus?.counts?.pending || 0) ? `<a href="#/wechat"><span>聊天线索</span><strong>${Number(wechatStatus.counts.pending)} 条等待确认</strong></a>` : ""}${policyPending ? `<a href="#/policies"><span>公司规定</span><strong>${policyPending} 条变化等待确认</strong></a>` : ""}</section>${renderWeeklyReview(weeklyReview)}${renderLearningRules(learningRules)}</section>`;
-
-  const attention = Array.isArray(brief?.attention) ? brief.attention : [];
-  page().querySelector(".today-plan-grid")?.insertAdjacentHTML(
-    "afterend",
-    renderAttention(attention, brief?.attention_counts || {}),
-  );
+  const attentionItems = Array.isArray(brief?.attention) ? brief.attention : [];
+  const attentionWaiting = Array.isArray(brief?.waiting) ? brief.waiting : [];
+  const attentionPolicyPending = Number(policyStatus?.counts?.pending || 0);
+  const sourceAlerts = [
+    Number(wechatStatus?.counts?.pending || 0)
+      ? `<a href="#/wechat"><span>聊天线索</span><strong>${Number(wechatStatus.counts.pending)} 条待确认</strong></a>`
+      : "",
+    attentionPolicyPending
+      ? `<a href="#/policies"><span>公司规定</span><strong>${attentionPolicyPending} 条变化待确认</strong></a>`
+      : "",
+  ].filter(Boolean).join("");
+  page().innerHTML = `<section class="today-page today-page-focused"><header class="today-heading"><div><p class="eyebrow">${greeting()}，Frank</p><h2>待我处理</h2><span>同一事项只显示一次，按拍板、确认、逾期、跟进和风险排序。</span></div><div class="today-status"><span class="status-dot ${nodeOnline ? "online" : "offline"}"></span>${nodeOnline ? "本机在线" : "等待本机接手"}</div></header>${renderAttention(attentionItems, brief?.attention_counts || {})}${sourceAlerts ? `<section class="today-alerts">${sourceAlerts}</section>` : ""}<details class="today-disclosure" data-today-disclosure="waiting" ${state.todayDisclosures.waiting ? "open" : ""}><summary><span>正在等别人</span><strong>${attentionWaiting.length} 项</strong></summary><div class="plan-list">${renderPlanList(attentionWaiting, "当前没有等待反馈的事项。")}</div></details>${renderWeeklyReview(weeklyReview)}</section>`;
   $$('[data-today-disclosure]').forEach((details) => details.addEventListener('toggle', () => {
-      state.todayDisclosures[details.dataset.todayDisclosure] = details.open;
-    }));
-    $$("[data-today-complete]").forEach((button) => button.addEventListener("click", () => changeTodayAction(button, button.dataset.todayComplete, "done")));
-$$("[data-today-snooze]").forEach((button) => button.addEventListener("click", () => changeTodayAction(button, button.dataset.todaySnooze, "snooze")));
-$$("[data-today-pin]").forEach((button) => button.addEventListener("click", () => changeTodayAction(button, button.dataset.todayPin, "pin")));
-$$("[data-learning-rule]").forEach((button) => button.addEventListener("click", async () => {
-const focusSelector = `[data-learning-rule="${CSS.escape(button.dataset.learningRule)}"]`;
-button.disabled = true;
-try {
-await api(`/api/learning-rules/${encodeURIComponent(button.dataset.learningRule)}`, {
-method: "PATCH",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }),
-});
-await refreshRouteWithoutJump(focusSelector);
-} catch (error) {
-button.disabled = false;
-toast(friendlyError(error), "error");
-}
-}));
-if (state.homeRefreshTimer) window.clearTimeout(state.homeRefreshTimer);
-state.homeRefreshTimer = window.setTimeout(() => {
-if (routeFromHash().name === "today") refreshRouteWithoutJump();
-}, (Array.isArray(materials) && materials.some((item) => ["queued", "claimed", "processing"].includes(item.status))) ? 10000 : 30000);
-}
-
-
-  function renderLearningRules(rules) {
-    const learned = (Array.isArray(rules) ? rules : []).filter(
-      (item) => item.rule_type !== "conversation_ignore",
-    );
-    const defaults = [
-      ["读取和整理分开", "微信、企微和邮箱可以自动读取；贾维斯只在你手工点击后整理，避免无谓消耗。"],
-      ["只留下需要推进的工作", "普通寒暄、加好友、占位图片和没有后续动作的内容不会要求你确认。"],
-      ["同一件事持续合并", "后续聊天和邮件优先追加到仍未完成的事项，不重复建立推进事项。"],
-      ["关键判断必须由你确认", "付款、审批、对外发送、重大规定变化和负责人建议不会自动成为最终结论。"],
-      ["完成事项退出工作队列", "已经完成的事项不再参与合并，也不会继续占用今日优先级。"],
-      ["自动处理可以追溯", "自动过滤、合并和排序保留理由与证据，出现误判时可以撤销或纠正。"],
-    ];
-    const defaultRows = defaults
-      .map(
-        ([title, description]) =>
-          `<article class="work-rule"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p></div><span>正在执行</span></article>`,
-      )
-      .join("");
-    const learnedRows = learned
-      .map(
-        (item) =>
-          `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "根据你的纠正持续使用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`,
-      )
-      .join("");
-    const activeCount = defaults.length + learned.filter((item) => item.enabled).length;
-    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作方式</span><strong>${activeCount} 条正在执行</strong></summary><div class="learning-rule-list">${defaultRows}${learnedRows}<footer><span>会话监听和屏蔽属于来源设置，不再混进工作规则。</span><a class="text-link" href="#/wechat">管理监听范围</a></footer></div></details>`;
+    state.todayDisclosures[details.dataset.todayDisclosure] = details.open;
+  }));
+  bindDynamic();
+    return;
   }
-function renderWechatCandidate(item, matters) {
+
+  function renderWechatCandidate(item, matters) {
   const sourceName = item.source === "wecom" ? "企业微信" : "个人微信";
   if (item.status === "processing") {
     return `<article class="wechat-candidate is-processing"><div class="wechat-card-head"><div><small>${sourceName} · ${escapeHtml(item.display_name)} ${fmtDate(item.window_end)}</small><h3>这段聊天已收下，等待你启动整理</h3></div><span class="wechat-state">等待整理</span></div><div class="wechat-card-skeleton"><i></i><i></i><i></i></div><p>点击页面顶部“让贾维斯整理新内容”后才会开始理解，不会自动消耗额度。</p></article>`;
@@ -1004,6 +1380,7 @@ function renderWechatCandidate(item, matters) {
 }
 
 function renderWechat(status, candidates, conversations, matters) {
+  state.manualEditRecords = { ...state.manualEditRecords, wechat: candidates };
   const counts = status?.counts || {};
   const sources = status?.sources || {};
   const personalStatus = sources.personal_wechat || {};
@@ -1245,35 +1622,104 @@ async function changeWechatConversation(button) {
   }
 }
 
-function renderSearchResults() {
-const target = $("#search-results");
-const summary = $("#search-summary");
-if (!target || !summary) return;
-const query = state.searchQuery.trim();
-if (!query) {
-summary.textContent = "输入关键词后，贾维斯会在允许的资料中查找";
-target.innerHTML = `<div class="search-empty"><span>⌕</span><strong>从一个关键词开始</strong><p>例如“游艇保险”“我在等谁”或一位同事的名字。</p></div>`;
-return;
-}
-if (!state.searchResults) {
-summary.textContent = "正在查找证据";
-target.innerHTML = `<div class="search-loading" aria-live="polite"><i></i><i></i><i></i></div>`;
-return;
-}
-const items = Array.isArray(state.searchResults.items) ? state.searchResults.items : [];
-const answer = state.searchResults.answer || {};
-summary.textContent = items.length ? `找到 ${items.length} 条相关记录` : "没有找到直接证据";
-const answerHtml = `<section class="search-answer"><header><span>贾维斯根据现有证据整理</span><strong>${items.length ? "找到可核实的相关内容" : "当前资料不足"}</strong></header>${(answer.facts || []).length ? `<ul>${answer.facts.map((fact) => `<li>${escapeHtml(humanText(fact, "", 260))}</li>`).join("")}</ul>` : ""}${(answer.missing || []).length ? `<div class="search-missing"><strong>还缺什么</strong><p>${escapeHtml(answer.missing.join("；"))}</p></div>` : ""}</section>`;
-const rows = items.length
-? items.map((item) => `<a class="search-result" href="${escapeHtml(item.href || "#/search")}"><span class="search-result-type">${escapeHtml(item.type_label || "记录")}</span><div><h3>${escapeHtml(humanText(item.title, "未命名记录", 160))}</h3><p>${escapeHtml(humanText(item.summary || item.body, "暂无摘要", 260))}</p><small>${escapeHtml(item.sort_reason || "正文匹配")}${item.created_at ? `，${fmtDate(item.created_at)}` : ""}</small></div><i>→</i></a>`).join("")
-: `<div class="search-empty"><span>⌕</span><strong>没有找到匹配内容</strong><p>可以减少筛选条件，或换一个更具体的业务关键词。</p></div>`;
-target.innerHTML = answerHtml + `<div class="search-result-list">${rows}</div>`;
-}
 
-async function performSearch() {
+  function renderSearchResults() {
+    const target = $("#search-results");
+    const summary = $("#search-summary");
+    if (!target || !summary) return;
+    const query = state.searchQuery.trim();
+    if (!query) {
+      summary.textContent = "输入关键词后，贾维斯会在允许的资料中查找";
+      target.innerHTML = `<div class="search-empty"><span>⌕</span><strong>从一个关键词开始</strong><p>例如“游艇保险”“我在等谁”或一位同事的名字。</p></div>`;
+      return;
+    }
+    if (!state.searchResults) {
+      summary.textContent = "正在查找证据";
+      target.innerHTML = `<div class="search-loading" aria-live="polite"><i></i><i></i><i></i></div>`;
+      return;
+    }
+    const items = Array.isArray(state.searchResults.items) ? state.searchResults.items : [];
+    const groups = new Map();
+    items.forEach((item) => {
+      const key = item.matter_id || `${item.entity_type}:${item.entity_id}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    });
+    summary.textContent = items.length ? `找到 ${items.length} 条原始证据，归入 ${groups.size} 组` : "没有找到直接证据";
+    const rows = items.length
+      ? [...groups.values()].map((group) => {
+        const matter = group.find((item) => item.entity_type === "matter");
+        const title = matter?.title || (group[0].matter_id ? "同一事项的相关证据" : group[0].title);
+        const evidence = group.map((item) => `<a class="search-result" href="${escapeHtml(item.href || "#/search")}"><span class="search-result-type">${escapeHtml(item.type_label || "记录")}</span><div><h3>${escapeHtml(humanText(item.title, "未命名记录", 160))}</h3><p>${escapeHtml(humanText(item.summary || item.body, "暂无摘要", 260))}</p><small>${escapeHtml(item.sort_reason || "正文匹配")}${item.created_at ? `，${fmtDate(item.created_at)}` : ""}</small></div><i>→</i></a>`).join("");
+        return `<section class="search-result-group"><header><strong>${escapeHtml(humanText(title, "相关证据", 160))}</strong><span>${group.length} 条</span></header>${evidence}</section>`;
+      }).join("")
+      : `<div class="search-empty"><span>⌕</span><strong>没有找到匹配内容</strong><p>可以减少筛选条件，或换一个更具体的业务关键词。</p></div>`;
+    const answer = state.searchResults.answer;
+    const answerHtml = state.searchAnswerVisible && answer
+      ? `<section class="search-answer"><header><span>贾维斯根据所选证据整理</span><strong>${items.length ? "供人工核对" : "当前资料不足"}</strong></header>${(answer.facts || []).length ? `<ul>${answer.facts.map((fact) => `<li>${escapeHtml(humanText(fact, "", 260))}</li>`).join("")}</ul>` : ""}${(answer.missing || []).length ? `<div class="search-missing"><strong>还缺什么</strong><p>${escapeHtml(answer.missing.join("；"))}</p></div>` : ""}</section>`
+      : items.length ? `<button class="button button-secondary search-answer-button" type="button" data-search-answer>根据这些证据整理回答</button>` : "";
+    target.innerHTML = `${answerHtml}<div class="search-result-groups">${rows}</div>`;
+    const renderedItems = [...groups.values()].flat();
+    $$(".search-result", target).forEach((resultLink, index) => {
+      const item = renderedItems[index];
+      const label = {
+        matter: "修改事项",
+        action: "修改行动",
+        material: "纠正归属",
+        evidence: "修正依据",
+      }[item?.entity_type];
+      if (!label) return;
+      const button = document.createElement("button");
+      button.className = "button button-quiet search-result-correct";
+      button.type = "button";
+      button.textContent = label;
+      resultLink.insertAdjacentElement("afterend", button);
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          let type = item.entity_type;
+          let record;
+          if (type === "matter") {
+            record = await api(`/api/matters/${encodeURIComponent(item.entity_id)}`);
+          } else if (type === "material") {
+            const [material, matters] = await Promise.all([
+              api(`/api/materials/${encodeURIComponent(item.entity_id)}`),
+              api("/api/matters?limit=100"),
+            ]);
+            record = material;
+            state.manualEditRecords = {
+              ...state.manualEditRecords,
+              matters: matters.items || matters,
+            };
+          } else {
+            const matter = await api(`/api/matters/${encodeURIComponent(item.matter_id)}`);
+            record = manualEditRecord(
+              type === "action" ? matter.actions : matter.evidence,
+              item.entity_id,
+            );
+            if (type === "evidence") type = "fact";
+          }
+          if (!record) throw new Error("未找到可修改的原记录");
+          openManualEditor(type, record, button);
+        } catch (error) {
+          button.disabled = false;
+          toast(friendlyError(error, "暂时无法打开修改面板"), "error");
+        }
+      });
+    });
+    $("[data-search-answer]", target)?.addEventListener("click", async (event) => {
+      event.currentTarget.disabled = true;
+      event.currentTarget.textContent = "正在整理…";
+      state.searchAnswerVisible = true;
+      await performSearch(true);
+    });
+  }
+
+  async function performSearch(includeAnswer = false) {
 const query = state.searchQuery.trim();
 if (!query) {
-state.searchResults = null;
+    state.searchResults = null;
+    if (!includeAnswer) state.searchAnswerVisible = false;
 renderSearchResults();
 return;
 }
@@ -1285,7 +1731,8 @@ if (filters.source) params.set("source", filters.source);
 if (filters.status) params.set("status", filters.status);
 if (filters.dateFrom) params.set("date_from", filters.dateFrom);
 if (filters.dateTo) params.set("date_to", filters.dateTo);
-if (filters.amount) params.set("amount", filters.amount);
+    if (filters.amount) params.set("amount", filters.amount);
+    if (includeAnswer) params.set("include_answer", "true");
 try {
 state.searchResults = await api(`/api/search?${params.toString()}`);
 renderSearchResults();
@@ -1350,12 +1797,13 @@ if (state.searchQuery.trim()) performSearch();
     return `<div class="matter-list">${items
       .map(
         (item) =>
-          `<article class="matter-row ${completed ? "completed" : ""}" data-search="${escapeHtml(`${item.title} ${item.summary}`.toLowerCase())}"><a href="#/matter/${encodeURIComponent(item.id)}"><span class="matter-monogram">${escapeHtml(matterTitle(item.title).slice(0, 1))}</span><div><p>${completed ? "完成归档" : "更新于"} ${fmtDate(item.updated_at)}</p><h3>${escapeHtml(matterTitle(item.title))}</h3><span>${escapeHtml(humanText(item.summary, "贾维斯尚未形成摘要", 180))}</span><footer>${badge(`${item.material_count || 0} 份材料`, "muted")}${completed ? badge("已完成", "green") : badge(`${item.open_action_count || 0} 个下一步`, item.open_action_count ? "blue" : "muted")}${!completed && item.pending_review_count ? badge(`${item.pending_review_count} 待拍板`, "amber") : ""}${!completed && item.open_reminder_count ? badge(`${item.open_reminder_count} 个提醒`, "muted") : ""}</footer></div><i>→</i></a></article>`,
+        `<article class="matter-row ${completed ? "completed" : ""}" data-search="${escapeHtml(`${item.title} ${item.summary}`.toLowerCase())}"><a href="#/matters/${encodeURIComponent(item.id)}"><span class="matter-monogram">${escapeHtml(matterTitle(item.title).slice(0, 1))}</span><div><p>${completed ? "完成归档" : "更新于"} ${fmtDate(item.updated_at)}</p><h3>${escapeHtml(matterTitle(item.title))}</h3><span>${escapeHtml(humanText(item.summary, "贾维斯尚未形成摘要", 180))}</span><footer>${badge(`${item.material_count || 0} 份材料`, "muted")}${completed ? badge("已完成", "green") : badge(`${item.open_action_count || 0} 个下一步`, item.open_action_count ? "blue" : "muted")}${!completed && item.pending_review_count ? badge(`${item.pending_review_count} 待拍板`, "amber") : ""}${!completed && item.open_reminder_count ? badge(`${item.open_reminder_count} 个提醒`, "muted") : ""}</footer></div><i>→</i></a></article>`,
       )
       .join("")}</div>`;
   }
 
 function renderEmail(status, messages, matters) {
+  state.manualEditRecords = { ...state.manualEditRecords, emails: messages };
   const account = status?.accounts?.[0];
   const latest = status?.latest || {};
   const checking = ["pending", "running"].includes(latest.status);
@@ -1373,7 +1821,7 @@ function renderEmail(status, messages, matters) {
             <header><div><small>${fmtDate(item.sent_at)}</small><h3>${escapeHtml(emailSubject(item.subject || item.matter_title))}</h3></div><span>需要推进</span></header>
             <p>${escapeHtml(emailSummary(item.summary, "已识别出需要继续推进的工作邮件", 320))}</p>
             ${item.evidence?.length ? `<div class="email-evidence"><strong>邮件中的明确要求</strong><ul>${item.evidence.map((value) => `<li>${escapeHtml(humanText(value, "", 360))}</li>`).join("")}</ul></div>` : ""}
-            <footer>${item.matter_id ? `<a class="button button-secondary" href="#/matter/${encodeURIComponent(item.matter_id)}">查看事项推进</a>` : ""}<button class="button button-quiet" type="button" data-email-ignore>不是工作</button></footer>
+          <footer>${item.matter_id ? `<a class="button button-secondary" href="#/matters/${encodeURIComponent(item.matter_id)}">查看事项推进</a>` : ""}<button class="button button-quiet" type="button" data-email-ignore>不是工作</button></footer>
           </article>`,
         )
         .join("")
@@ -1382,7 +1830,7 @@ function renderEmail(status, messages, matters) {
     items.length
       ? items
           .map(
-            (item) => `<a class="email-matter-row ${completed ? "completed" : ""}" href="#/matter/${encodeURIComponent(item.id)}"><div><small>${completed ? "已完成" : `${item.open_action_count || 0} 项待推进`}</small><h3>${escapeHtml(emailSubject(item.title, "待整理事项", 100))}</h3><p>${escapeHtml(emailSummary(item.summary, "等待整理", 220))}</p></div><i>→</i></a>`,
+        (item) => `<a class="email-matter-row ${completed ? "completed" : ""}" href="#/matters/${encodeURIComponent(item.id)}"><div><small>${completed ? "已完成" : `${item.open_action_count || 0} 项待推进`}</small><h3>${escapeHtml(emailSubject(item.title, "待整理事项", 100))}</h3><p>${escapeHtml(emailSummary(item.summary, "等待整理", 220))}</p></div><i>→</i></a>`,
           )
           .join("")
       : `<div class="wechat-empty compact"><div><strong>${completed ? "还没有已完成的邮件事项" : "还没有邮件事项"}</strong><p>${completed ? "完成后的邮件工作会自动归档到这里。" : "只有确实需要跟进的工作邮件才会建立事项。"}</p></div></div>`;
@@ -1450,6 +1898,7 @@ function renderEmail(status, messages, matters) {
       }
     }),
   );
+  bindManualCorrectionEntrances();
 }
 
   function renderPolicyCandidate(item, policies) {
@@ -1565,6 +2014,7 @@ function renderEmail(status, messages, matters) {
   }
 
   function renderPolicies(status, candidates, activePolicies, repealedPolicies) {
+    state.manualEditRecords = { ...state.manualEditRecords, policyCandidates: candidates, policies: activePolicies, repealedPolicies };
     const pending = candidates.filter((item) => item.status === "pending");
     const recent = candidates.filter((item) => ["applied", "auto_applied", "undone"].includes(item.status)).slice(0, 40);
     const obsidian = status?.obsidian || {};
@@ -1616,6 +2066,7 @@ function renderEmail(status, messages, matters) {
       toast("保存位置已复制", "success");
     }));
     setPolicyTab(state.policyTab);
+    bindManualCorrectionEntrances();
   }
 
   function renderPersonActionRows(actions, people) {
@@ -1625,7 +2076,7 @@ function renderEmail(status, messages, matters) {
     return `<div class="person-action-list">${actions
       .map((action) => {
         const matterId = action.matter_id || action.matter?.id;
-        const href = matterId ? `#/matter/${encodeURIComponent(matterId)}` : "#/matters";
+        const href = matterId ? `#/matters/${encodeURIComponent(matterId)}` : "#/matters";
         return `<article class="person-action-row" data-search="${escapeHtml(`${actionTitle(action)} ${actionDetail(action)} ${actionMatterLabel(action)}`.toLowerCase())}"><div><small>${escapeHtml(actionMatterLabel(action))}${action.due_date ? ` · 截止 ${escapeHtml(action.due_date)}` : ""}</small><h3>${escapeHtml(actionTitle(action))}</h3><p>${escapeHtml(actionDetail(action))}</p><footer>${badge(action.status === "done" ? "已完成" : "未完成", action.status === "done" ? "green" : "blue")}${pendingAssignees(action).length ? badge("负责人待确认", "amber") : ""}</footer></div><a class="button button-secondary" href="${href}">查看事项</a></article>`;
       })
       .join("")}</div>`;
@@ -1667,7 +2118,34 @@ function renderEmail(status, messages, matters) {
     const completedMatters = state.matters.filter((item) => item.is_completed);
     const openActions = Array.isArray(actionGroups.open) ? actionGroups.open : [];
     const doneActions = Array.isArray(actionGroups.done) ? actionGroups.done : [];
-    page().innerHTML = `<section class="section-heading"><div><p class="eyebrow">按事情，而不是按来源</p><h2>事项推进</h2><span>默认只看仍需推进的事项，完成后自动归入已完成。</span></div><button class="button button-primary" type="button" data-open-intake>＋ 新材料</button></section><label class="matter-search"><span>⌕</span><input id="matter-filter" placeholder="搜索事项、金额、人员或关键词"></label><nav class="wechat-tabs matter-top-tabs" aria-label="事项查看方式" role="tablist"><button class="${state.matterTab === "all" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterTab === "all"}" data-matter-tab="all">全部事项</button><button class="${state.matterTab === "people" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterTab === "people"}" data-matter-tab="people">按负责人</button></nav><nav class="wechat-tabs matter-view-tabs" aria-label="事项完成状态" role="tablist"><button class="${state.matterStatus === "open" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterStatus === "open"}" data-matter-view="open">未完成 <span>${state.matterTab === "people" ? openActions.length : openMatters.length}</span></button><button class="${state.matterStatus === "completed" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterStatus === "completed"}" data-matter-view="completed">已完成 <span>${state.matterTab === "people" ? doneActions.length : completedMatters.length}</span></button></nav><section class="matter-mode" data-matter-mode="all" ${state.matterTab === "all" ? "" : "hidden"}><section id="open-matters" class="matter-group" role="tabpanel" data-matter-panel="open" ${state.matterStatus === "open" ? "" : "hidden"}><header><div><h3>正在推进</h3><p>仍有下一步、待拍板、提醒或后台处理的事项。</p></div><strong>${openMatters.length} 项</strong></header>${renderMatterRows(openMatters, false)}</section><section id="completed-matters" class="matter-group" role="tabpanel" data-matter-panel="completed" ${state.matterStatus === "completed" ? "" : "hidden"}><header><div><h3>已完成</h3><p>所有推进动作和提醒都已关闭，可随时回查证据。</p></div><strong>${completedMatters.length} 项</strong></header>${renderMatterRows(completedMatters, true)}</section></section><section class="matter-mode" data-matter-mode="people" ${state.matterTab === "people" ? "" : "hidden"}><section class="matter-group" role="tabpanel" data-matter-person-panel="open" ${state.matterStatus === "open" ? "" : "hidden"}><header><div><h3>按负责人推进</h3><p>只显示已确认负责人；建议人选仍停在负责人待明确。</p></div><strong>${openActions.length} 项</strong></header>${renderPersonGroups(openActions, state.people)}</section><section class="matter-group" role="tabpanel" data-matter-person-panel="completed" ${state.matterStatus === "completed" ? "" : "hidden"}><header><div><h3>已完成行动</h3><p>完成后的行动按最后确认的负责人归档。</p></div><strong>${doneActions.length} 项</strong></header>${renderPersonGroups(doneActions, state.people)}</section></section>`;
+      page().innerHTML = `<section class="section-heading"><div><p class="eyebrow">按事情，而不是按来源</p><h2>事项推进</h2><span>默认只看仍需推进的事项，完成后自动归入已完成。</span></div><button class="button button-primary" type="button" data-open-intake>＋ 新材料</button></section><label class="matter-search"><span>⌕</span><input id="matter-filter" placeholder="搜索事项、金额、人员或关键词"></label><nav class="wechat-tabs matter-top-tabs" aria-label="事项查看方式" role="tablist"><button class="${state.matterTab === "all" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterTab === "all"}" data-matter-tab="all">全部事项</button><button class="${state.matterTab === "people" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterTab === "people"}" data-matter-tab="people">按负责人</button></nav><nav class="wechat-tabs matter-view-tabs" aria-label="事项完成状态" role="tablist"><button class="${state.matterStatus === "open" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterStatus === "open"}" data-matter-view="open">未完成 <span>${state.matterTab === "people" ? openActions.length : openMatters.length}</span></button><button class="${state.matterStatus === "completed" ? "active" : ""}" type="button" role="tab" aria-selected="${state.matterStatus === "completed"}" data-matter-view="completed">已完成 <span>${state.matterTab === "people" ? doneActions.length : completedMatters.length}</span></button></nav><section class="matter-mode" data-matter-mode="all" ${state.matterTab === "all" ? "" : "hidden"}><section id="open-matters" class="matter-group" role="tabpanel" data-matter-panel="open" ${state.matterStatus === "open" ? "" : "hidden"}><header><div><h3>正在推进</h3><p>仍有下一步、待拍板、提醒或后台处理的事项。</p></div><strong>${openMatters.length} 项</strong></header>${renderMatterRows(openMatters, false)}</section><section id="completed-matters" class="matter-group" role="tabpanel" data-matter-panel="completed" ${state.matterStatus === "completed" ? "" : "hidden"}><header><div><h3>已完成</h3><p>所有推进动作和提醒都已关闭，可随时回查证据。</p></div><strong>${completedMatters.length} 项</strong></header>${renderMatterRows(completedMatters, true)}</section></section><section class="matter-mode" data-matter-mode="people" ${state.matterTab === "people" ? "" : "hidden"}><section class="matter-group" role="tabpanel" data-matter-person-panel="open" ${state.matterStatus === "open" ? "" : "hidden"}><header><div><h3>按负责人推进</h3><p>只显示已确认负责人；建议人选仍停在负责人待明确。</p></div><strong>${openActions.length} 项</strong></header>${renderPersonGroups(openActions, state.people)}</section><section class="matter-group" role="tabpanel" data-matter-person-panel="completed" ${state.matterStatus === "completed" ? "" : "hidden"}><header><div><h3>已完成行动</h3><p>完成后的行动按最后确认的负责人归档。</p></div><strong>${doneActions.length} 项</strong></header>${renderPersonGroups(doneActions, state.people)}</section></section>`;
+
+      $(".section-heading .eyebrow", page()).textContent = "工作台账";
+      $(".section-heading h2", page()).textContent = "推进事项清单";
+      $(".section-heading span", page()).textContent =
+        "先从完整清单掌握进度，再进入单项办理。";
+      $("#matter-filter", page()).placeholder = "搜索事项名称、内容或人员";
+      $$(".matter-top-tabs, .matter-view-tabs", page()).forEach((item) => item.remove());
+      const allMode = $('[data-matter-mode="all"]', page());
+      const peopleMode = $('[data-matter-mode="people"]', page());
+      peopleMode?.remove();
+      if (allMode) allMode.hidden = false;
+      const openPanel = $('[data-matter-panel="open"]', page());
+      if (openPanel) {
+        openPanel.hidden = false;
+        $("header h3", openPanel).textContent = "全部推进事项";
+        $("header p", openPanel).textContent =
+          "清单集中显示事项摘要、待办数量、待确认内容和要求日期。";
+      }
+      const completedPanel = $('[data-matter-panel="completed"]', page());
+      if (completedPanel && allMode) {
+        completedPanel.hidden = false;
+        const archive = document.createElement("details");
+        archive.className = "matter-completed-archive";
+        archive.innerHTML = `<summary><span>已完成事项</span><strong>${completedMatters.length} 项</strong></summary>`;
+        archive.append(completedPanel);
+        allMode.append(archive);
+      }
 
     $$("[data-matter-tab]", page()).forEach((button) => {
       button.addEventListener("click", () => {
@@ -1792,7 +2270,47 @@ return `<section class="content-card matter-timeline-card"><div class="section-t
     return `<article class="matter-reminder"><div><span>${escapeHtml(item.kind === "overdue" ? "已到期" : item.kind === "review" ? "待拍板" : "需关注")}</span><h3>${escapeHtml(humanText(item.title, "未完成提醒", 160))}</h3><p>${escapeHtml(humanText(item.reason, "这件事仍需要处理。", 280))}</p></div><footer>${primary}${dismiss}</footer></article>`;
   }
 
-function renderMatter(matter, people = [], timeline = []) {
+function renderMatterWorkspaceList(items = [], selectedId = "") {
+  const openItems = items.filter((item) => !item.is_completed);
+  if (!openItems.length) {
+    return `<div class="matter-workspace-empty"><strong>当前没有待推进事项</strong><p>新事项形成后会显示在这里。</p></div>`;
+  }
+  const needsHandling = openItems.filter(
+    (item) =>
+      Number(item.pending_review_count || 0) > 0 ||
+      Number(item.blocked_action_count || 0) > 0 ||
+      Number(item.open_reminder_count || 0) > 0 ||
+      Number(item.open_action_count || 0) > 0,
+  );
+  const following = openItems.filter((item) => !needsHandling.includes(item));
+  const rows = (group) => group
+    .map(
+      (item) => `<button class="matter-workspace-item ${String(item.id) === String(selectedId) ? "active" : ""}" type="button" data-workspace-matter="${escapeHtml(item.id)}" data-search="${escapeHtml(`${item.title || ""} ${item.summary || ""}`.toLowerCase())}" aria-pressed="${String(item.id) === String(selectedId) ? "true" : "false"}"><div><h3>${escapeHtml(matterTitle(item.title))}</h3><small>${item.pending_review_count ? `${item.pending_review_count} 项待确认` : `${item.open_action_count || 0} 项待办`}${item.target_date ? ` · ${escapeHtml(item.target_date)}` : ""}</small></div><span aria-hidden="true">›</span></button>`,
+    )
+    .join("");
+  return `${needsHandling.length ? `<div class="matter-workspace-group" data-workspace-group><strong>当前需要推进</strong><span>${needsHandling.length} 项</span></div>${rows(needsHandling)}` : ""}${following.length ? `<div class="matter-workspace-group" data-workspace-group><strong>持续跟进</strong><span>${following.length} 项</span></div>${rows(following)}` : ""}`;
+}
+
+function renderWorkPackageStep(step = {}, index = 0) {
+  const kindOptions = [["task", "下一步"], ["conclusion", "明确结论"], ["risk", "风险"], ["decision", "待拍板"], ["waiting", "等待反馈"]];
+  const flowOptions = [["needs_action", "待办理"], ["waiting", "等待反馈"], ["blocked", "暂时受阻"], ["needs_decision", "等待拍板"]];
+  const options = (items, value) => items.map(([key, label]) => `<option value="${key}"${key === value ? " selected" : ""}>${label}</option>`).join("");
+  return `<article class="work-package-step" data-work-package-step data-step-index="${index}"><label class="work-package-select"><input type="checkbox" data-work-package-select value="${index}"><span>采纳为待办</span></label><div class="work-package-step-main"><label>步骤标题<input name="step_title" maxlength="200" value="${escapeHtml(step.title || "")}" placeholder="例如：复核原始凭证"></label><label>办理说明<textarea name="step_detail" rows="2" maxlength="2000" placeholder="写清办理内容和交付结果">${escapeHtml(step.detail || "")}</textarea></label></div><div class="work-package-step-fields"><label>行动类型<select name="step_kind">${options(kindOptions, step.kind || "task")}</select></label><label>负责人<input name="step_owner" maxlength="100" value="${escapeHtml(step.owner || "")}" placeholder="待明确可留空"></label><label>截止日期<input name="step_due_date" type="date" value="${escapeHtml(step.due_date || "")}"></label><label>推进状态<select name="step_flow_state">${options(flowOptions, step.flow_state || "needs_action")}</select></label><label>等待对象<input name="step_waiting_on" maxlength="200" value="${escapeHtml(step.waiting_on || "")}"></label><label>下次跟进时间<input name="step_next_follow_up_at" type="datetime-local" value="${escapeHtml(manualEditDateTime(step.next_follow_up_at))}"></label><label>预计用时（分钟）<input name="step_estimated_minutes" type="number" min="0" max="10080" value="${escapeHtml(step.estimated_minutes ?? "")}"></label><label class="work-package-step-blocked">受阻说明<textarea name="step_blocked_reason" rows="2" maxlength="1000">${escapeHtml(step.blocked_reason || "")}</textarea></label></div></article>`;
+}
+
+  function renderWorkPackage(matter, workPackage) {
+  if (!workPackage) {
+    return `<section class="matter-work-package" data-work-package data-matter-id="${escapeHtml(matter.id)}"><div class="section-title"><div><p>办理准备</p><h2>办理方案</h2></div><button class="button button-secondary" type="button" data-work-package-generate>新建办理方案</button></div><p class="work-package-help">方案只用于准备工作；只有人工采纳的步骤才会进入待办。</p><div class="work-package-feedback" aria-live="polite"></div></section>`;
+  }
+    const draft = workPackage.draft || {};
+    const steps = Array.isArray(draft.steps) ? draft.steps : [];
+    const lines = (values) => Array.isArray(values) ? values.join("\n") : "";
+    const reply = draft.reply_draft || {};
+    const stale = workPackage.status === "stale";
+    return `<section class="matter-work-package" data-work-package data-matter-id="${escapeHtml(matter.id)}" data-package-status="${escapeHtml(workPackage.status || "draft")}"><div class="section-title"><div><p>办理准备</p><h2>办理方案</h2></div><span>第 ${escapeHtml(workPackage.version || 1)} 版</span></div>${stale ? `<div class="work-package-stale"><div><strong>事项内容已有变化，当前草稿已保留</strong><p>可以继续保存草稿；重新核对事项内容后，再生成新的办理方案。</p></div><button class="button button-secondary" type="button" data-work-package-regenerate>重新生成办理方案</button></div>` : ""}<form data-work-package-form data-package-updated="${escapeHtml(workPackage.updated_at || "")}"><label>当前结论<textarea name="conclusion" rows="3" maxlength="2000" placeholder="写下当前结论或办理口径">${escapeHtml(draft.conclusion || "")}</textarea></label><label>可靠依据（每行一项）<textarea name="basis" rows="3" maxlength="4000" placeholder="列出支持当前结论的材料或事实">${escapeHtml(lines(draft.basis))}</textarea></label><div class="work-package-two-column"><label>信息缺口（每行一项）<textarea name="gaps" rows="3" maxlength="3000" placeholder="仍需补充或核实的信息">${escapeHtml(lines(draft.gaps))}</textarea></label><label>业务风险（每行一项）<textarea name="risks" rows="3" maxlength="3000" placeholder="可能影响进度或结果的风险">${escapeHtml(lines(draft.risks))}</textarea></label></div><label>待确认问题（每行一项）<textarea name="questions" rows="3" maxlength="3000" placeholder="需要 Frank 或相关人员确认的问题">${escapeHtml(lines(draft.questions))}</textarea></label><div class="work-package-reply"><label>回复或汇报用途<input name="reply_purpose" maxlength="200" value="${escapeHtml(reply.purpose || "")}" placeholder="例如：向分管领导汇报"></label><label>回复或汇报草稿<textarea name="reply_text" rows="4" maxlength="5000" placeholder="仅保存草稿，不会自动发送">${escapeHtml(reply.text || "")}</textarea></label></div><div class="work-package-steps" data-work-package-steps>${steps.length ? steps.map(renderWorkPackageStep).join("") : `<p class="work-package-empty">还没有步骤，请先添加。</p>`}</div><div class="work-package-controls"><button class="button button-quiet" type="button" data-work-package-add>＋ 添加步骤</button><button class="button button-secondary" type="submit">保存方案</button><button class="button button-primary" type="button" data-work-package-apply disabled${stale ? " aria-disabled=\"true\" title=\"事项内容变化后需重新生成办理方案\"" : ""}>采纳所选步骤</button></div><p class="work-package-help">保存只更新方案；采纳后，所选步骤才会成为待办。回复草稿不会自动发送。</p><div class="work-package-feedback" aria-live="polite"></div></form></section>`;
+}
+
+function renderMatter(matter, people = [], timeline = [], matters = [], workPackage = null) {
     state.people = normalizePeople(people);
     const assistant = matter.assistant || {};
     const brief = assistant.brief || {};
@@ -1815,15 +2333,15 @@ function renderMatter(matter, people = [], timeline = []) {
       .filter(Boolean),
   );
     const facts = evidence.filter((item) => item.claim_type === "fact");
-    const whatDone = (brief.what_i_did || [])
-      .map(
-        (item) => `<li>${escapeHtml(humanText(item, "已完成整理", 140))}</li>`,
-      )
-      .join("");
-    const agentCard = assistant.display_name
-      ? `<section class="matter-agent-card"><div class="matter-agent-head"><div class="assistant-avatar large"><span>贾</span><i></i></div><div><p>贾维斯已接手</p><h2>${escapeHtml(humanText(brief.headline, matter.summary, 220))}</h2></div>${badge(humanText(assistant.source, "已完成理解", 32), "green")}</div>${whatDone ? `<ul>${whatDone}</ul>` : ""}${brief.needs_you ? `<div class="matter-needs-you"><span>需要你拍板</span><p>${escapeHtml(humanText(brief.needs_you, "", 300))}</p></div>` : ""}<footer><span>下一次检查</span><strong>${brief.next_check_at ? `${fmtDate(brief.next_check_at)} · ${escapeHtml(humanText(brief.next_check_reason, "复查进展", 160))}` : "有新进展时主动提醒"}</strong></footer></section>`
-      : `<section class="matter-agent-card waiting"><div class="matter-agent-head"><div class="assistant-avatar large"><span>贾</span><i></i></div><div><p>贾维斯</p><h2>这件事还没有经过贾维斯深度整理</h2></div></div><p>可以让贾维斯重新研读原始材料，生成业务摘要、下一步和追踪计划。</p></section>`;
-
+    state.manualEditRecords = {
+      ...state.manualEditRecords,
+      matter,
+      matters: Array.isArray(matters) ? matters : [],
+      actions,
+      reminders,
+      facts: facts.slice(0, 12),
+      materials: matter.materials || [],
+    };
     const actionHtml = actions.length
       ? actions.map((item) => renderAction(item, state.people)).join("")
       : `<li class="calm-empty"><span>✓</span><div><strong>暂时没有开放动作</strong><p>贾维斯识别到新的下一步后会出现在这里。</p></div></li>`;
@@ -1834,10 +2352,10 @@ function renderMatter(matter, people = [], timeline = []) {
       ? reviews
           .map(
             (item) =>
-              `<article class="decision-box"><span>需要你</span><h3>${escapeHtml(humanText(item.payload?.value || item.title, "有一条判断需要确认", 160).replace(/^确认推断[：:]\s*/, ""))}</h3><p>${escapeHtml(humanText(item.payload?.quote, "请回到原始依据确认。", 260))}</p><a href="#/reviews">去拍板 →</a></article>`,
+              `<article class="decision-box matter-decision" data-review-row="${escapeHtml(item.id)}"><span>需确认</span><h3>${escapeHtml(humanText(item.payload?.value || item.title, "有一条判断需要确认", 160).replace(/^确认推断[：:]\s*/, ""))}</h3><p>${escapeHtml(humanText(item.payload?.quote, "请回到原始依据确认。", 260))}</p><textarea class="review-note" rows="2" aria-label="修正内容" placeholder="仅在需要修正时填写"></textarea><footer><button class="button button-primary" type="button" data-review-action="accepted" data-review-id="${escapeHtml(item.id)}">确认无误</button><button class="button button-secondary" type="button" data-review-action="edited" data-review-id="${escapeHtml(item.id)}">修正后确认</button><button class="button button-quiet" type="button" data-review-action="rejected" data-review-id="${escapeHtml(item.id)}">不采纳</button></footer></article>`,
           )
           .join("")
-      : `<div class="calm-inline"><span>✓</span>目前没有需要你判断的内容</div>`;
+      : "";
     const factsHtml = facts.length
       ? facts
           .slice(0, 12)
@@ -1847,7 +2365,9 @@ function renderMatter(matter, people = [], timeline = []) {
           )
           .join("")
       : `<div class="calm-inline">尚无可直接核实的事实依据</div>`;
-  const matterProgressHtml = `<section class="content-card matter-progress-card"><div class="section-title"><div><p>手工更新</p><h2>状态、闭环日期与业务推进</h2></div><span>每次保存都会进入时间线</span></div><div class="matter-progress-grid"><form data-matter-status-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-status">事项状态</label><div class="matter-inline-fields"><select id="matter-status" name="status"><option value="active" ${matter.status === "completed" ? "" : "selected"}>正在推进</option><option value="completed" ${matter.status === "completed" ? "selected" : ""}>已完成</option></select><button class="button button-secondary" type="submit">保存状态</button></div><small>标记完成后进入完成归档；重新打开后回到推进列表。</small></form><form data-matter-date-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-target-date">要求闭环日期</label><div class="matter-inline-fields"><input id="matter-target-date" name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"><button class="button button-secondary" type="submit">保存日期</button></div><small>不确定日期时可以留空后保存。</small></form><form data-matter-progress-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-progress-summary">本次推进结果</label><input id="matter-progress-summary" name="summary" maxlength="200" placeholder="例如：已完成第一轮数据核对" required><label for="matter-progress-detail">补充说明</label><textarea id="matter-progress-detail" name="detail" rows="3" maxlength="2000" placeholder="记录已做了什么、还缺什么、下一步等谁。"></textarea><button class="button button-primary" type="submit">记录推进</button></form></div></section>`;
+  const matterProgressHtml = `<div class="matter-progress-compact"><div><strong>记录本次办理结果</strong><span>保存后自动进入事项记录</span></div><form data-matter-progress-form data-matter-id="${escapeHtml(matter.id)}"><textarea id="matter-progress-summary" name="summary" rows="2" maxlength="200" placeholder="例如：已完成数据复核，等待对方补充盖章文件" required></textarea><input name="detail" type="hidden" value=""><button class="button button-primary" type="submit">保存记录</button></form></div><details class="matter-settings"><summary>日期与事项设置</summary><form data-matter-date-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-target-date">要求闭环日期</label><div class="matter-inline-fields"><input id="matter-target-date" name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"><button class="button button-secondary" type="submit">保存日期</button></div></form><p>当前状态：${escapeHtml(stateLabel(matter.status))}。事项收尾前应先核对未完成行动、提醒和待确认内容。</p></details>`;
+  const workPackageHtml = renderWorkPackage(matter, workPackage);
+  const closeCheckHtml = `<section class="content-card matter-close-check" data-close-check data-matter-id="${escapeHtml(matter.id)}"><div class="section-title"><div><p>事项收尾</p><h2>关闭前先核对未完成内容</h2></div><button class="button button-secondary" type="button" data-close-preview>执行收尾检查</button></div><p class="matter-close-check-help">检查只读取行动、提醒、待确认项和后台任务，不会替你关闭或忽略任何内容。</p><div class="matter-close-check-result" data-close-check-result aria-live="polite"></div></section>`;
   const materialsHtml = (matter.materials || [])
       .map(
         (item) =>
@@ -1855,17 +2375,91 @@ function renderMatter(matter, people = [], timeline = []) {
       )
       .join("");
 
-    page().innerHTML = `<a class="back-link" href="#/matters">← 返回事项</a><section class="matter-hero"><div><p>${stateLabel(matter.status)} 更新于 ${fmtDate(matter.updated_at)}</p><h2>${escapeHtml(matterTitle(matter.title))}</h2><span>${escapeHtml(humanText(matter.summary, "贾维斯正在整理摘要。", 420))}</span></div><aside><strong>${actions.filter((item) => item.status === "open").length}</strong><small>待推进</small><strong>${reviews.length}</strong><small>待你拍板</small></aside></section>${agentCard}${renderMatterTimeline(timeline)}<div class="matter-layout"><main><section class="content-card"><div class="section-title"><div><p>行动台账</p><h2>接下来怎么做</h2></div><span>${actions.length} 项</span></div><ul class="action-list">${actionHtml}</ul></section><section class="content-card"><div class="section-title"><div><p>原始依据</p><h2>已经核实的内容</h2></div></div><div class="fact-grid">${factsHtml}</div></section></main><aside><section class="content-card decision-section"><div class="section-title"><div><p>人工边界</p><h2>需要你拍板</h2></div></div>${reviewHtml}</section><section class="content-card"><div class="section-title"><div><p>证据链</p><h2>来源材料</h2></div></div><div class="source-list">${materialsHtml}</div></section></aside></div><section id="transcript-panel" class="transcript-panel" hidden></section>`;
-  page().querySelector(".matter-hero")?.insertAdjacentHTML("afterend", matterProgressHtml);
-  $("[data-matter-status-form]", page())?.addEventListener("submit", saveMatterStatus);
+    state.matters = Array.isArray(matters) ? matters : [];
+    state.selectedMatterId = matter.id;
+    const openMatterCount = state.matters.filter((item) => !item.is_completed).length;
+    const openActionCount = actions.filter((item) => item.status === "open").length;
+    const priorityNote = humanText(brief.needs_you, "", 240);
+      page().innerHTML = `<section class="matter-workspace"><aside class="matter-workspace-sidebar"><header><div><strong>待推进事项</strong><small>共 ${openMatterCount} 项</small></div><label><span aria-hidden="true">⌕</span><input id="matter-workspace-filter" type="search" placeholder="按名称搜索" value="${escapeHtml(state.matterWorkspaceQuery)}"></label></header><nav aria-label="全部待推进事项">${renderMatterWorkspaceList(state.matters, matter.id)}</nav><p class="matter-workspace-no-result" hidden>没有匹配的事项</p></aside><div class="matter-workspace-detail"><section class="matter-hero"><div><p>${stateLabel(matter.status)} · 更新于 ${fmtDate(matter.updated_at)}</p><h2>${escapeHtml(matterTitle(matter.title))}</h2><span>${escapeHtml(humanText(matter.summary, "尚未形成事项摘要。", 320))}</span>${priorityNote ? `<strong class="matter-priority-note">本次办理重点：${escapeHtml(priorityNote)}</strong>` : ""}</div><aside><strong>${openActionCount}</strong><small>待办</small><strong>${reviews.length}</strong><small>待确认</small></aside></section><section class="content-card matter-handling-card"><div class="section-title"><div><p>事项办理</p><h2>本事项需要处理的内容</h2></div><span>${openActionCount + reviews.length} 项</span></div>${reviews.length ? `<section class="matter-handling-section"><header><strong>需确认事项</strong><span>${reviews.length} 项</span></header>${reviewHtml}</section>` : ""}<section class="matter-handling-section"><header><strong>待办事项</strong><span>${openActionCount} 项</span></header><ul class="action-list">${actionHtml}</ul>${reminders.length ? `<div class="matter-reminders compact">${reminderHtml}</div>` : ""}</section>${matterProgressHtml}</section><details class="content-card matter-support"><summary><span>业务依据与原始材料</span><small>${facts.length} 条依据 · ${(matter.materials || []).length} 份材料</small></summary><section class="matter-reference-grid"><div><div class="section-title"><div><p>业务依据</p><h2>已确认信息</h2></div></div><div class="fact-grid">${factsHtml}</div></div><div><div class="section-title"><div><p>资料来源</p><h2>原始材料</h2></div></div><div class="source-list">${materialsHtml}</div></div></section></details><details class="content-card matter-support"><summary><span>事项办理记录</span><small>${timeline.length} 条</small></summary>${renderMatterTimeline(timeline)}</details><section id="transcript-panel" class="transcript-panel" hidden></section></div></section>`;
+    $(".matter-workspace-sidebar > header strong", page()).textContent = "全部推进事项";
+    $(".matter-workspace-sidebar > header small", page()).textContent =
+      `${openMatterCount} 项进行中`;
+    $("#matter-workspace-filter", page()).placeholder = "搜索事项";
+    const matterStatusText = $(".matter-hero .badge", page())?.textContent || "待处理";
+    $(".matter-hero > div > p", page()).textContent =
+      `当前事项 · ${matterStatusText} · 更新于 ${fmtDate(matter.updated_at)}`;
+    $$('[data-workspace-matter]', page()).forEach((row) => {
+      const item = state.matters.find(
+        (candidate) => String(candidate.id) === String(row.dataset.workspaceMatter),
+      );
+      if (!item) return;
+      const status = item.pending_review_count
+        ? `${item.pending_review_count} 项待确认`
+        : item.blocked_action_count
+          ? `${item.blocked_action_count} 项受阻`
+          : item.open_action_count
+            ? `${item.open_action_count} 项待办`
+            : item.waiting_action_count
+              ? `${item.waiting_action_count} 项等待反馈`
+              : "持续跟进";
+      $("small", row).textContent =
+        `${status}${item.target_date ? ` · 要求 ${item.target_date}` : ""}`;
+    });
+    $(".matter-handling-card > .section-title p", page())?.remove();
+    $(".matter-handling-card > .section-title h2", page()).textContent = "当前办理";
+    $(".matter-priority-note", page())?.replaceChildren(document.createTextNode(`当前办理重点：${priorityNote}`));
+    $$(".matter-handling-card .action-row.done", page()).forEach((row) => row.remove());
+    const openActionList = $(".matter-handling-card .action-list", page());
+    if (openActionList && !$(".action-row", openActionList)) {
+      openActionList.innerHTML = `<li class="calm-empty"><span>✓</span><div><strong>当前没有待办事项</strong><p>需要继续办理的内容形成后会显示在这里。</p></div></li>`;
+    }
+  $(".matter-support", page())?.insertAdjacentHTML(
+    "beforebegin",
+    `<details class="content-card matter-support matter-more-tools"><summary><span>更多办理工具</span><small>办理方案与事项收尾</small></summary><div class="matter-more-tools-body">${workPackageHtml}${closeCheckHtml}</div></details>`,
+  );
+  $("#matter-workspace-filter", page())?.addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    state.matterWorkspaceQuery = event.target.value;
+    const rows = $$('[data-workspace-matter]', page());
+    rows.forEach((row) => {
+      row.hidden = Boolean(query && !row.dataset.search.includes(query));
+    });
+    const noResult = $(".matter-workspace-no-result", page());
+    if (noResult) noResult.hidden = rows.some((row) => !row.hidden);
+  });
+  $$('[data-workspace-matter]', page()).forEach((button) => {
+    button.addEventListener("click", async () => {
+      const matterId = button.dataset.workspaceMatter;
+      if (!matterId || String(matterId) === String(state.selectedMatterId)) return;
+      const listScroll = $(".matter-workspace-sidebar nav", page())?.scrollTop || 0;
+      button.disabled = true;
+      try {
+        const [nextMatter, nextTimeline, nextWorkPackage] = await Promise.all([
+          api(`/api/matters/${encodeURIComponent(matterId)}`),
+          apiOptional(`/api/matters/${encodeURIComponent(matterId)}/timeline`, []),
+          apiOptional(`/api/matters/${encodeURIComponent(matterId)}/work-package`, null),
+        ]);
+        window.history.replaceState(
+          null,
+          "",
+          `#/matters/${encodeURIComponent(matterId)}`,
+        );
+        renderMatter(nextMatter, state.people, nextTimeline, state.matters, nextWorkPackage);
+          const nextDetail = $(".matter-workspace-detail", page());
+          const nextList = $(".matter-workspace-sidebar nav", page());
+          if (nextDetail) nextDetail.scrollTop = 0;
+          if (nextList) nextList.scrollTop = listScroll;
+        $(`[data-workspace-matter="${CSS.escape(matterId)}"]`, page())?.focus({ preventScroll: true });
+      } catch (error) {
+        button.disabled = false;
+        toast(friendlyError(error), "error");
+      }
+    });
+  });
   $("[data-matter-date-form]", page())?.addEventListener("submit", saveMatterTargetDate);
   $("[data-matter-progress-form]", page())?.addEventListener("submit", saveMatterProgress);
-  $(".action-list", page())
-      ?.closest(".content-card")
-      ?.insertAdjacentHTML(
-        "afterend",
-        `<section class="content-card reminder-section"><div class="section-title"><div><p>主动跟进</p><h2>未完成提醒</h2></div><span>${reminders.length} 条</span></div><div class="matter-reminders">${reminderHtml}</div></section>`,
-      );
+  bindWorkPackage(matter, workPackage);
+  bindCloseCheck(matter);
     bindDynamic();
     $$("[data-view-transcript]", page()).forEach((button) =>
       button.addEventListener("click", () =>
@@ -1877,30 +2471,6 @@ function renderMatter(matter, people = [], timeline = []) {
     );
   }
 
-  async function saveMatterStatus(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const button = form.querySelector('button[type="submit"]');
-    button.disabled = true;
-    try {
-      await api(`/api/matters/${encodeURIComponent(form.dataset.matterId)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: form.elements.status.value }),
-      });
-      toast(
-        form.elements.status.value === "completed"
-          ? "事项已归入完成"
-          : "事项已重新打开",
-        "success",
-      );
-      await refreshRouteWithoutJump("#matter-status");
-    } catch (error) {
-      button.disabled = false;
-      toast(friendlyError(error), "error");
-    }
-  }
-
   async function saveMatterTargetDate(event) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -1910,7 +2480,11 @@ function renderMatter(matter, people = [], timeline = []) {
       await api(`/api/matters/${encodeURIComponent(form.dataset.matterId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target_date: form.elements.target_date.value || null }),
+        body: JSON.stringify({
+          target_date: form.elements.target_date.value || null,
+          expected_updated_at: form.dataset.expectedUpdated || null,
+          reason: form.elements.reason?.value || "人工调整事项日期",
+        }),
       });
       toast("要求闭环日期已保存", "success");
       await refreshRouteWithoutJump("#matter-target-date");
@@ -1942,6 +2516,255 @@ function renderMatter(matter, people = [], timeline = []) {
       button.disabled = false;
       toast(friendlyError(error), "error");
     }
+  }
+
+  function setMatterFeedback(container, message, tone = "") {
+    const feedback = $(".work-package-feedback, .matter-close-check-result", container);
+    if (!feedback) return;
+    feedback.className = feedback.className.replace(/\s(?:success|error)\b/g, "");
+    if (tone) feedback.classList.add(tone);
+    feedback.textContent = message;
+  }
+
+  function workPackageDraft(form, workPackage) {
+    const previousSteps = Array.isArray(workPackage?.draft?.steps)
+      ? workPackage.draft.steps
+      : [];
+    return {
+      ...(workPackage?.draft || {}),
+      conclusion: form.elements.conclusion.value.trim(),
+      basis: form.elements.basis.value.split("\n").map((line) => line.trim()).filter(Boolean),
+      gaps: form.elements.gaps.value.split("\n").map((line) => line.trim()).filter(Boolean),
+      risks: form.elements.risks.value.split("\n").map((line) => line.trim()).filter(Boolean),
+      questions: form.elements.questions.value.split("\n").map((line) => line.trim()).filter(Boolean),
+      reply_draft: {
+        purpose: form.elements.reply_purpose.value.trim(),
+        text: form.elements.reply_text.value.trim(),
+      },
+      steps: $$('[data-work-package-step]', form).map((row) => {
+        const index = Number(row.dataset.stepIndex);
+        const minutes = row.querySelector('[name="step_estimated_minutes"]').value;
+        return {
+          ...(previousSteps[index] || { kind: "task", flow_state: "needs_action" }),
+          title: row.querySelector('[name="step_title"]').value.trim(),
+          detail: row.querySelector('[name="step_detail"]').value.trim(),
+          kind: row.querySelector('[name="step_kind"]').value,
+          owner: row.querySelector('[name="step_owner"]').value.trim(),
+          due_date: row.querySelector('[name="step_due_date"]').value || null,
+          flow_state: row.querySelector('[name="step_flow_state"]').value,
+          waiting_on: row.querySelector('[name="step_waiting_on"]').value.trim(),
+          blocked_reason: row.querySelector('[name="step_blocked_reason"]').value.trim(),
+          next_follow_up_at:
+            row.querySelector('[name="step_next_follow_up_at"]').value || null,
+          estimated_minutes: minutes === "" ? null : Number(minutes),
+        };
+      }),
+    };
+  }
+
+  function bindWorkPackage(matter, initialPackage) {
+    const section = $("[data-work-package]", page());
+    if (!section) return;
+    const generate = $("[data-work-package-generate]", section);
+    if (generate) {
+      generate.addEventListener("click", async () => {
+        generate.disabled = true;
+        setMatterFeedback(section, "正在生成草稿…");
+        try {
+          await api(`/api/matters/${encodeURIComponent(matter.id)}/work-package/generate`, {
+            method: "POST",
+          });
+          toast("工作包草稿已生成", "success");
+          await refreshRouteWithoutJump("[data-work-package-form]");
+        } catch (error) {
+          generate.disabled = false;
+          setMatterFeedback(section, friendlyError(error), "error");
+        }
+      });
+      return;
+    }
+
+    const form = $("[data-work-package-form]", section);
+    if (!form || !initialPackage) return;
+    let currentPackage = initialPackage;
+    const applyButton = $("[data-work-package-apply]", form);
+    const updateApplyButton = () => {
+      const stale = currentPackage.status === "stale";
+      applyButton.disabled = stale || !$("[data-work-package-select]:checked", form);
+      applyButton.setAttribute("aria-disabled", String(applyButton.disabled));
+    };
+    const regenerate = $("[data-work-package-regenerate]", section);
+    regenerate?.addEventListener("click", async () => {
+      regenerate.disabled = true;
+      setMatterFeedback(section, "正在重新生成办理方案…");
+      try {
+        await api(`/api/matters/${encodeURIComponent(matter.id)}/work-package/generate`, {
+          method: "POST",
+        });
+        toast("办理方案已重新生成", "success");
+        await refreshRouteWithoutJump("[data-work-package-form]");
+      } catch (error) {
+        regenerate.disabled = false;
+        setMatterFeedback(section, friendlyError(error), "error");
+      }
+    });
+    form.addEventListener("input", (event) => {
+      if (!event.target.matches('[data-work-package-select]')) form.dataset.dirty = "true";
+    });
+    form.addEventListener("change", updateApplyButton);
+    $("[data-work-package-add]", form)?.addEventListener("click", () => {
+      const list = $("[data-work-package-steps]", form);
+      const indexes = $$('[data-work-package-step]', list).map((row) => Number(row.dataset.stepIndex));
+      const index = indexes.length ? Math.max(...indexes) + 1 : 0;
+      $(".work-package-empty", list)?.remove();
+      list.insertAdjacentHTML("beforeend", renderWorkPackageStep({}, index));
+      form.dataset.dirty = "true";
+      list.lastElementChild?.querySelector('[name="step_title"]')?.focus();
+    });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      setMatterFeedback(section, "正在保存草稿…");
+      try {
+        currentPackage = await api(`/api/matters/${encodeURIComponent(matter.id)}/work-package`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            draft: workPackageDraft(form, currentPackage),
+            expected_updated_at: currentPackage.updated_at,
+          }),
+        });
+        form.dataset.dirty = "";
+        form.dataset.packageUpdated = currentPackage.updated_at;
+        button.disabled = false;
+        updateApplyButton();
+        setMatterFeedback(section, "草稿已保存。", "success");
+      } catch (error) {
+        button.disabled = false;
+        setMatterFeedback(section, friendlyError(error), "error");
+      }
+    });
+    applyButton.addEventListener("click", async () => {
+      if (currentPackage.status === "stale") {
+        setMatterFeedback(section, "事项内容已有变化，请重新生成办理方案后再采纳。", "error");
+        regenerate?.focus();
+        return;
+      }
+      if (form.dataset.dirty) {
+        setMatterFeedback(section, "草稿有未保存修改，请先点击“保存草稿”。", "error");
+        form.querySelector('button[type="submit"]')?.focus();
+        return;
+      }
+      const stepIndexes = $$('[data-work-package-select]:checked', form).map((input) => Number(input.value));
+      if (!stepIndexes.length) return;
+      const missingTitle = stepIndexes.some((index) => !currentPackage.draft?.steps?.[index]?.title?.trim());
+      if (missingTitle) {
+        setMatterFeedback(section, "所选步骤缺少标题，请补充并保存草稿。", "error");
+        return;
+      }
+      applyButton.disabled = true;
+      setMatterFeedback(section, "正在应用所选步骤…");
+      try {
+        const result = await api(`/api/matters/${encodeURIComponent(matter.id)}/work-package/apply`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            step_indexes: stepIndexes,
+            expected_updated_at: currentPackage.updated_at,
+          }),
+        });
+        toast(`已创建 ${result.created_actions?.length || 0} 项待办`, "success");
+        await refreshRouteWithoutJump("[data-work-package-apply]");
+      } catch (error) {
+        applyButton.disabled = false;
+        setMatterFeedback(section, friendlyError(error), "error");
+      }
+    });
+  }
+
+  function closePreviewHtml(preview) {
+    const labels = {
+      actions: "未完成行动",
+      reminders: "未处理提醒",
+      reviews: "待确认事项",
+      assignee_reviews: "待确认负责人",
+      active_jobs: "后台处理中",
+    };
+    const blockers = Object.entries(preview.blockers || {}).filter(([, items]) => items.length);
+    if (blockers.length) {
+      return `<div class="matter-close-blocked"><strong>暂时不能关闭，共 ${preview.blocker_count} 项未处理</strong>${blockers.map(([kind, items]) => `<section><h3>${labels[kind] || "未完成内容"}（${items.length}）</h3><ul>${items.map((item) => `<li><span>${escapeHtml(humanText(item.title, labels[kind] || "未完成内容", 160))}</span><button class="button button-quiet" type="button" data-close-target-kind="${escapeHtml(kind)}" data-close-target-id="${escapeHtml(item.action_id || item.id || "")}">去处理</button></li>`).join("")}</ul></section>`).join("")}<p>请逐项处理后重新执行收尾检查。检查不会自动关闭这些内容。</p></div>`;
+    }
+    return `<form class="matter-close-ready" data-matter-close data-expected-updated="${escapeHtml(preview.updated_at || "")}"><strong>检查通过，可以关闭事项</strong><label>收尾说明<textarea name="completion_note" rows="3" maxlength="2000" placeholder="说明完成结果和可回查依据" required></textarea></label><button class="button button-primary" type="submit">确认关闭事项</button></form>`;
+  }
+
+  function bindCloseCheck(matter) {
+    const section = $("[data-close-check]", page());
+    const previewButton = $("[data-close-preview]", section);
+    const result = $("[data-close-check-result]", section);
+    if (!section || !previewButton || !result) return;
+    previewButton.addEventListener("click", async () => {
+      previewButton.disabled = true;
+      result.textContent = "正在检查未完成内容…";
+      try {
+        const preview = await api(`/api/matters/${encodeURIComponent(matter.id)}/close-preview`);
+        result.innerHTML = closePreviewHtml(preview);
+        previewButton.disabled = false;
+        $$('[data-close-target-kind]', result).forEach((button) => {
+          button.addEventListener("click", () => {
+            const kind = button.dataset.closeTargetKind;
+            const id = CSS.escape(button.dataset.closeTargetId || "");
+            if (kind === "active_jobs") {
+              window.location.hash = "#/nodes";
+              return;
+            }
+            const selectors = {
+              actions: `[data-action-row="${id}"]`,
+              assignee_reviews: `[data-action-row="${id}"]`,
+              reviews: `[data-review-row="${id}"]`,
+              reminders: `[data-reminder-id="${id}"]`,
+            };
+            const match = selectors[kind] ? $(selectors[kind], page()) : null;
+            const target = kind === "reminders" ? match?.closest(".matter-reminder") : match;
+            if (!target) {
+              toast("该内容暂未显示，请在事项记录中查看。", "error");
+              return;
+            }
+            section.closest("details")?.removeAttribute("open");
+            target.scrollIntoView({ behavior: "smooth", block: "center" });
+            target.setAttribute("tabindex", "-1");
+            target.focus({ preventScroll: true });
+          });
+        });
+        $("[data-matter-close]", result)?.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const form = event.currentTarget;
+          const note = form.elements.completion_note.value.trim();
+          if (!note) return form.elements.completion_note.focus();
+          const button = form.querySelector('button[type="submit"]');
+          button.disabled = true;
+          try {
+            await api(`/api/matters/${encodeURIComponent(matter.id)}/close`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                completion_note: note,
+                expected_updated_at: form.dataset.expectedUpdated,
+              }),
+            });
+            state.selectedMatterId = null;
+            toast("事项已关闭，未改动任何子项", "success");
+            await renderRoute({ quiet: true, preserveScroll: true });
+          } catch (error) {
+            button.disabled = false;
+            setMatterFeedback(section, friendlyError(error), "error");
+          }
+        });
+      } catch (error) {
+        previewButton.disabled = false;
+        setMatterFeedback(section, friendlyError(error), "error");
+      }
+    });
   }
 
   function renderAssigneeReview(item, people) {
@@ -2041,7 +2864,14 @@ function renderMatter(matter, people = [], timeline = []) {
   }
 }
 
-function bindDynamic() {
+  function bindDynamic() {
+    $$('a[href^="#/matter/"], a[href^="#/matters/"]').forEach((link) =>
+      link.addEventListener("click", () => {
+        const matterId = decodeURIComponent(link.getAttribute("href").split("/").pop());
+        if (!matterId) return;
+        state.selectedMatterId = matterId;
+      }),
+    );
     $$("[data-open-intake]").forEach((button) =>
       button.addEventListener("click", openIntake),
     );
@@ -2118,6 +2948,7 @@ function bindDynamic() {
   $("[data-wechat-search]")?.addEventListener("input", (event) => {
     filterWechatConversationRows();
   });
+  bindManualCorrectionEntrances();
 }
 
   function assigneeContainer(button) {
@@ -2264,9 +3095,10 @@ function bindDynamic() {
     }
   }
 
-function updateReviewCount(count) {
-  setShortcutCount("#review-count", count);
-}
+  function updateReviewCount(count) {
+    setShortcutCount("#review-count", count);
+    if (routeFromHash().name === "today") refreshRouteWithoutJump();
+  }
 
 function updateWechatCount(count) {
   setShortcutCount("#wechat-count", count);
@@ -2399,9 +3231,7 @@ function updateWechatCount(count) {
       window.setTimeout(() => {
         closeIntake();
         resetIntake();
-        const alreadyToday = window.location.hash === "#/today";
-        window.location.hash = "#/today";
-        if (alreadyToday) refreshRouteWithoutJump();
+        refreshRouteWithoutJump();
       }, 900);
     } catch (error) {
       if (!error.status || error.name === "TypeError") {
@@ -2568,13 +3398,21 @@ function updateWechatCount(count) {
       const result = await api("/api/analysis/run", { method: "POST" });
       const released = Number(result.released || 0);
       const needsReview = Number(result.needs_review || 0);
+      const prepared = Number(result.work_packages_prepared || 0);
+      const packageFailures = Array.isArray(result.work_packages_failed)
+        ? result.work_packages_failed.length
+        : 0;
       toast(
         released
-          ? `已交给贾维斯整理 ${released} 份新内容`
+          ? `已交给贾维斯整理 ${released} 份新内容${prepared ? `，并准备 ${prepared} 个办理方案` : ""}`
+          : packageFailures
+            ? `${packageFailures} 个办理方案准备失败，可再次点击重试`
+            : prepared
+              ? `已准备 ${prepared} 个事项办理方案`
           : needsReview
           ? `有 ${needsReview} 份内容需要检查`
           : "现在没有等待整理的新内容",
-        released ? "success" : needsReview ? "error" : "info",
+        released || prepared ? "success" : needsReview || packageFailures ? "error" : "info",
       );
       if (!released && needsReview) window.location.hash = "#/intake";
       await refreshRouteWithoutJump();
@@ -2682,7 +3520,10 @@ function updateWechatCount(count) {
               : status === "running"
                 ? "读取中"
                 : "等待中";
-        return `<article class="source-sync-result ${escapeHtml(status)}"><div><span class="status-dot"></span><strong>${escapeHtml(sourceSyncLabels[item.source])}</strong><em>${escapeHtml(stateText)}</em></div><p>${escapeHtml(sourceSyncResultText(item.source, item.result))}</p></article>`;
+        const manageLink = item.source === "wecom"
+          ? '<a href="#/wechat">管理监听范围</a>'
+          : "";
+        return `<article class="source-sync-result ${escapeHtml(status)}"><div><span class="status-dot"></span><strong>${escapeHtml(sourceSyncLabels[item.source])}</strong><em>${escapeHtml(stateText)}</em></div><p>${escapeHtml(sourceSyncResultText(item.source, item.result))}</p>${manageLink}</article>`;
       })
       .join("");
     const newItems = rows.reduce(
@@ -2700,7 +3541,7 @@ function updateWechatCount(count) {
     const summary = $("#source-sync-summary");
     if (summary) {
       summary.textContent = !terminal
-        ? "读取完成后会在这里显示新增数量，不会自动消耗贾维斯额度。"
+        ? "读取和整理分开进行：读取完成后会在这里显示新增数量；同一件事持续合并，不会自动消耗贾维斯额度。"
         : failed
           ? `${3 - failed} 个来源完成，${failed} 个来源需要重试。`
           : newItems
@@ -2893,7 +3734,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-    navigator.serviceWorker.register("/sw.js?v=51").catch(() => {});
+    navigator.serviceWorker.register("/sw.js?v=72").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;
