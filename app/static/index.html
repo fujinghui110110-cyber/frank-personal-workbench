@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#102a2a" />
+    <meta
+      name="description"
+      content="Frank 的个人工作台"
+    />
+    <link rel="manifest" href="/manifest.webmanifest?v=24" />
+  <link rel="stylesheet" href="/static/app.css?v=52" />
+    <title>Frank 的个人工作台</title>
+  </head>
+  <body>
+    <div id="app" class="app-root">
+      <section id="login-view" class="login-view" aria-labelledby="login-title" hidden>
+        <div class="login-story" aria-hidden="true">
+          <div class="login-story-inner">
+            <div class="wb-orbit"><span>贾</span></div>
+            <p>Frank 的个人工作台</p>
+            <h2>把零散信息交给贾维斯，<br />只把判断留给你。</h2>
+            <ul>
+              <li><span>01</span> 录音、聊天、审批随手投递</li>
+              <li><span>02</span> 自动归并事项和下一步</li>
+              <li><span>03</span> 到时间主动回来追踪</li>
+            </ul>
+          </div>
+        </div>
+        <div class="login-panel-wrap">
+          <div class="login-panel">
+            <div class="login-brand">
+              <span class="brand-seal">F</span><strong>Frank 的个人工作台</strong>
+            </div>
+            <p class="eyebrow">欢迎回来</p>
+            <h1 id="login-title">进入你的工作台</h1>
+            <p class="login-lead">
+              今天的重点、待确认和贾维斯已完成的工作都在里面。
+            </p>
+            <form id="login-form" class="stack-form" data-testid="login-form">
+              <label for="passcode">访问口令</label>
+              <input
+                id="passcode"
+                name="passcode"
+                type="password"
+                autocomplete="current-password"
+                required
+                maxlength="256"
+                data-testid="passcode-input"
+                placeholder="输入访问口令"
+              />
+              <button
+                id="login-submit"
+                class="button button-primary button-wide"
+                type="submit"
+                data-testid="login-submit"
+              >
+                进入工作台
+              </button>
+              <p
+                id="login-error"
+                class="form-message error-message"
+                role="alert"
+                hidden
+              ></p>
+            </form>
+            <p class="login-footnote">
+              <span class="secure-dot"></span>
+              原始材料保留在你的工作台，关键操作仍由你确认。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <div id="workbench" class="workbench" hidden>
+        <aside class="side-rail" aria-label="主导航">
+          <div class="rail-brand">
+          <span class="brand-seal small">F</span>
+            <div>
+            <strong>Frank 的个人工作台</strong><span>个人信息与事项中心</span>
+            </div>
+          </div>
+
+          <div class="assistant-presence">
+            <div class="assistant-avatar"><span>贾</span><i></i></div>
+            <div>
+            <strong>贾维斯</strong
+              ><span id="assistant-presence-label">正在待命</span>
+            </div>
+          </div>
+
+          <nav class="rail-nav" id="desktop-nav" aria-label="主导航">
+            <p class="nav-section-label">主导航</p>
+            <a href="#/today" data-route="today">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4l8 7.2v8.3a.5.5 0 0 1-.5.5H15v-6H9v6H4.5a.5.5 0 0 1-.5-.5z" /></svg>
+              <span>今天</span>
+            </a>
+            <a href="#/matters" data-route="matters">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
+              <span>事项</span>
+            </a>
+            <a href="#/policies" data-route="policies">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zM9 8h6M9 12h6M9 16h4" /></svg>
+              <span>规定</span>
+            </a>
+            <a href="#/search" data-route="search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 5 5" /></svg>
+              <span>搜索</span><kbd>⌘K</kbd>
+            </a>
+          </nav>
+
+          <div class="rail-footer">
+            <div class="connection-row">
+              <span class="status-dot" id="connection-dot"></span
+              ><span id="connection-label">检查连接</span>
+            </div>
+            <button
+              class="button button-quiet button-wide"
+              id="logout-button"
+              type="button"
+            >
+              退出工作台
+            </button>
+          </div>
+        </aside>
+
+        <div class="content-shell">
+          <header class="topbar">
+            <div class="topbar-title">
+              <p class="eyebrow" id="page-kicker">Frank 的个人工作台</p>
+              <h1 id="page-title">今天</h1>
+            </div>
+          <div class="topbar-actions">
+            <span class="offline-pill" id="offline-pill" hidden>连接中断，材料暂存在当前设备</span>
+          </div>
+          </header>
+
+          <section class="workflow-band" aria-label="工作台三步流程">
+            <article class="workflow-step workflow-step-action">
+              <div class="workflow-step-number">1</div>
+              <div class="workflow-step-copy">
+                <span>读取新信息</span>
+                <small id="source-sync-detail">个人微信、企业微信和邮箱</small>
+              </div>
+              <button class="button button-primary" id="run-source-sync-global" type="button">立即读取</button>
+            </article>
+            <article class="workflow-step workflow-step-action">
+              <div class="workflow-step-number">2</div>
+              <div class="workflow-step-copy">
+                <span>整理新内容</span>
+                <small id="analysis-run-detail">仅手工启动，不会自动消耗额度</small>
+              </div>
+              <button class="button button-secondary" id="run-analysis-global" type="button">让贾维斯整理</button>
+            </article>
+            <article class="workflow-step workflow-step-attention">
+              <div class="workflow-step-number">3</div>
+              <div class="workflow-step-copy">
+                <span>需要我处理</span>
+                <small id="attention-total">目前没有等待确认</small>
+              </div>
+              <nav class="work-queue-bar" aria-label="待确认与来源入口">
+                <a href="#/wechat" data-route="wechat"><span>聊天线索</span><b id="wechat-count" hidden>0</b></a>
+                <a href="#/email" data-route="email"><span>邮件工作</span><b id="email-count" hidden>0</b></a>
+                <a href="#/reviews" data-route="reviews"><span>需要拍板</span><b id="review-count" hidden>0</b></a>
+                <a href="#/policies" data-route="policies"><span>公司规定</span><b id="policy-count" hidden>0</b></a>
+                <a class="work-queue-status" href="#/nodes" data-route="nodes"><span class="status-dot" id="shortcut-node-dot"></span><span>运行状态</span></a>
+              </nav>
+            </article>
+      </section>
+      <section
+        id="source-sync-receipt"
+        class="source-sync-receipt"
+        aria-live="polite"
+        hidden
+      >
+        <header>
+          <div>
+            <p id="source-sync-receipt-kicker">读取进度</p>
+            <h2 id="source-sync-receipt-title">正在检查三个平台</h2>
+          </div>
+          <button
+            class="button button-quiet"
+            id="source-sync-receipt-close"
+            type="button"
+          >
+            收起
+          </button>
+        </header>
+        <div id="source-sync-result-grid" class="source-sync-result-grid"></div>
+        <footer>
+          <span id="source-sync-summary">等待本机完成读取。</span>
+          <button
+            class="button button-primary"
+            id="source-sync-organize"
+            type="button"
+            hidden
+          >
+            整理这些新内容
+          </button>
+        </footer>
+      </section>
+      <main id="page-content" class="page-content" tabindex="-1"></main>
+        </div>
+
+        <button
+          class="handoff-fab"
+          type="button"
+          data-open-intake
+          aria-label="交给贾维斯"
+          data-testid="top-intake-button"
+        >
+          <span aria-hidden="true">＋</span><strong>交给贾维斯</strong>
+        </button>
+
+        <nav class="bottom-nav" aria-label="移动端导航">
+          <a href="#/today" data-route="today"
+            ><span>今</span><small>今天</small></a
+          >
+          <a href="#/matters" data-route="matters"
+            ><span>事</span><small>事项</small></a
+          >
+          <a href="#/policies" data-route="policies"
+            ><span>规</span><small>规定</small></a
+          >
+          <a href="#/search" data-route="search"
+            ><span>⌕</span><small>搜索</small></a
+          >
+        </nav>
+      </div>
+    </div>
+
+    <div
+      id="toast-region"
+      class="toast-region"
+      aria-live="polite"
+      aria-atomic="true"
+    ></div>
+
+    <dialog
+      id="intake-dialog"
+      class="intake-dialog"
+      aria-labelledby="intake-dialog-title"
+    >
+      <form
+        id="intake-form"
+        class="intake-form"
+        method="dialog"
+        data-testid="intake-form"
+      >
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">不用整理，不用分类</p>
+        <h2 id="intake-dialog-title">直接交给贾维斯</h2>
+          </div>
+          <button
+            class="icon-button"
+            type="button"
+            data-close-dialog
+            aria-label="关闭投递窗口"
+          >
+            ×
+          </button>
+        </div>
+        <p class="dialog-help">
+          Mac 开机时可在这里直接投递。Mac 关机时，在安卓手机上分享或复制到“财务工作台投递箱 /
+          待处理”；下次开机后会自动同步、收件、转写并交给贾维斯。
+        </p>
+
+        <div class="source-tabs" role="tablist" aria-label="材料类型">
+          <button
+            type="button"
+            class="source-tab active"
+            role="tab"
+            aria-selected="true"
+            data-source="text"
+          >
+            <span>文</span>文字
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="audio"
+          >
+            <span>声</span>会议录音
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="wechat_markdown"
+          >
+            <span>微</span>微信记录
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="wecom_approval"
+          >
+            <span>审</span>企微审批
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="file"
+          >
+            <span>档</span>文件
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="image"
+          >
+            <span>图</span>图片
+          </button>
+          <button
+            type="button"
+            class="source-tab"
+            role="tab"
+            aria-selected="false"
+            data-source="video"
+          >
+            <span>影</span>视频
+          </button>
+        </div>
+
+        <input
+          id="intake-source-type"
+          type="hidden"
+          name="source_type"
+          value="text"
+        />
+        <label for="intake-note"
+          >顺手说一句 <span class="optional">可不写</span></label
+        >
+        <textarea
+          id="intake-note"
+          name="text_note"
+          rows="4"
+          placeholder="例如：这是今天和王总讨论预算的录音，重点看下周要推进什么"
+          data-testid="intake-note"
+        ></textarea>
+
+        <div
+          id="dropzone"
+          class="dropzone"
+          tabindex="0"
+          role="button"
+          aria-label="拖放或选择文件"
+        >
+          <input id="intake-file" name="upload" type="file" hidden />
+          <span class="dropzone-icon" aria-hidden="true">＋</span>
+          <strong>把文件拖到这里</strong>
+          <span
+            >也可以
+            <button type="button" class="text-button" id="choose-file">
+              选择文件
+            </button></span
+          >
+          <span id="selected-file" class="selected-file" hidden></span>
+        </div>
+
+        <label for="intake-matter"
+          >我知道它属于哪件事 <span class="optional">不知道就不选</span></label
+        >
+        <select id="intake-matter" name="matter_id">
+              <option value="">交给贾维斯判断</option>
+        </select>
+
+        <div class="intake-promise">
+          <span>1</span>
+          <p><strong>先安全收下</strong><small>上传成功后原件留存</small></p>
+          <i></i>
+          <span>2</span>
+          <p>
+                  <strong>贾维斯整理</strong><small>提炼、归并、安排追踪</small>
+          </p>
+          <i></i>
+          <span>3</span>
+          <p><strong>只找你拍板</strong><small>关键动作保留人工确认</small></p>
+        </div>
+
+        <div class="dialog-footer">
+          <span class="queue-note" id="queue-note">连接中断时暂存在当前设备</span>
+          <button
+            class="button button-primary"
+            type="submit"
+            data-testid="intake-submit"
+          >
+            交给贾维斯
+          </button>
+        </div>
+        <p id="intake-message" class="form-message" role="status" hidden></p>
+      </form>
+    </dialog>
+
+    <template id="loading-template">
+      <div class="loading-view" aria-label="正在加载">
+        <span></span><strong>贾维斯正在整理页面</strong>
+      </div>
+    </template>
+  <script src="/static/app.js?v=52" defer></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.finance-workbench.worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>scripts.mac_worker</string>
+    <string>--poll-seconds</string>
+    <string>15</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WORKBENCH_BASE_URL</key>
+    <string>__WORKBENCH_BASE_URL__</string>
+    <key>WORKBENCH_WORKER_TOKEN</key>
+    <string>__WORKBENCH_WORKER_TOKEN__</string>
+    <key>WORKBENCH_SYNC_INBOX</key>
+    <string>__WORKBENCH_SYNC_INBOX__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/finance-workbench-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/finance-workbench-worker-error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,21 @@
+services:
+  workbench:
+    build: .
+    image: finance-workbench:local
+    restart: unless-stopped
+    ports:
+      - "${WORKBENCH_BIND_ADDRESS:-127.0.0.1}:8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WORKBENCH_ENV: ${WORKBENCH_ENV:-production}
+      WORKBENCH_DATA_DIR: /data
+    volumes:
+      - workbench-data:/data
+      - type: bind
+        source: /Users/frank/知识库/04-制度资料/公司最新规定
+        target: /Users/frank/知识库/04-制度资料/公司最新规定
+
+volumes:
+  workbench-data:

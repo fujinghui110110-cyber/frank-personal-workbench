@@ -1,0 +1,12 @@
+{
+  "name": "Frank 的个人工作台",
+  "short_name": "Frank 工作台",
+  "description": "Frank 的个人信息、材料与事项工作台",
+  "lang": "zh-CN",
+  "start_url": "/#/today",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#102f37",
+  "icons": []
+}
