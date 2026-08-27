@@ -1,6 +1,6 @@
 # Frank 工作台 v2 验收证据
 
-最后核对：2026-08-28 01:47（Asia/Shanghai）
+最后核对：2026-08-28 02:50（Asia/Shanghai）
 
 ## 验收结论
 
@@ -21,7 +21,9 @@
 | 同事项重归属不制造假记录 | `reassign_material()` 返回 `changed: false`，不写审计、不显示撤销；真实移动更新时间单调递增 | `test_material_reassignment_is_monotonic_and_same_target_is_a_noop` 通过 |
 | 事项关闭不静默处理子项 | `close-preview` 列出未完成行动、提醒和待确认；`close` 只在人工处理后关闭事项 | 合成测试验证预览只读、存在阻塞时拒绝、关闭与重新打开均不篡改子项 |
 | 日期边界明确 | 人工日期使用 `user_entered`；无原文依据的建议日期不自动生成提醒 | `tests/test_workbench_evolution.py` 与 v2 编辑测试覆盖日期依据和提醒边界 |
-| 静态资源不再命中旧页面 | HTML、Service Worker 和注册地址统一使用 v72 | 正式服务返回 `/static/app.js?v=72`、`/static/app.css?v=72`，缓存名为 `frank-personal-workbench-shell-v72` |
+| 静态资源不再命中旧页面 | HTML、Service Worker 和注册地址统一使用 v73 | 正式服务返回 `/static/app.js?v=73`、`/static/app.css?v=73`，缓存名为 `frank-personal-workbench-shell-v73` |
+| 事项推进不再回到旧层级 | 活动前端无 `renderToday` 和 `route.name === "today"`；旧地址只做兼容跳转 | 导航回归测试与正式浏览器地址检查 |
+| “全部推进事项”数量口径一致 | 前端各事项选择入口统一请求 API 允许的 500 条上限 | 导航回归测试检查不再使用 `limit=100` |
 
 ## 自动验证
 
@@ -38,7 +40,7 @@
 - 实际结果：地址与界面均直接进入 `#/matters`；左侧显示全部 47 项进行中事项，右侧显示当前事项办理内容。
 - 切换事项：点击另一事项后，URL 更新为 `#/matters/{id}`，左侧完整清单、分组与滚动位置保留，右侧更新为新事项。
 - 控制台：无脚本错误；仅有登录表单缺少 username 字段的浏览器建议，不影响运行。
-- 截图：`/private/tmp/frank-workbench-live.png`、`/private/tmp/frank-workbench-switch.png`。
+- 截图：`/private/tmp/frank-workbench-v73-before-switch.png`、`/private/tmp/frank-workbench-v73-after-switch.png`。
 - 按 Frank 最新要求，本轮不做手机端验收。
 
 ## 数据安全与备份

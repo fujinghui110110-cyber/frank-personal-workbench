@@ -807,11 +807,11 @@ def test_frontend_markup_matches_javascript_and_hidden_contracts(
     assert 'id="login-submit"' in response.text
     assert stylesheet.status_code == 200
     assert "[hidden] { display: none !important; }" in stylesheet.text
-    assert '/static/app.css?v=72' in response.text
+    assert '/static/app.css?v=73' in response.text
     assert '/static/app-evolution.css' not in response.text
-    assert '/static/app.js?v=72' in response.text
+    assert '/static/app.js?v=73' in response.text
     assert service_worker.status_code == 200
-    assert "frank-personal-workbench-shell-v72" in service_worker.text
+    assert "frank-personal-workbench-shell-v73" in service_worker.text
     assert "fetch(request).then" in service_worker.text
     assert ".catch(() => caches.match(request))" in service_worker.text
     assert "Mac 关机时" in response.text
@@ -846,9 +846,8 @@ def test_frontend_refreshes_actions_without_full_page_jump(client: TestClient) -
     script = client.get("/static/app.js").text
 
     assert "async function refreshRouteWithoutJump(focusSelectorOverride = null)" in script
-    assert 'data-today-disclosure="rules"' in script
+    assert 'route.name === "today"' not in script
     assert "focusTarget.focus({ preventScroll: true })" in script
-    assert 'if (routeFromHash().name === "today") refreshRouteWithoutJump();' in script
     for start, end in (
         ("async function resolveWechatCandidate", "async function changeWechatConversation"),
         ("async function resolveReview", "async function resolveAction"),
@@ -925,7 +924,7 @@ def test_frontend_exposes_persistent_source_receipt_and_useful_work_rules(
     assert "本次读取结果" in script
     assert "读取和整理分开" in script
     assert "同一件事持续合并" in script
-    assert 'item.rule_type !== "conversation_ignore"' in script
+    assert "function renderToday(" not in script
     assert "管理监听范围" in script
 
 

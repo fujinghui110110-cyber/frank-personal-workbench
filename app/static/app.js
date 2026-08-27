@@ -3,9 +3,8 @@
 
   const state = {
     actor: null,
-    route: "today",
+    route: "matters",
     online: navigator.onLine,
-    overview: null,
     matters: [],
     reviews: [],
     nodes: [],
@@ -32,7 +31,6 @@ searchFocus: false,
 searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
     showEmptyPeople: false,
     homeRefreshTimer: null,
-    todayDisclosures: { weekly: false, rules: false },
     sourceSyncRunning: false,
     sourceReceiptDismissed: false,
     manualEditRecords: {
@@ -360,14 +358,6 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     return new Intl.DateTimeFormat("zh-CN", { ...defaults, ...options }).format(
       date,
     );
-  }
-
-  function greeting() {
-    const hour = new Date().getHours();
-    if (hour < 11) return "早上好";
-    if (hour < 14) return "中午好";
-    if (hour < 19) return "下午好";
-    return "晚上好";
   }
 
   function badge(text, tone = "") {
@@ -871,10 +861,16 @@ async function saveManualEdit(event) {
       ? `${sourceFailures} 个来源需要重新检查`
       : "个人微信、企业微信和邮箱可独立读取";
   }
-    const online = (Array.isArray(nodes) ? nodes : []).some(
-      (item) => item.status === "online",
-    );
-    $("#shortcut-node-dot")?.classList.toggle("online", online);
+  const online = (Array.isArray(nodes) ? nodes : []).some(
+    (item) => item.status === "online",
+  );
+  const assistantPresence = $("#assistant-presence-label");
+  if (assistantPresence) {
+    assistantPresence.textContent = online
+      ? "在线，自动读取；整理需手工启动"
+      : "本机未连接，材料会等待读取";
+  }
+  $("#shortcut-node-dot")?.classList.toggle("online", online);
     $("#shortcut-node-dot")?.classList.toggle("offline", !online);
   }
 
@@ -933,7 +929,6 @@ async function saveManualEdit(event) {
         link.classList.toggle("active", link.dataset.route === route.name),
     );
     const titles = {
-      today: "工作概览",
       intake: "随手投递",
       wechat: "聊天线索",
       email: "邮件工作",
@@ -966,19 +961,7 @@ async function renderRoute({ quiet = false, preserveScroll = false } = {}) {
     setRoute(route);
     if (!quiet) showLoading();
     try {
-if (route.name === "today") {
-const [brief, overview, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules] = await Promise.all([
-api("/api/today/brief"),
-api("/api/overview"),
-api("/api/materials?limit=30"),
-api("/api/wechat/status"),
-api("/api/policies/status"),
-apiOptional("/api/assignee-reviews?status=pending", []),
-apiOptional("/api/weekly-review", null),
-apiOptional("/api/learning-rules", []),
-]);
-renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules);
-    } else if (route.name === "intake") {
+    if (route.name === "intake") {
       renderIntakePage(await api("/api/analysis/issues"));
     } else if (route.name === "wechat") {
       const sourceQuery = state.chatSource === "all" ? "" : `&source=${encodeURIComponent(state.chatSource)}`;
@@ -989,7 +972,7 @@ renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeRevi
         api(`/api/wechat/candidates?candidate_status=ignored&limit=300${sourceQuery}`),
         api(`/api/wechat/candidates?candidate_status=accepted&limit=300${sourceQuery}`),
         api(`/api/wechat/conversations${conversationSourceQuery}`),
-        api("/api/matters?limit=100"),
+        api("/api/matters?limit=500"),
       ]);
       renderWechat(wechatStatus, [...pending, ...ignored, ...accepted], conversations, matters);
     } else if (route.name === "email") {
@@ -1009,7 +992,7 @@ renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeRevi
         renderPolicies(policyStatus, candidates, activePolicies, repealedPolicies);
       } else if (route.name === "matters") {
         const [matters, people] = await Promise.all([
-          api("/api/matters?limit=100"),
+          api("/api/matters?limit=500"),
           apiOptional("/api/people", []),
         ]);
         state.matters = matters;
@@ -1167,172 +1150,6 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
       <ol class="work-progress">${progress}</ol>
       ${item.matter_id ? `<a href="${href}" class="text-link">查看贾维斯结果 →</a>` : ""}
     </article>`;
-  }
-
-function planHref(item) {
-const matterId = item.matter_id || item.matter?.id;
-if (matterId) return `#/matters/${encodeURIComponent(matterId)}`;
-if (item.item_type === "review" || ["review", "decision"].includes(item.kind)) return "#/reviews";
-return "#/matters";
-}
-
-function renderPlanItem(item, index, { controls = false } = {}) {
-const title = humanText(item.title, "有一件事需要处理", 140).replace(/^确认推断[：:]\s*/, "");
-const detail = humanText(
-item.waiting_on
-? `正在等待：${item.waiting_on}`
-: item.blocked_reason || item.detail || item.summary,
-"打开事项查看贾维斯整理的依据。",
-260,
-);
-const reason = humanText(item.sort_reason, "", 120);
-const meta = [
-kindLabel(item.kind),
-item.due_date ? `截止 ${item.due_date}` : "",
-].filter(Boolean).join("，");
-const actionButtons = controls && item.id && item.item_type !== "review"
-? `<button class="button button-primary" type="button" data-today-complete="${escapeHtml(item.id)}">完成</button><button class="button button-secondary" type="button" data-today-snooze="${escapeHtml(item.id)}">稍后处理</button><button class="button button-quiet" type="button" data-today-pin="${escapeHtml(item.id)}" aria-pressed="${item.pinned ? "true" : "false"}">${item.pinned ? "取消固定" : "固定优先"}</button>`
-: "";
-return `<article class="plan-item ${escapeHtml(item.kind || "work")}"><div class="plan-item-index">${String(index + 1).padStart(2, "0")}</div><div class="plan-item-body"><small>${escapeHtml(meta)}</small><h3><a href="${planHref(item)}">${escapeHtml(title)}</a></h3><p>${escapeHtml(detail)}</p>${reason ? `<div class="plan-reason">${escapeHtml(reason)}</div>` : ""}<footer>${actionButtons}<a class="text-link" href="${planHref(item)}">查看事项</a></footer></div></article>`;
-}
-
-function renderPlanList(items, emptyTitle, emptyDetail) {
-return items.length
-? items.map((item, index) => renderPlanItem(item, index)).join("")
-: `<div class="plan-empty"><span>✓</span><div><strong>${escapeHtml(emptyTitle)}</strong><p>${escapeHtml(emptyDetail)}</p></div></div>`;
-}
-
-function renderNowCard(item) {
-if (!item) return `<article class="now-card is-empty"><div class="now-card-mark">✓</div><div class="now-card-body"><small>现在</small><h2>暂时没有必须立刻处理的事</h2><p>新材料交给贾维斯后，需要你介入的内容会出现在这里。</p><button class="button button-primary" type="button" data-open-intake>交给贾维斯</button></div></article>`;
-const controls = item.id && item.item_type !== "review"
-? `<footer class="now-actions"><button class="button button-primary" type="button" data-today-complete="${escapeHtml(item.id)}">完成</button><button class="button button-secondary" type="button" data-today-snooze="${escapeHtml(item.id)}">稍后处理</button><button class="button button-quiet" type="button" data-today-pin="${escapeHtml(item.id)}" aria-pressed="${item.pinned ? "true" : "false"}">${item.pinned ? "取消固定" : "固定优先"}</button><a class="text-link" href="${planHref(item)}">查看事项</a></footer>`
-: `<footer class="now-actions"><a class="text-link" href="${planHref(item)}">查看详情</a></footer>`;
-return `<article class="now-card ${escapeHtml(item.kind || "work")}"><div class="now-card-mark">1</div><div class="now-card-body"><small>现在只做这件</small><h2><a href="${planHref(item)}">${escapeHtml(humanText(item.title, "待处理行动", 180))}</a></h2><p>${escapeHtml(humanText(item.detail, "打开事项查看下一步。", 320))}</p><div class="now-reason"><strong>为什么现在做</strong><span>${escapeHtml(humanText(item.sort_reason, "按截止时间和最近变化排序", 160))}</span></div><dl class="now-facts">${item.due_date ? `<div><dt>截止时间</dt><dd>${escapeHtml(item.due_date)}</dd></div>` : ""}${item.waiting_on ? `<div><dt>等待对象</dt><dd>${escapeHtml(item.waiting_on)}</dd></div>` : ""}${item.blocked_reason ? `<div><dt>阻塞因素</dt><dd>${escapeHtml(item.blocked_reason)}</dd></div>` : ""}</dl>${controls}</div></article>`;
-}
-
-function renderWeeklyReview(review) {
-if (!review) return "";
-const counts = review.counts || {};
-const people = (review.people || []).slice(0, 8);
-    return `<details class="today-disclosure" data-today-disclosure="weekly" ${state.todayDisclosures.weekly ? "open" : ""}><summary><span>本周复盘</span><strong>${Number(counts.completed || 0)} 项完成，${Number(counts.overdue || 0)} 项超期</strong></summary><div class="weekly-review-grid"><section><h3>本周状态</h3><p>完成 ${Number(counts.completed || 0)} 项，等待 ${Number(counts.waiting || 0)} 项，阻塞 ${Number(counts.blocked || 0)} 项，公司规定变化 ${Number(counts.policy_changes || 0)} 条。</p></section><section><h3>负责人负荷</h3>${people.length ? `<ul>${people.map((item) => `<li><span>${escapeHtml(item.display_name)}</span><strong>${Number(item.open_count || 0)} 项开放${Number(item.overdue_count || 0) ? `，${Number(item.overdue_count)} 项超期` : ""}</strong></li>`).join("")}</ul>` : "<p>目前没有已确认负责人的开放行动。</p>"}</section></div></details>`;
-}
-
-  function renderIgnoredConversationRules(rules) {
-    const rows = Array.isArray(rules)
-      ? rules.filter((item) => item.rule_type !== "conversation_ignore")
-      : [];
-    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作规则</span><strong>${rows.filter((item) => item.enabled).length} 条正在使用</strong></summary><div class="learning-rule-list">${rows.length ? rows.map((item) => `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "正在使用，可随时停用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`).join("") : `<div class="plan-empty"><span>✓</span><div><strong>还没有形成个人规则</strong><p>屏蔽会话和后续纠正会在这里变成可查看的规则。</p></div></div>`}</div></details>`;
-}
-
-async function changeTodayAction(button, actionId, change) {
-const focusAttribute = [...button.attributes].find((item) => item.name.startsWith("data-") && item.value);
-const focusSelector = focusAttribute ? `[${focusAttribute.name}="${CSS.escape(focusAttribute.value)}"]` : null;
-button.disabled = true;
-try {
-if (change === "done") {
-await api(`/api/actions/${encodeURIComponent(actionId)}/resolve`, {
-method: "POST",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify({ status: "done" }),
-});
-toast("已标记完成", "success");
-} else {
-const payload = change === "snooze"
-? { snoozed_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
-: { pinned: button.getAttribute("aria-pressed") !== "true" };
-await api(`/api/actions/${encodeURIComponent(actionId)}/planning-state`, {
-method: "PATCH",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify(payload),
-});
-toast(change === "snooze" ? "已移到明天再处理" : "优先顺序已更新", "success");
-}
-await refreshRouteWithoutJump(focusSelector);
-} catch (error) {
-button.disabled = false;
-toast(friendlyError(error), "error");
-}
-}
-
-function attentionHref(item) {
-  if (item?.target === "reviews") return "#/reviews";
-  if (item?.matter_id) {
-    return `#/matters/${encodeURIComponent(item.matter_id)}`;
-  }
-    return "#/matters";
-}
-
-function attentionTypeLabel(type) {
-  return {
-    decision: "业务拍板",
-    assignee_confirmation: "跟进人确认",
-    overdue: "逾期行动",
-    follow_up: "到期跟进",
-    reminder: "到期提醒",
-    risk: "阻塞风险",
-    action: "普通行动",
-  }[type] || "需要处理";
-}
-
-function renderAttention(attention, counts = {}) {
-  const items = Array.isArray(attention) ? attention : [];
-  const summary = [
-    ["decision", "拍板"],
-    ["assignee_confirmation", "跟进人确认"],
-    ["overdue", "逾期"],
-    ["follow_up", "到期跟进"],
-    ["reminder", "提醒"],
-    ["risk", "风险"],
-    ["action", "行动"],
-  ]
-    .filter(([key]) => Number(counts[key] || 0) > 0)
-    .map(([key, label]) => `${label} ${Number(counts[key])}`)
-    .join(" · ");
-  const rows = items.length
-    ? items
-        .map(
-          (item, index) => `<article class="plan-item attention-item">
-            <div class="plan-item-index">${String(index + 1).padStart(2, "0")}</div>
-            <div class="plan-item-body">
-              <small>${escapeHtml(attentionTypeLabel(item.item_type))}${item.due_at ? ` · ${escapeHtml(fmtDate(item.due_at))}` : ""}</small>
-              <h3><a href="${attentionHref(item)}">${escapeHtml(humanText(item.title, "需要处理", 180))}</a></h3>
-              <p>${escapeHtml(humanText(item.reason, "这件事仍需要处理。", 260))}</p>
-            </div>
-            <a class="button button-secondary" href="${attentionHref(item)}">${item.target === "reviews" ? "去确认" : "查看事项"}</a>
-          </article>`,
-        )
-        .join("")
-    : `<div class="plan-empty"><span>✓</span><div><strong>目前没有需要你处理的事项</strong><p>新的拍板、跟进、风险和行动会按优先级出现在这里。</p></div></div>`;
-  return `<section class="plan-card today-attention"><header><div><p>统一入口</p><h2>需要我处理</h2></div><span>${items.length} 项</span></header>${summary ? `<p class="attention-summary">${escapeHtml(summary)}</p>` : ""}<div class="plan-list">${rows}</div></section>`;
-}
-
-function renderToday(brief, overview, materials, wechatStatus = null, policyStatus = null, assigneeReviews = [], weeklyReview = null, learningRules = []) {
-state.overview = overview || {};
-const nodeOnline = (state.overview.nodes || []).some((item) => item.status === "online");
-const pendingReviews = Number(brief?.counts?.pending_reviews || 0) + (Array.isArray(assigneeReviews) ? assigneeReviews.length : 0);
-updateReviewCount(pendingReviews);
-updateWechatCount(Number(wechatStatus?.counts?.pending || 0));
-  $("#assistant-presence-label").textContent = nodeOnline
-    ? "在线，自动读取；整理需手工启动"
-    : "本机未连接，材料会等待读取";
-
-  const attentionItems = Array.isArray(brief?.attention) ? brief.attention : [];
-  const attentionWaiting = Array.isArray(brief?.waiting) ? brief.waiting : [];
-  const attentionPolicyPending = Number(policyStatus?.counts?.pending || 0);
-  const sourceAlerts = [
-    Number(wechatStatus?.counts?.pending || 0)
-      ? `<a href="#/wechat"><span>聊天线索</span><strong>${Number(wechatStatus.counts.pending)} 条待确认</strong></a>`
-      : "",
-    attentionPolicyPending
-      ? `<a href="#/policies"><span>公司规定</span><strong>${attentionPolicyPending} 条变化待确认</strong></a>`
-      : "",
-  ].filter(Boolean).join("");
-  page().innerHTML = `<section class="today-page today-page-focused"><header class="today-heading"><div><p class="eyebrow">${greeting()}，Frank</p><h2>待我处理</h2><span>同一事项只显示一次，按拍板、确认、逾期、跟进和风险排序。</span></div><div class="today-status"><span class="status-dot ${nodeOnline ? "online" : "offline"}"></span>${nodeOnline ? "本机在线" : "等待本机接手"}</div></header>${renderAttention(attentionItems, brief?.attention_counts || {})}${sourceAlerts ? `<section class="today-alerts">${sourceAlerts}</section>` : ""}<details class="today-disclosure" data-today-disclosure="waiting" ${state.todayDisclosures.waiting ? "open" : ""}><summary><span>正在等别人</span><strong>${attentionWaiting.length} 项</strong></summary><div class="plan-list">${renderPlanList(attentionWaiting, "当前没有等待反馈的事项。")}</div></details>${renderWeeklyReview(weeklyReview)}</section>`;
-  $$('[data-today-disclosure]').forEach((details) => details.addEventListener('toggle', () => {
-    state.todayDisclosures[details.dataset.todayDisclosure] = details.open;
-  }));
-  bindDynamic();
-    return;
   }
 
   function renderWechatCandidate(item, matters) {
@@ -1684,7 +1501,7 @@ async function changeWechatConversation(button) {
           } else if (type === "material") {
             const [material, matters] = await Promise.all([
               api(`/api/materials/${encodeURIComponent(item.entity_id)}`),
-              api("/api/matters?limit=100"),
+              api("/api/matters?limit=500"),
             ]);
             record = material;
             state.manualEditRecords = {
@@ -3097,7 +2914,6 @@ function renderMatter(matter, people = [], timeline = [], matters = [], workPack
 
   function updateReviewCount(count) {
     setShortcutCount("#review-count", count);
-    if (routeFromHash().name === "today") refreshRouteWithoutJump();
   }
 
 function updateWechatCount(count) {
@@ -3120,7 +2936,7 @@ function updateWechatCount(count) {
     if (!select) return;
     if (!state.matters.length) {
       try {
-        state.matters = await api("/api/matters?limit=100");
+        state.matters = await api("/api/matters?limit=500");
       } catch (_) {
         return;
       }
@@ -3734,7 +3550,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-    navigator.serviceWorker.register("/sw.js?v=72").catch(() => {});
+    navigator.serviceWorker.register("/sw.js?v=73").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;

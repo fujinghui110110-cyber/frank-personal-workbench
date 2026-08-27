@@ -38,13 +38,12 @@ def test_stale_work_package_has_formal_recovery_prompt_and_disabled_apply() -> N
     assert "applyButton.disabled = stale ||" in binder
 
 
-def test_today_renderer_has_no_legacy_duplicate_dashboard_after_early_return() -> None:
+def test_legacy_today_renderer_is_removed_from_the_active_frontend() -> None:
     script = app_script()
-    renderer = region(script, "function renderToday(", "function renderWechatCandidate(")
 
-    assert "待我处理" in renderer
-    assert "今天只看下一步" not in renderer
-    assert "只处理一件最重要的事" not in renderer
+    assert 'route.name === "today"' not in script
+    assert "function renderToday(" not in script
+    assert "data-today-complete" not in script
 
 
 def test_work_package_step_exposes_and_serializes_all_business_fields() -> None:
