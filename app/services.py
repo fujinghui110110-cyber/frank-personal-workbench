@@ -38,6 +38,43 @@ SCHEDULE_BASES = {"material_explicit", "user_entered", "suggested", "legacy"}
 AUTO_SCHEDULE_BASES = {"material_explicit", "user_entered"}
 
 
+class StaleWriteError(RuntimeError):
+    pass
+
+
+def next_updated_at(current: str | None) -> str:
+    now = datetime.now(UTC)
+    if current:
+        try:
+            previous = datetime.fromisoformat(current.replace("Z", "+00:00"))
+            now = max(now, previous + timedelta(seconds=1))
+        except ValueError:
+            pass
+    return now.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def matter_stage(
+    status: str,
+    open_actions: int,
+    pending_reviews: int,
+    open_reminders: int,
+    active_jobs: int,
+    blocked_actions: int = 0,
+    waiting_actions: int = 0,
+) -> str:
+    if status == "completed":
+        return "completed"
+    if pending_reviews:
+        return "needs_decision"
+    if blocked_actions:
+        return "blocked"
+    if waiting_actions:
+        return "waiting"
+    if not any((open_actions, pending_reviews, open_reminders, active_jobs)):
+        return "ready_to_close"
+    return "in_progress"
+
+
 def has_explicit_date_fact(facts: list[dict[str, Any]], value: Any) -> bool:
     if not value:
         return False
@@ -200,14 +237,23 @@ def build_attention(
             continue
         due = reminder.get("due_at")
         if due:
-            try:
-                parsed_due = datetime.fromisoformat(str(due).replace("Z", "+00:00"))
-            except ValueError:
+            due_text = str(due)
+            if len(due_text) == 10:
+                try:
+                    if date.fromisoformat(due_text) > target_date:
+                        continue
+                except ValueError:
+                    pass
                 parsed_due = None
-            if parsed_due and parsed_due.tzinfo is None:
-                parsed_due = parsed_due.replace(tzinfo=UTC)
-            if parsed_due and parsed_due > now:
-                continue
+            else:
+                try:
+                    parsed_due = datetime.fromisoformat(due_text.replace("Z", "+00:00"))
+                except ValueError:
+                    parsed_due = None
+                if parsed_due and parsed_due.tzinfo is None:
+                    parsed_due = parsed_due.replace(tzinfo=UTC)
+                if parsed_due and parsed_due > now:
+                    continue
         action_id = str(reminder.get("action_id") or "").strip()
         if action_id:
             reminder_action_ids.add(action_id)
@@ -290,8 +336,23 @@ def build_attention(
             str(item.get("id") or ""),
         )
     )
-    counts["total"] = len(items)
-    return items, counts
+    unique_items: list[dict[str, Any]] = []
+    seen_matters: set[str] = set()
+    for item in items:
+        identity = str(item.get("matter_id") or f"{item['item_type']}:{item['id']}")
+        if identity in seen_matters:
+            continue
+        seen_matters.add(identity)
+        selected = dict(item)
+        if selected.get("matter_title"):
+            selected["driver_title"] = selected.get("title")
+            selected["title"] = selected["matter_title"]
+        unique_items.append(selected)
+    counts = {key: 0 for key in ATTENTION_PRIORITIES}
+    for item in unique_items:
+        counts[item["item_type"]] += 1
+    counts["total"] = len(unique_items)
+    return unique_items, counts
 
 
 def build_workflow_stats(
@@ -704,7 +765,13 @@ class WorkbenchService:
             new_id("audit"), actor, "analysis.released", "analysis", "pending",
             metadata={"released": released},
         )
-        return {"released": released, **self.analysis_status()}
+        prepared = self.prepare_attention_work_packages(actor)
+        return {
+            "released": released,
+            "work_packages_prepared": prepared["prepared"],
+            "work_packages_failed": prepared["failed"],
+            **self.analysis_status(),
+        }
 
     def validate_auxiliary_job(
         self, job_id: str, worker_id: str, lease_token: str
@@ -898,29 +965,40 @@ class WorkbenchService:
         payload: dict[str, Any] | None = None,
         *,
         created_at: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
         if not matter_id:
             return None
         event_id = new_id("event")
         timestamp = created_at or utc_now()
-        with self.database.connect() as connection:
-            connection.execute(
-                "INSERT INTO matter_events "
-                "(id, matter_id, event_type, actor, object_type, object_id, summary, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event_id,
-                    matter_id,
-                    event_type,
-                    actor,
-                    object_type,
-                    object_id,
-                    str(summary or "")[:500],
-                    json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")),
-                    timestamp,
-                ),
+        values = (
+            event_id,
+            matter_id,
+            event_type,
+            actor,
+            object_type,
+            object_id,
+            str(summary or "")[:500],
+            json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")),
+            timestamp,
+        )
+        query = (
+            "INSERT INTO matter_events "
+            "(id, matter_id, event_type, actor, object_type, object_id, summary, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        if connection is not None:
+            connection.execute(query, values)
+            row = connection.execute(
+                "SELECT * FROM matter_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            row = dict(row) if row else None
+        else:
+            with self.database.connect() as own_connection:
+                own_connection.execute(query, values)
+            row = self.database.fetch_one(
+                "SELECT * FROM matter_events WHERE id = ?", (event_id,)
             )
-        row = self.database.fetch_one("SELECT * FROM matter_events WHERE id = ?", (event_id,))
         if not row:
             return None
         row["payload"] = parse_json(row.pop("payload_json", "{}"), {})
@@ -970,6 +1048,233 @@ class WorkbenchService:
         if not detail:
             raise RuntimeError("事项关联失败")
         return detail
+
+    def reassign_material_preview(
+        self, material_id: str, matter_id: str
+    ) -> dict[str, Any]:
+        material = self.database.fetch_one(
+            "SELECT id, matter_id, filename, updated_at FROM materials WHERE id = ?",
+            (material_id,),
+        )
+        if not material:
+            raise KeyError("材料不存在")
+        target = self.database.fetch_one(
+            "SELECT id, title FROM matters WHERE id = ?", (matter_id,)
+        )
+        if not target:
+            raise KeyError("事项不存在")
+        actions = self.database.fetch_one(
+            "SELECT COUNT(*) AS count FROM actions WHERE material_id = ?",
+            (material_id,),
+        )["count"]
+        counts = {
+            "facts": self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM evidence WHERE material_id = ?",
+                (material_id,),
+            )["count"],
+            "actions": actions,
+            "reminders": self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM reminders WHERE action_id IN "
+                "(SELECT id FROM actions WHERE material_id = ?)",
+                (material_id,),
+            )["count"],
+            "reviews": self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM review_items WHERE material_id = ?",
+                (material_id,),
+            )["count"],
+            "email_records": self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM email_messages WHERE material_id = ?",
+                (material_id,),
+            )["count"],
+            "chat_records": self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM wechat_candidates WHERE material_id = ?",
+                (material_id,),
+            )["count"],
+        }
+        return public_labels({
+            "material_id": material_id,
+            "from_matter_id": material.get("matter_id"),
+            "to_matter_id": matter_id,
+            "to_matter_title": target["title"],
+            "updated_at": material["updated_at"],
+            "counts": counts,
+            "will_change": material.get("matter_id") != matter_id,
+        })
+
+    def reassign_material(
+        self,
+        material_id: str,
+        matter_id: str,
+        reason: str,
+        expected_updated_at: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        material = self.database.fetch_one(
+            "SELECT * FROM materials WHERE id = ?", (material_id,)
+        )
+        if not material:
+            raise KeyError("材料不存在")
+        target = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
+        if not target:
+            raise KeyError("事项不存在")
+        note = reason.strip()
+        if not note:
+            raise ValueError("请填写重新归属原因")
+        if expected_updated_at and expected_updated_at != material.get("updated_at"):
+            raise StaleWriteError("材料已被更新，请刷新后再操作")
+        old_matter_id = material.get("matter_id")
+        if old_matter_id == matter_id:
+            result = self.get_matter(matter_id) or target
+            result["_material_updated_at"] = material.get("updated_at")
+            result["changed"] = False
+            return result
+        now = next_updated_at(material.get("updated_at"))
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                "UPDATE materials SET matter_id = ?, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (matter_id, now, material_id, material["updated_at"]),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("材料已被更新，请刷新后再操作")
+            connection.execute(
+                "UPDATE reminders SET matter_id = ?, updated_at = ? "
+                "WHERE action_id IN (SELECT id FROM actions WHERE material_id = ?)",
+                (matter_id, now, material_id),
+            )
+            for table in ("evidence", "actions", "review_items"):
+                connection.execute(
+                    f"UPDATE {table} SET matter_id = ? WHERE material_id = ?",
+                    (matter_id, material_id),
+                )
+            connection.execute(
+                "UPDATE email_messages SET matter_id = ?, updated_at = ? WHERE material_id = ?",
+                (matter_id, now, material_id),
+            )
+            connection.execute(
+                "UPDATE wechat_candidates SET matter_id = ?, updated_at = ? WHERE material_id = ?",
+                (matter_id, now, material_id),
+            )
+            affected = [value for value in (old_matter_id, matter_id) if value]
+            for affected_id in dict.fromkeys(affected):
+                connection.execute(
+                    "UPDATE matters SET updated_at = ? WHERE id = ?", (now, affected_id)
+                )
+                connection.execute(
+                    "UPDATE work_packages SET status = 'stale', updated_at = ? "
+                    "WHERE matter_id = ?",
+                    (now, affected_id),
+                )
+            payload = {
+                "before": old_matter_id,
+                "after": matter_id,
+                "reason": note[:500],
+            }
+            self.database.audit(
+                new_id("audit"), actor, "material.reassigned", "material", material_id,
+                matter_id, payload, connection=connection,
+            )
+            if old_matter_id:
+                self.record_matter_event(
+                    old_matter_id, "material.reassigned_out", actor, "material", material_id,
+                    "材料已移出本事项", payload, connection=connection,
+                )
+            self.record_matter_event(
+                matter_id, "material.reassigned_in", actor, "material", material_id,
+                "材料已重新归入本事项", payload, connection=connection,
+            )
+        result = self.get_matter(matter_id)
+        if not result:
+            raise RuntimeError("材料重新归属失败")
+        result["_material_updated_at"] = now
+        result["changed"] = True
+        return result
+
+    def correct_fact(
+        self,
+        evidence_id: str,
+        value: str,
+        field_type: str | None,
+        reason: str,
+        expected_created_at: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        evidence = self.database.fetch_one(
+            "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
+        )
+        if not evidence:
+            raise KeyError("事实依据不存在")
+        if evidence.get("status") == "superseded":
+            raise StaleWriteError("该事实已有修正版，请刷新后再操作")
+        if expected_created_at and expected_created_at != evidence.get("created_at"):
+            raise StaleWriteError("事实依据已被更新，请刷新后再操作")
+        corrected_value = value.strip()
+        correction_reason = reason.strip()
+        if not corrected_value or not correction_reason:
+            raise ValueError("请填写修正内容和修正原因")
+        new_id_value = new_id("evidence")
+        now = utc_now()
+        payload = {
+            "before_id": evidence_id,
+            "after_id": new_id_value,
+            "before": evidence["value"],
+            "after": corrected_value[:2000],
+            "reason": correction_reason[:500],
+        }
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                "UPDATE evidence SET status = 'superseded' "
+                "WHERE id = ? AND status != 'superseded'",
+                (evidence_id,),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("该事实已有修正版，请刷新后再操作")
+            connection.execute(
+                "INSERT INTO evidence "
+                "(id, matter_id, material_id, claim_type, field_type, value, "
+                "source_locator, quote, confidence, status, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)",
+                (
+                    new_id_value,
+                    evidence["matter_id"],
+                    evidence["material_id"],
+                    evidence["claim_type"],
+                    (field_type or evidence["field_type"])[:160],
+                    corrected_value[:2000],
+                    evidence["source_locator"],
+                    evidence.get("quote") or "",
+                    evidence.get("confidence"),
+                    actor,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE review_items SET evidence_id = ? "
+                "WHERE evidence_id = ? AND status = 'pending'",
+                (new_id_value, evidence_id),
+            )
+            connection.execute(
+                "UPDATE matters SET updated_at = ? WHERE id = ?",
+                (now, evidence["matter_id"]),
+            )
+            connection.execute(
+                "UPDATE work_packages SET status = 'stale', updated_at = ? WHERE matter_id = ?",
+                (now, evidence["matter_id"]),
+            )
+            self.database.audit(
+                new_id("audit"), actor, "evidence.corrected", "evidence", new_id_value,
+                evidence["matter_id"], payload, connection=connection,
+            )
+            self.record_matter_event(
+                evidence["matter_id"], "evidence.corrected", actor, "evidence",
+                new_id_value, "已建立事实修正版", payload, connection=connection,
+            )
+        result = self.database.fetch_one(
+            "SELECT * FROM evidence WHERE id = ?", (new_id_value,)
+        )
+        if not result:
+            raise RuntimeError("事实修正失败")
+        return public_labels(result)
 
     def claim_job(self, worker_id: str) -> dict[str, Any] | None:
         now_dt = datetime.now(UTC)
@@ -1102,6 +1407,197 @@ class WorkbenchService:
             raise RuntimeError("任务失败状态写入失败")
         return result
 
+    def _merge_analysis_work_package(
+        self,
+        connection: sqlite3.Connection,
+        matter_id: str,
+        material_id: str,
+        result: dict[str, Any],
+        facts: list[dict[str, Any]],
+        actions: list[dict[str, Any]],
+        now: str,
+        actor: str,
+    ) -> None:
+        existing_row = connection.execute(
+            "SELECT * FROM work_packages WHERE matter_id = ?", (matter_id,)
+        ).fetchone()
+        existing = dict(existing_row) if existing_row else None
+        if existing and existing["status"] != "adopted":
+            draft = parse_json(existing.get("draft_json"), {})
+        else:
+            draft = {}
+        if not isinstance(draft, dict):
+            draft = {}
+        draft.setdefault("conclusion", "")
+        draft.setdefault("basis", [])
+        draft.setdefault("gaps", [])
+        draft.setdefault("risks", [])
+        draft.setdefault("steps", [])
+        draft.setdefault("questions", [])
+        draft.setdefault("reply_draft", {"purpose": "", "text": ""})
+        if not draft["conclusion"]:
+            draft["conclusion"] = str(
+                result.get("summary") or result.get("matter_title") or ""
+            )[:2000]
+
+        def append_unique(key: str, value: Any) -> None:
+            text = str(value or "").strip()
+            values = draft.get(key)
+            if text and isinstance(values, list) and text not in values:
+                values.append(text)
+
+        for item in facts:
+            append_unique(
+                "basis",
+                f"待确认：{str(item.get('value') or '').strip()}"
+                + (
+                    f"（{str(item.get('source_locator') or '').strip()}）"
+                    if item.get("source_locator")
+                    else ""
+                ),
+            )
+
+        brief = result.get("brief") if isinstance(result.get("brief"), dict) else {}
+        for key, draft_key in (("gaps", "gaps"), ("missing", "gaps"), ("risks", "risks")):
+            values = brief.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                for value in values:
+                    append_unique(draft_key, value)
+
+        steps = draft.get("steps")
+        if not isinstance(steps, list):
+            steps = []
+            draft["steps"] = steps
+        known_steps = {
+            (
+                str(step.get("kind") or "task"),
+                str(step.get("title") or "").strip(),
+                str(step.get("detail") or "").strip(),
+            )
+            for step in steps
+            if isinstance(step, dict)
+        }
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            kind = str(action.get("kind") or "task")
+            if kind not in ACTION_KINDS:
+                raise ValueError("不支持的行动类型")
+            basis, due_date, next_follow_up_at = normalize_schedule(action, facts)
+            title = str(action.get("title") or "待处理").strip()[:200]
+            detail = str(action.get("detail") or "").strip()[:2000]
+            identity = (kind, title, detail)
+            if identity in known_steps:
+                continue
+            flow_state = str(action.get("flow_state") or default_flow_state(kind))
+            if flow_state not in FLOW_STATES:
+                flow_state = default_flow_state(kind)
+            estimated_minutes = action.get("estimated_minutes")
+            steps.append(
+                {
+                    "kind": kind,
+                    "title": title,
+                    "detail": detail,
+                    "owner": str(action.get("owner") or "")[:160],
+                    "due_date": due_date,
+                    "flow_state": flow_state,
+                    "waiting_on": str(action.get("waiting_on") or "")[:160],
+                    "blocked_reason": str(action.get("blocked_reason") or "")[:500],
+                    "next_follow_up_at": next_follow_up_at,
+                    "schedule_basis": basis,
+                    "suggested_due_date": action.get("due_date") if basis == "suggested" else None,
+                    "suggested_next_follow_up_at": (
+                        action.get("next_follow_up_at") if basis == "suggested" else None
+                    ),
+                    "estimated_minutes": (
+                        estimated_minutes
+                        if isinstance(estimated_minutes, int) and estimated_minutes > 0
+                        else None
+                    ),
+                    "assignee_suggestions": normalize_suggestions(action),
+                    "source_material_id": material_id,
+                }
+            )
+            known_steps.add(identity)
+
+        for suggestion in result.get("completion_suggestions") or []:
+            if not isinstance(suggestion, dict):
+                continue
+            reason = str(suggestion.get("reason") or "").strip()
+            action_id = str(suggestion.get("action_id") or "").strip()
+            prefix = f"是否确认行动 {action_id} 已完成"
+            if isinstance(draft.get("questions"), list):
+                draft["questions"] = [
+                    question
+                    for question in draft["questions"]
+                    if not str(question).startswith(prefix)
+                ]
+            append_unique(
+                "questions",
+                prefix + (f"：{reason}" if reason else ""),
+            )
+
+        next_check_at = brief.get("next_check_at")
+        next_check_reason = str(brief.get("next_check_reason") or "").strip()
+        if next_check_at and next_check_reason:
+            append_unique(
+                "questions",
+                f"是否在 {str(next_check_at)[:50]} 复查：{next_check_reason[:500]}",
+            )
+
+        package_id = existing["id"] if existing else new_id("package")
+        version = int(existing["version"]) + 1 if existing else 1
+        if existing and now <= existing["updated_at"]:
+            now = (
+                datetime.fromisoformat(existing["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        fingerprint = self._work_package_fingerprint(matter_id, connection=connection)
+        connection.execute(
+            "INSERT INTO work_packages "
+            "(id, matter_id, version, draft_json, source_fingerprint, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'draft', ?, ?) "
+            "ON CONFLICT(matter_id) DO UPDATE SET version = excluded.version, "
+            "draft_json = excluded.draft_json, source_fingerprint = excluded.source_fingerprint, "
+            "status = 'draft', updated_at = excluded.updated_at",
+            (
+                package_id,
+                matter_id,
+                version,
+                json.dumps(draft, ensure_ascii=False, separators=(",", ":")),
+                fingerprint,
+                existing["created_at"] if existing else now,
+                now,
+            ),
+        )
+        payload = {
+            "material_id": material_id,
+            "version": version,
+            "suggested_steps": len(actions),
+        }
+        self.database.audit(
+            new_id("audit"),
+            actor,
+            "work_package.prepared",
+            "work_package",
+            package_id,
+            matter_id,
+            payload,
+            connection=connection,
+        )
+        self.record_matter_event(
+            matter_id,
+            "work_package.prepared",
+            actor,
+            "work_package",
+            package_id,
+            "贾维斯已准备办理方案，等待人工核对",
+            payload,
+            connection=connection,
+        )
+
     def complete_job(
         self,
         job_id: str,
@@ -1132,28 +1628,28 @@ class WorkbenchService:
         )
         if not material:
             raise RuntimeError("任务材料不存在")
-        matter_id = result.get("matter_id") or material["matter_id"]
-        if matter_id and not self.database.fetch_one(
-            "SELECT id FROM matters WHERE id = ?", (matter_id,)
-        ):
-            raise KeyError("事项不存在")
+        matter_id = material["matter_id"]
         facts = result.get("facts", [])
         for fact in facts:
             if not fact.get("source_locator"):
                 raise ValueError("财务事实必须提供原文定位")
         self.reserve_job_result(job_id, worker_id, lease_token)
-        matter_id = result.get("matter_id") or material["matter_id"]
         if matter_id:
             matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
             if not matter:
                 raise KeyError("事项不存在")
         else:
             matter = self.create_matter(
-                result.get("matter_title") or material["filename"] or "待归并事项",
+                result.get("matter_title") or material["filename"] or "待确认事项建议",
                 worker_id,
                 result.get("summary", ""),
             )
             matter_id = matter["id"]
+            with self.database.connect() as connection:
+                connection.execute(
+                    "UPDATE matters SET status = 'needs_decision' WHERE id = ?",
+                    (matter_id,),
+                )
 
         inferences = result.get("inferences", [])
         actions = result.get("actions", [])
@@ -1173,53 +1669,6 @@ class WorkbenchService:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "UPDATE reminders SET status = 'done', updated_at = ? "
-                "WHERE status = 'open' AND fingerprint LIKE ?",
-                (now, f"job:{job_id}:%"),
-            )
-            if job.get("job_type") == "workbuddy_analyze":
-                connection.execute(
-                    "UPDATE reminders SET status = 'done', updated_at = ? WHERE fingerprint IN ("
-                    "SELECT 'review:' || id FROM review_items "
-                    "WHERE material_id = ? AND status = 'pending')",
-                    (now, job["material_id"]),
-                )
-                connection.execute(
-                    "UPDATE reminders SET status = 'done', updated_at = ? WHERE action_id IN ("
-                    "SELECT id FROM actions WHERE material_id = ? AND status = 'open')",
-                    (now, job["material_id"]),
-                )
-                connection.execute(
-                    "UPDATE review_items SET status = 'superseded', resolved_at = ? "
-                    "WHERE material_id = ? AND status = 'pending'",
-                    (now, job["material_id"]),
-                )
-                connection.execute(
-                    "UPDATE evidence SET status = 'superseded' WHERE material_id = ? "
-                    "AND id NOT IN (SELECT evidence_id FROM review_items "
-                    "WHERE material_id = ? AND status IN ('accepted', 'edited'))",
-                    (job["material_id"], job["material_id"]),
-                )
-                connection.execute(
-                    "UPDATE actions SET status = 'dismissed', updated_at = ? "
-                    "WHERE material_id = ? AND status = 'open'",
-                    (now, job["material_id"]),
-                )
-            result_title = str(result.get("matter_title") or "").strip()
-            material_count = connection.execute(
-                "SELECT COUNT(*) FROM materials WHERE matter_id = ?", (matter_id,)
-            ).fetchone()[0]
-            if result_title and material_count <= 1:
-                connection.execute(
-                    "UPDATE matters SET title = ?, updated_at = ? WHERE id = ?",
-                    (normalized_title(result_title), now, matter_id),
-                )
-            if result.get("summary"):
-                connection.execute(
-                    "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
-                    (str(result["summary"])[:1000], now, matter_id),
-                )
-            connection.execute(
                 "UPDATE materials SET matter_id = ?, status = 'processed', metadata_json = ?, "
                 "updated_at = ? "
                 "WHERE id = ?",
@@ -1230,10 +1679,7 @@ class WorkbenchService:
                     job["material_id"],
                 ),
             )
-            for claim_type, items, default_status in (
-                ("fact", facts, "confirmed"),
-                ("inference", inferences, "pending"),
-            ):
+            for claim_type, items in (("fact", facts), ("inference", inferences)):
                 for item in items:
                     evidence_id = new_id("evidence")
                     connection.execute(
@@ -1251,209 +1697,37 @@ class WorkbenchService:
                             str(item.get("source_locator", "模型推断"))[:255],
                             str(item.get("quote", ""))[:1000],
                             item.get("confidence"),
-                            default_status,
+                            "pending",
                             worker_id,
                             now,
                         ),
                     )
-                    if claim_type == "inference":
-                        connection.execute(
-                            "INSERT INTO review_items "
-                            "(id, matter_id, material_id, evidence_id, kind, title, payload_json, "
-                            "confidence, created_at) VALUES (?, ?, ?, ?, 'inference', ?, ?, ?, ?)",
-                            (
-                                new_id("review"),
-                                matter_id,
-                                job["material_id"],
-                                evidence_id,
-                                f"确认推断：{str(item.get('value', ''))[:80]}",
-                                json.dumps(item, ensure_ascii=False, separators=(",", ":")),
-                                item.get("confidence"),
-                                now,
-                            ),
-                        )
-            for action in actions:
-                kind = str(action.get("kind", "task"))
-                if kind not in ACTION_KINDS:
-                    raise ValueError("不支持的行动类型")
-                action_id = new_id("action")
-                flow_state = str(action.get("flow_state") or default_flow_state(kind))
-                if flow_state not in FLOW_STATES:
-                    flow_state = default_flow_state(kind)
-                waiting_on = str(action.get("waiting_on") or "")[:160]
-                blocked_reason = str(action.get("blocked_reason") or "")[:500]
-                requested_due_date = action.get("due_date") or None
-                requested_follow_up_at = action.get("next_follow_up_at") or None
-                schedule_basis, due_date, next_follow_up_at = normalize_schedule(
-                    action,
-                    facts,
-                )
-                estimated_minutes = action.get("estimated_minutes")
-                if not isinstance(estimated_minutes, int) or estimated_minutes <= 0:
-                    estimated_minutes = None
-                completion_evidence = action.get("completion_evidence")
-                if isinstance(completion_evidence, str):
-                    completion_evidence = [completion_evidence]
-                if not isinstance(completion_evidence, list):
-                    completion_evidence = []
-                completion_evidence = [str(item)[:500] for item in completion_evidence[:12]]
-                connection.execute(
-                    "INSERT INTO actions "
-                    "(id, matter_id, material_id, kind, title, detail, status, owner, due_date, "
-                    "flow_state, waiting_on, blocked_reason, next_follow_up_at, schedule_basis, "
-                    "estimated_minutes, "
-                    "completion_evidence, created_by, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        action_id,
-                        matter_id,
-                            job["material_id"],
-                            kind,
-                            str(action.get("title", "待处理"))[:160],
-                        str(action.get("detail", ""))[:1000],
-                        str(action.get("owner", ""))[:80] or None,
-                        due_date,
-                        flow_state,
-                        waiting_on,
-                        blocked_reason,
-                        next_follow_up_at,
-                        schedule_basis,
-                        estimated_minutes,
-                        json.dumps(completion_evidence, ensure_ascii=False, separators=(",", ":")),
-                        worker_id,
-                        now,
-                        now,
-                        ),
-                    )
-                upsert_action_suggestions(
-                    connection,
-                    action_id,
-                    job["material_id"],
-                    normalize_suggestions(action),
-                    now,
-                )
-                if schedule_basis == "suggested" and (
-                    requested_due_date or requested_follow_up_at
-                ):
-                    suggestion = {
-                        "action_id": action_id,
-                        "suggested_due_date": requested_due_date,
-                        "suggested_next_follow_up_at": requested_follow_up_at,
-                        "reason": "日期未能在同一材料的明确日期证据中核对",
-                    }
                     connection.execute(
                         "INSERT INTO review_items "
-                        "(id, matter_id, material_id, kind, title, payload_json, created_at) "
-                        "VALUES (?, ?, ?, 'schedule', ?, ?, ?)",
+                        "(id, matter_id, material_id, evidence_id, kind, title, payload_json, "
+                        "confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             new_id("review"),
                             matter_id,
                             job["material_id"],
-                            f"确认行动日期：{requested_due_date or requested_follow_up_at}",
-                            json.dumps(
-                                suggestion,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
+                            evidence_id,
+                            claim_type,
+                            f"确认{'事实' if claim_type == 'fact' else '推断'}：{str(item.get('value', ''))[:80]}",
+                            json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+                            item.get("confidence"),
                             now,
                         ),
                     )
-            for suggestion in result.get("completion_suggestions") or []:
-                if not isinstance(suggestion, dict):
-                    continue
-                suggested_action_id = str(suggestion.get("action_id") or "").strip()
-                if not suggested_action_id:
-                    continue
-                action_row = connection.execute(
-                    "SELECT id, matter_id, status FROM actions WHERE id = ?",
-                    (suggested_action_id,),
-                ).fetchone()
-                if not action_row or action_row["matter_id"] != matter_id or action_row["status"] != "open":
-                    continue
-                existing_completion = connection.execute(
-                    "SELECT id FROM review_items WHERE kind = 'action_completion' "
-                    "AND matter_id = ? AND status = 'pending' ORDER BY created_at DESC",
-                    (matter_id,),
-                ).fetchall()
-                duplicate = False
-                for existing in existing_completion:
-                    existing_payload = connection.execute(
-                        "SELECT payload_json FROM review_items WHERE id = ?",
-                        (existing["id"],),
-                    ).fetchone()
-                    payload = parse_json(existing_payload["payload_json"] if existing_payload else "{}", {})
-                    if payload.get("action_id") == suggested_action_id:
-                        duplicate = True
-                        break
-                if duplicate:
-                    continue
-                payload = {
-                    "action_id": suggested_action_id,
-                    "reason": str(suggestion.get("reason") or "")[:500],
-                    "evidence": [
-                        str(item)[:500]
-                        for item in (suggestion.get("evidence") or [])[:4]
-                    ],
-                }
-                review_id = new_id("review")
-                connection.execute(
-                    "INSERT INTO review_items "
-                    "(id, matter_id, material_id, evidence_id, kind, title, payload_json, confidence, created_at) "
-                    "VALUES (?, ?, ?, NULL, 'action_completion', ?, ?, NULL, ?)",
-                    (
-                        review_id,
-                        matter_id,
-                        job["material_id"],
-                        f"确认行动完成：{str(action_row['id'])[:60]}",
-                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                        now,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO reminders "
-                    "(id, matter_id, action_id, kind, title, reason, status, fingerprint, due_at, created_at, updated_at) "
-                    "VALUES (?, ?, ?, 'review', ?, ?, 'scheduled', ?, NULL, ?, ?) "
-                    "ON CONFLICT(fingerprint) DO UPDATE SET reason = excluded.reason, status = 'scheduled', updated_at = excluded.updated_at",
-                    (
-                        new_id("reminder"),
-                        matter_id,
-                        suggested_action_id,
-                        "待确认行动完成",
-                        payload["reason"] or "模型建议确认该行动是否已完成",
-                        f"review:{review_id}",
-                        now,
-                        now,
-                    ),
-                )
-            next_check_at = brief.get("next_check_at")
-            next_check_reason = str(brief.get("next_check_reason") or "").strip()
-            if (
-                next_check_at
-                and next_check_reason
-                and brief.get("schedule_basis") in AUTO_SCHEDULE_BASES
-                and (
-                    brief.get("schedule_basis") != "material_explicit"
-                    or has_explicit_date_fact(facts, next_check_at)
-                )
-            ):
-                connection.execute(
-                    "INSERT INTO reminders "
-                    "(id, matter_id, action_id, kind, title, reason, status, fingerprint, "
-                    "due_at, created_at, updated_at) "
-                    "VALUES (?, ?, NULL, 'follow_up', ?, ?, 'scheduled', ?, ?, ?, ?) "
-                    "ON CONFLICT(fingerprint) DO UPDATE SET reason = excluded.reason, "
-                    "due_at = excluded.due_at, status = 'scheduled', updated_at = excluded.updated_at",
-                    (
-                        new_id("reminder"),
-                        matter_id,
-                        f"贾维斯 复查：{str(result.get('matter_title') or '当前事项')[:80]}",
-                        next_check_reason[:1000],
-                        f"workbuddy:{job['material_id']}:{next_check_at}",
-                        str(next_check_at)[:50],
-                        now,
-                        now,
-                    ),
-                )
+            self._merge_analysis_work_package(
+                connection,
+                matter_id,
+                job["material_id"],
+                result,
+                facts,
+                actions,
+                now,
+                worker_id,
+            )
             completed = connection.execute(
                 "UPDATE jobs SET status = 'succeeded', error = NULL, result_version = 1, "
                 "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ? "
@@ -1470,7 +1744,11 @@ class WorkbenchService:
             "job",
             job_id,
             matter_id,
-            {"facts": len(facts), "inferences": len(inferences), "actions": len(actions)},
+            {
+                "facts_pending": len(facts),
+                "inferences_pending": len(inferences),
+                "suggested_actions": len(actions),
+            },
         )
         self.record_matter_event(
             matter_id,
@@ -1481,9 +1759,9 @@ class WorkbenchService:
             "材料处理结果已写入事项",
             {
                 "material_id": job["material_id"],
-                "facts": len(facts),
-                "inferences": len(inferences),
-                "actions": len(actions),
+                "facts_pending": len(facts),
+                "inferences_pending": len(inferences),
+                "suggested_actions": len(actions),
             },
         )
         detail = self.get_matter(matter_id)
@@ -1497,6 +1775,10 @@ class WorkbenchService:
             "(SELECT COUNT(*) FROM materials x WHERE x.matter_id = m.id) AS material_count, "
             "(SELECT COUNT(*) FROM actions a WHERE a.matter_id = m.id AND a.status = 'open') "
             "AS open_action_count, "
+            "(SELECT COUNT(*) FROM actions a WHERE a.matter_id = m.id AND a.status = 'open' "
+            "AND a.flow_state = 'blocked') AS blocked_action_count, "
+            "(SELECT COUNT(*) FROM actions a WHERE a.matter_id = m.id AND a.status = 'open' "
+            "AND a.flow_state = 'waiting') AS waiting_action_count, "
             "((SELECT COUNT(*) FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') + "
             "(SELECT COUNT(*) FROM action_assignees aa JOIN actions a ON a.id = aa.action_id "
             "WHERE a.matter_id = m.id AND aa.status = 'pending')) "
@@ -1511,21 +1793,17 @@ class WorkbenchService:
             (limit,),
         )
         for matter in matters:
-            status_override = bool(matter.pop("status_override", 0))
-            computed_complete = not any(
-                matter[field]
-                for field in (
-                    "open_action_count",
-                    "pending_review_count",
-                    "open_reminder_count",
-                    "active_job_count",
-                )
+            matter.pop("status_override", None)
+            matter["is_completed"] = matter["status"] == "completed"
+            matter["stage"] = matter_stage(
+                matter["status"],
+                matter["open_action_count"],
+                matter["pending_review_count"],
+                matter["open_reminder_count"],
+                matter["active_job_count"],
+                matter["blocked_action_count"],
+                matter["waiting_action_count"],
             )
-            matter["is_completed"] = (
-                matter["status"] == "completed" if status_override else computed_complete
-            )
-            if not status_override:
-                matter["status"] = "completed" if computed_complete else "active"
         return public_labels(matters)
 
     def _attach_action_assignees(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1628,7 +1906,15 @@ class WorkbenchService:
         if not action:
             raise KeyError("行动不存在")
 
+        expected_updated_at = changes.pop("expected_updated_at", None)
+        reason = str(changes.pop("change_reason", "") or "")[:500]
+        if expected_updated_at and expected_updated_at != action.get("updated_at"):
+            raise StaleWriteError("行动已被更新，请刷新后再保存")
         allowed = {
+            "title",
+            "detail",
+            "kind",
+            "due_date",
             "flow_state",
             "waiting_on",
             "blocked_reason",
@@ -1643,6 +1929,28 @@ class WorkbenchService:
             raise ValueError("至少提供一项规划字段")
 
         values: dict[str, Any] = {}
+        if "title" in changes:
+            title = str(changes["title"] or "").strip()
+            if not title:
+                raise ValueError("行动标题不能为空")
+            values["title"] = title[:200]
+        if "detail" in changes:
+            values["detail"] = str(changes["detail"] or "")[:2000]
+        if "kind" in changes:
+            kind = str(changes["kind"] or "")
+            if kind not in ACTION_KINDS:
+                raise ValueError("不支持的行动类型")
+            values["kind"] = kind
+            if "flow_state" not in changes:
+                values["flow_state"] = default_flow_state(kind)
+        if "due_date" in changes:
+            due_date = changes["due_date"] or None
+            if due_date:
+                try:
+                    date.fromisoformat(str(due_date))
+                except ValueError as exc:
+                    raise ValueError("行动日期格式不正确") from exc
+            values["due_date"] = due_date
         if "flow_state" in changes:
             flow_state = changes["flow_state"] or default_flow_state(action["kind"])
             if flow_state not in FLOW_STATES:
@@ -1662,9 +1970,13 @@ class WorkbenchService:
                 except ValueError as exc:
                     raise ValueError("时间格式不正确") from exc
             values[field] = value or None
-        if "next_follow_up_at" in changes:
+        if "due_date" in changes or "next_follow_up_at" in changes:
+            final_due_date = values.get("due_date", action.get("due_date"))
+            final_follow_up = values.get(
+                "next_follow_up_at", action.get("next_follow_up_at")
+            )
             values["schedule_basis"] = (
-                "user_entered" if changes["next_follow_up_at"] else "legacy"
+                "user_entered" if final_due_date or final_follow_up else "legacy"
             )
         if "estimated_minutes" in changes:
             minutes = changes["estimated_minutes"]
@@ -1684,30 +1996,45 @@ class WorkbenchService:
             )
 
         now = utc_now()
+        if now <= action["updated_at"]:
+            now = (
+                datetime.fromisoformat(action["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
         assignments = ", ".join(f"{key} = ?" for key in values)
+        audit_payload = {
+            "before": {key: action.get(key) for key in values},
+            "after": values,
+            "reason": reason,
+        }
         with self.database.connect() as connection:
-            connection.execute(
-                f"UPDATE actions SET {assignments}, updated_at = ? WHERE id = ?",
-                (*values.values(), now, action_id),
+            updated_row = connection.execute(
+                f"UPDATE actions SET {assignments}, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (*values.values(), now, action_id, action["updated_at"]),
             )
-        self.database.audit(
-            new_id("audit"),
-            actor,
-            "action.planning_updated",
-            "action",
-            action_id,
-            action["matter_id"],
-            values,
-        )
-        self.record_matter_event(
-            action["matter_id"],
-            "action.planning_updated",
-            actor,
-            "action",
-            action_id,
-            "行动规划已更新",
-            values,
-        )
+            if updated_row.rowcount != 1:
+                raise StaleWriteError("行动已被更新，请刷新后再保存")
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "action.planning_updated",
+                "action",
+                action_id,
+                action["matter_id"],
+                audit_payload,
+                connection=connection,
+            )
+            self.record_matter_event(
+                action["matter_id"],
+                "action.planning_updated",
+                actor,
+                "action",
+                action_id,
+                "行动规划已更新",
+                audit_payload,
+                connection=connection,
+            )
         updated = self.database.fetch_one("SELECT * FROM actions WHERE id = ?", (action_id,))
         if not updated:
             raise RuntimeError("行动规划写入失败")
@@ -1769,29 +2096,416 @@ class WorkbenchService:
             "('queued', 'claimed', 'processing', 'retryable_failed', 'needs_review')",
             (matter_id,),
         )
-        status_override = bool(matter.pop("status_override", 0))
-        computed_complete = not any(
-            (
-                any(item.get("status") == "open" for item in matter["actions"]),
-                any(item.get("status") == "pending" for item in matter["reviews"]),
-                any(
-                    assignee.get("status") == "pending"
-                    for action in matter["actions"]
-                    for assignee in action.get("assignees", [])
-                ),
-                any(
-                    item.get("status") not in {"done", "dismissed"}
-                    for item in matter["reminders"]
-                ),
-                int((active_job or {}).get("total") or 0),
-            )
+        matter.pop("status_override", None)
+        open_actions = [item for item in matter["actions"] if item.get("status") == "open"]
+        pending_reviews = [item for item in matter["reviews"] if item.get("status") == "pending"]
+        pending_assignees = [
+            assignee
+            for action in matter["actions"]
+            for assignee in action.get("assignee_suggestions", [])
+            if assignee.get("status") == "pending"
+        ]
+        open_reminders = [
+            item
+            for item in matter["reminders"]
+            if item.get("status") not in {"done", "dismissed"}
+        ]
+        matter["is_completed"] = matter["status"] == "completed"
+        matter["stage"] = matter_stage(
+            matter["status"],
+            len(open_actions),
+            len(pending_reviews) + len(pending_assignees),
+            len(open_reminders),
+            int((active_job or {}).get("total") or 0),
+            sum(item.get("flow_state") == "blocked" for item in open_actions),
+            sum(item.get("flow_state") == "waiting" for item in open_actions),
         )
-        matter["is_completed"] = (
-            matter["status"] == "completed" if status_override else computed_complete
-        )
-        if not status_override:
-            matter["status"] = "completed" if computed_complete else "active"
         return public_labels(matter)
+
+    def _work_package_fingerprint(
+        self,
+        matter_id: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
+        def fetch_one(query: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
+            if connection is None:
+                return self.database.fetch_one(query, params)
+            row = connection.execute(query, params).fetchone()
+            return dict(row) if row else None
+
+        def fetch_all(query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            if connection is None:
+                return self.database.fetch_all(query, params)
+            return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+        matter = fetch_one(
+            "SELECT id, title, status, summary, goal, completion_criteria, owner, "
+            "target_date, updated_at FROM matters WHERE id = ?",
+            (matter_id,),
+        )
+        if not matter:
+            raise KeyError("事项不存在")
+        source = {
+            "matter": matter,
+            "materials": fetch_all(
+                "SELECT id, sha256, status, updated_at FROM materials WHERE matter_id = ? "
+                "ORDER BY id",
+                (matter_id,),
+            ),
+            "evidence": fetch_all(
+                "SELECT id, status, created_at FROM evidence WHERE matter_id = ? ORDER BY id",
+                (matter_id,),
+            ),
+            "actions": fetch_all(
+                "SELECT id, status, updated_at FROM actions WHERE matter_id = ? ORDER BY id",
+                (matter_id,),
+            ),
+            "reminders": fetch_all(
+                "SELECT id, status, updated_at FROM reminders WHERE matter_id = ? ORDER BY id",
+                (matter_id,),
+            ),
+            "reviews": fetch_all(
+                "SELECT id, status, resolved_at FROM review_items WHERE matter_id = ? ORDER BY id",
+                (matter_id,),
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(source, ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest()
+
+    def get_work_package(self, matter_id: str) -> dict[str, Any] | None:
+        if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
+            raise KeyError("事项不存在")
+        package = self.database.fetch_one(
+            "SELECT * FROM work_packages WHERE matter_id = ?", (matter_id,)
+        )
+        if not package:
+            return None
+        if (
+            package["status"] in {"draft", "stale"}
+            and package["source_fingerprint"] != self._work_package_fingerprint(matter_id)
+        ):
+            package["status"] = "stale"
+        package["draft"] = parse_json(package.pop("draft_json", "{}"), {})
+        return public_labels(package)
+
+    def generate_work_package(self, matter_id: str, actor: str) -> dict[str, Any]:
+        matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
+        if not matter:
+            raise KeyError("事项不存在")
+        fingerprint = self._work_package_fingerprint(matter_id)
+        evidence = self.database.fetch_all(
+            "SELECT value, source_locator FROM evidence "
+            "WHERE matter_id = ? AND status = 'confirmed' ORDER BY created_at",
+            (matter_id,),
+        )
+        reviews = self.database.fetch_all(
+            "SELECT title FROM review_items "
+            "WHERE matter_id = ? AND status = 'pending' ORDER BY created_at",
+            (matter_id,),
+        )
+        blocked_actions = self.database.fetch_all(
+            "SELECT title, blocked_reason FROM actions "
+            "WHERE matter_id = ? AND status = 'open' AND flow_state = 'blocked' "
+            "ORDER BY created_at",
+            (matter_id,),
+        )
+        draft = {
+            "conclusion": matter.get("summary") or matter["title"],
+            "basis": [
+                item["value"]
+                + (f"（{item['source_locator']}）" if item.get("source_locator") else "")
+                for item in evidence
+            ],
+            "gaps": [],
+            "risks": [
+                item.get("blocked_reason") or f"{item['title']}当前受阻"
+                for item in blocked_actions
+            ],
+            "steps": [],
+            "questions": [item["title"] for item in reviews],
+            "reply_draft": {"purpose": "", "text": ""},
+        }
+        existing = self.database.fetch_one(
+            "SELECT * FROM work_packages WHERE matter_id = ?", (matter_id,)
+        )
+        package_id = existing["id"] if existing else new_id("package")
+        version = int(existing["version"]) + 1 if existing else 1
+        now = utc_now()
+        if existing and now <= existing["updated_at"]:
+            now = (
+                datetime.fromisoformat(existing["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO work_packages "
+                "(id, matter_id, version, draft_json, source_fingerprint, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'draft', ?, ?) "
+                "ON CONFLICT(matter_id) DO UPDATE SET version = excluded.version, "
+                "draft_json = excluded.draft_json, source_fingerprint = excluded.source_fingerprint, "
+                "status = 'draft', updated_at = excluded.updated_at",
+                (
+                    package_id,
+                    matter_id,
+                    version,
+                    json.dumps(draft, ensure_ascii=False, separators=(",", ":")),
+                    fingerprint,
+                    now,
+                    now,
+                ),
+            )
+        payload = {"version": version, "source_fingerprint": fingerprint}
+        self.database.audit(
+            new_id("audit"), actor, "work_package.generated", "work_package", package_id,
+            matter_id, payload,
+        )
+        self.record_matter_event(
+            matter_id, "work_package.generated", actor, "work_package", package_id,
+            "事项工作包已生成", payload,
+        )
+        package = self.get_work_package(matter_id)
+        if not package:
+            raise RuntimeError("工作包生成失败")
+        return package
+
+    def prepare_attention_work_packages(self, actor: str) -> dict[str, Any]:
+        rows = self.database.fetch_all(
+            "SELECT DISTINCT m.id FROM matters m "
+            "LEFT JOIN work_packages wp ON wp.matter_id = m.id "
+            "WHERE m.status != 'completed' AND wp.id IS NULL AND ("
+            "EXISTS (SELECT 1 FROM actions a WHERE a.matter_id = m.id AND a.status = 'open') "
+            "OR EXISTS (SELECT 1 FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') "
+            "OR EXISTS (SELECT 1 FROM reminders n WHERE n.matter_id = m.id "
+            "AND n.status IN ('open', 'scheduled')) "
+            "OR EXISTS (SELECT 1 FROM materials x JOIN jobs j ON j.material_id = x.id "
+            "WHERE x.matter_id = m.id AND j.status IN ('retryable_failed', 'needs_review'))"
+            ") ORDER BY m.updated_at DESC"
+        )
+        prepared = 0
+        failed: list[dict[str, str]] = []
+        for row in rows:
+            try:
+                self.generate_work_package(row["id"], actor)
+                prepared += 1
+            except Exception:
+                failed.append({"matter_id": row["id"], "message": "办理方案准备失败"})
+        return {"prepared": prepared, "failed": failed}
+
+    def update_work_package(
+        self,
+        matter_id: str,
+        draft: dict[str, Any],
+        expected_updated_at: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        package = self.database.fetch_one(
+            "SELECT * FROM work_packages WHERE matter_id = ?", (matter_id,)
+        )
+        if not package:
+            if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
+                raise KeyError("事项不存在")
+            raise KeyError("工作包不存在")
+        if expected_updated_at and expected_updated_at != package["updated_at"]:
+            raise StaleWriteError("工作包已被更新，请刷新后再保存")
+        if not isinstance(draft, dict) or not isinstance(draft.get("steps", []), list):
+            raise ValueError("工作包草稿格式不正确")
+        if any(not isinstance(step, dict) for step in draft.get("steps", [])):
+            raise ValueError("工作包步骤格式不正确")
+        now = utc_now()
+        if now <= package["updated_at"]:
+            now = (
+                datetime.fromisoformat(package["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        version = int(package["version"]) + 1
+        current_fingerprint = self._work_package_fingerprint(matter_id)
+        next_status = (
+            "stale"
+            if package["status"] == "stale"
+            or current_fingerprint != package["source_fingerprint"]
+            else "draft"
+        )
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                "UPDATE work_packages SET version = ?, draft_json = ?, status = ?, "
+                "updated_at = ? WHERE id = ? AND updated_at = ?",
+                (
+                    version,
+                    json.dumps(draft, ensure_ascii=False, separators=(",", ":")),
+                    next_status,
+                    now,
+                    package["id"],
+                    package["updated_at"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("工作包已被更新，请刷新后再保存")
+        payload = {"version": version, "step_count": len(draft.get("steps", []))}
+        self.database.audit(
+            new_id("audit"), actor, "work_package.updated", "work_package", package["id"],
+            matter_id, payload,
+        )
+        self.record_matter_event(
+            matter_id, "work_package.updated", actor, "work_package", package["id"],
+            "事项工作包已修改", payload,
+        )
+        result = self.get_work_package(matter_id)
+        if not result:
+            raise RuntimeError("工作包更新失败")
+        return result
+
+    def apply_work_package(
+        self,
+        matter_id: str,
+        step_indexes: list[int],
+        expected_updated_at: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        package = self.database.fetch_one(
+            "SELECT * FROM work_packages WHERE matter_id = ?", (matter_id,)
+        )
+        if not package:
+            if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
+                raise KeyError("事项不存在")
+            raise KeyError("工作包不存在")
+        if expected_updated_at and expected_updated_at != package["updated_at"]:
+            raise StaleWriteError("工作包已被更新，请刷新后再应用")
+        if package["status"] != "applied" and (
+            package["status"] == "stale"
+            or package["source_fingerprint"] != self._work_package_fingerprint(matter_id)
+        ):
+            raise StaleWriteError("事项内容已有变化，请重新生成办理方案后再采纳")
+        draft = parse_json(package["draft_json"], {})
+        steps = draft.get("steps", []) if isinstance(draft, dict) else []
+        indexes = list(dict.fromkeys(step_indexes))
+        if any(not isinstance(index, int) or isinstance(index, bool) for index in indexes):
+            raise ValueError("工作包步骤序号必须是整数")
+        if any(index < 0 or index >= len(steps) for index in indexes):
+            raise ValueError("工作包步骤序号超出范围")
+        now = utc_now()
+        if now <= package["updated_at"]:
+            now = (
+                datetime.fromisoformat(package["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        created: list[dict[str, Any]] = []
+        with self.database.connect() as connection:
+            for index in indexes:
+                step = steps[index]
+                source_key = f"work_package:{package['id']}:v{package['version']}:step:{index}"
+                if connection.execute(
+                    "SELECT id FROM actions WHERE matter_id = ? AND created_by = ?",
+                    (matter_id, source_key),
+                ).fetchone():
+                    continue
+                kind = str(step.get("kind") or "task")
+                if kind not in ACTION_KINDS:
+                    kind = "task"
+                title = str(step.get("title") or "").strip()
+                if not title:
+                    raise ValueError("选中的工作包步骤缺少标题")
+                flow_state = str(step.get("flow_state") or default_flow_state(kind))
+                if flow_state not in FLOW_STATES:
+                    flow_state = default_flow_state(kind)
+                action_id = new_id("action")
+                connection.execute(
+                    "INSERT INTO actions "
+                    "(id, matter_id, kind, title, detail, status, owner, due_date, created_by, "
+                    "created_at, updated_at, flow_state, waiting_on, blocked_reason, "
+                    "next_follow_up_at, schedule_basis, estimated_minutes, completion_evidence) "
+                    "VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user_entered', ?, '[]')",
+                    (
+                        action_id,
+                        matter_id,
+                        kind,
+                        title[:200],
+                        str(step.get("detail") or "")[:2000],
+                        str(step.get("owner") or "")[:160] or None,
+                        step.get("due_date") or None,
+                        source_key,
+                        now,
+                        now,
+                        flow_state,
+                        str(step.get("waiting_on") or "")[:160],
+                        str(step.get("blocked_reason") or "")[:500],
+                        step.get("next_follow_up_at") or None,
+                        step.get("estimated_minutes")
+                        if isinstance(step.get("estimated_minutes"), int)
+                        and step["estimated_minutes"] > 0
+                        else None,
+                    ),
+                )
+                upsert_action_suggestions(
+                    connection,
+                    action_id,
+                    str(step.get("source_material_id") or "") or None,
+                    step.get("assignee_suggestions")
+                    if isinstance(step.get("assignee_suggestions"), list)
+                    else [],
+                    now,
+                )
+                created.append({"id": action_id, "step_index": index, "title": title[:200]})
+            updated = connection.execute(
+                "UPDATE work_packages SET status = 'applied', updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (now, package["id"], package["updated_at"]),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("工作包已被更新，请刷新后再应用")
+            for action in created:
+                payload = {
+                    "work_package_id": package["id"],
+                    "step_index": action["step_index"],
+                }
+                self.database.audit(
+                    new_id("audit"),
+                    actor,
+                    "action.created",
+                    "action",
+                    action["id"],
+                    matter_id,
+                    payload,
+                    connection=connection,
+                )
+                self.record_matter_event(
+                    matter_id,
+                    "action.created",
+                    actor,
+                    "action",
+                    action["id"],
+                    f"已从工作包创建行动：{action['title']}",
+                    payload,
+                    connection=connection,
+                )
+            payload = {
+                "selected_step_indexes": indexes,
+                "created_action_ids": [action["id"] for action in created],
+            }
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "work_package.applied",
+                "work_package",
+                package["id"],
+                matter_id,
+                payload,
+                connection=connection,
+            )
+            self.record_matter_event(
+                matter_id,
+                "work_package.applied",
+                actor,
+                "work_package",
+                package["id"],
+                "事项工作包已应用",
+                payload,
+                connection=connection,
+            )
+        result = self.get_work_package(matter_id)
+        if not result:
+            raise RuntimeError("工作包应用失败")
+        return {"work_package": result, "created_actions": public_labels(created)}
 
     def matter_timeline(self, matter_id: str, limit: int = 200) -> list[dict[str, Any]]:
         if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
@@ -1820,96 +2534,204 @@ class WorkbenchService:
         matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
         if not matter:
             raise KeyError("事项不存在")
-        if "status" in changes:
-            status = changes.get("status")
-            if status not in {"active", "completed"}:
-                raise ValueError("事项状态只能是 active 或 completed")
-            now = utc_now()
-            with self.database.connect() as connection:
-                if status == "completed":
-                    connection.execute(
-                        "UPDATE actions SET status = 'done', flow_state = 'completed', "
-                        "completion_evidence = CASE WHEN TRIM(COALESCE(completion_evidence, '')) = '' "
-                        "THEN '事项由用户直接标记完成' ELSE completion_evidence END, updated_at = ? "
-                        "WHERE matter_id = ? AND status = 'open'",
-                        (now, matter_id),
-                    )
-                    connection.execute(
-                        "UPDATE reminders SET status = 'done', updated_at = ? "
-                        "WHERE matter_id = ? AND status NOT IN ('done', 'dismissed')",
-                        (now, matter_id),
-                    )
-                connection.execute(
-                    "UPDATE review_items SET status = 'dismissed', resolved_at = ? "
-                    "WHERE matter_id = ? AND status = 'pending'",
-                    (now, matter_id),
-                )
-                connection.execute(
-                    "UPDATE action_assignees SET status = 'superseded', updated_at = ? "
-                    "WHERE status = 'pending' AND action_id IN "
-                    "(SELECT id FROM actions WHERE matter_id = ?)",
-                    (now, matter_id),
-                )
-                connection.execute(
-                    "UPDATE matters SET status = ?, status_override = 1, updated_at = ? WHERE id = ?",
-                    (status, now, matter_id),
-                )
-            payload = {"before": matter.get("status"), "after": status}
+        expected_updated_at = changes.pop("expected_updated_at", None)
+        reason = str(changes.pop("reason", "") or "")[:500]
+        if expected_updated_at and expected_updated_at != matter.get("updated_at"):
+            raise StaleWriteError("事项已被更新，请刷新后再保存")
+        if changes.get("status") == "completed":
+            raise ValueError("请先完成收尾检查，再关闭事项")
+        allowed = {
+            "title",
+            "summary",
+            "goal",
+            "completion_criteria",
+            "owner",
+            "target_date",
+            "status",
+        }
+        values = {key: value for key, value in changes.items() if key in allowed}
+        if not values:
+            raise ValueError("请提供需要修改的事项内容")
+        if values.get("status") not in {None, "active"}:
+            raise ValueError("事项状态只能重新打开为正在推进")
+        if "target_date" in values:
+            values["target_date"] = values["target_date"] or None
+            if values["target_date"]:
+                try:
+                    date.fromisoformat(str(values["target_date"]))
+                except ValueError as exc:
+                    raise ValueError("要求闭环日期格式不正确") from exc
+        for field in ("title", "summary", "goal", "completion_criteria", "owner"):
+            if field in values:
+                values[field] = str(values[field] or "").strip()
+        if "title" in values and not values["title"]:
+            raise ValueError("事项标题不能为空")
+        now = utc_now()
+        if now <= matter["updated_at"]:
+            now = (
+                datetime.fromisoformat(matter["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        before = {key: matter.get(key) for key in values}
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        payload = {"before": before, "after": values, "reason": reason}
+        with self.database.connect() as connection:
+            updated_row = connection.execute(
+                f"UPDATE matters SET {assignments}, status_override = 1, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (*values.values(), now, matter_id, matter["updated_at"]),
+            )
+            if updated_row.rowcount != 1:
+                raise StaleWriteError("事项已被更新，请刷新后再保存")
+            connection.execute(
+                "UPDATE work_packages SET status = 'stale', updated_at = ? "
+                "WHERE matter_id = ? AND status = 'draft'",
+                (now, matter_id),
+            )
             self.database.audit(
                 new_id("audit"),
                 actor,
-                "matter.status.updated",
+                "matter.updated",
                 "matter",
                 matter_id,
                 matter_id,
                 payload,
+                connection=connection,
             )
             self.record_matter_event(
                 matter_id,
-                "matter.status.updated",
+                "matter.updated",
                 actor,
                 "matter",
                 matter_id,
-                "事项已标记为已完成" if status == "completed" else "事项已重新打开",
+                "事项内容已修改",
                 payload,
+                connection=connection,
             )
-        if "target_date" not in changes:
-            if "status" in changes:
-                updated = self.get_matter(matter_id)
-                if not updated:
-                    raise RuntimeError("事项更新失败")
-                return updated
-            raise ValueError("请提供事项状态或要求闭环日期")
-        target_date = changes.get("target_date") or None
-        if target_date:
-            try:
-                date.fromisoformat(str(target_date))
-            except ValueError as exc:
-                raise ValueError("要求闭环日期格式不正确") from exc
-        now = utc_now()
-        with self.database.connect() as connection:
-            connection.execute(
-                "UPDATE matters SET target_date = ?, updated_at = ? WHERE id = ?",
-                (target_date, now, matter_id),
-            )
-        payload = {"before": matter.get("target_date"), "after": target_date}
-        self.database.audit(
-            new_id("audit"), actor, "matter.target_date.updated", "matter", matter_id,
-            matter_id, payload,
-        )
-        self.record_matter_event(
-            matter_id,
-            "matter.target_date.updated",
-            actor,
-            "matter",
-            matter_id,
-            "要求闭环日期已调整" if target_date else "已清除要求闭环日期",
-            payload,
-        )
         updated = self.get_matter(matter_id)
         if not updated:
             raise RuntimeError("事项更新失败")
         return updated
+
+    def close_preview(self, matter_id: str) -> dict[str, Any]:
+        matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
+        if not matter:
+            raise KeyError("事项不存在")
+        actions = self.database.fetch_all(
+            "SELECT id, title, status, flow_state, completion_evidence FROM actions "
+            "WHERE matter_id = ? AND status = 'open' ORDER BY created_at",
+            (matter_id,),
+        )
+        reminders = self.database.fetch_all(
+            "SELECT id, title, status, due_at FROM reminders WHERE matter_id = ? "
+            "AND status NOT IN ('done', 'dismissed') AND kind != 'review' ORDER BY created_at",
+            (matter_id,),
+        )
+        reviews = self.database.fetch_all(
+            "SELECT id, title, status FROM review_items WHERE matter_id = ? "
+            "AND status = 'pending' ORDER BY created_at",
+            (matter_id,),
+        )
+        assignee_reviews = self.database.fetch_all(
+            "SELECT aa.id, aa.action_id, a.title, aa.status FROM action_assignees aa "
+            "JOIN actions a ON a.id = aa.action_id WHERE a.matter_id = ? "
+            "AND aa.status = 'pending' ORDER BY aa.created_at",
+            (matter_id,),
+        )
+        active_jobs = self.database.fetch_all(
+            "SELECT j.id, j.status FROM jobs j JOIN materials x ON x.id = j.material_id "
+            "WHERE x.matter_id = ? AND j.status IN "
+            "('queued', 'claimed', 'processing', 'retryable_failed', 'needs_review')",
+            (matter_id,),
+        )
+        blockers = {
+            "actions": actions,
+            "reminders": reminders,
+            "reviews": reviews,
+            "assignee_reviews": assignee_reviews,
+            "active_jobs": active_jobs,
+        }
+        return public_labels(
+            {
+                "matter_id": matter_id,
+                "matter_status": matter["status"],
+                "updated_at": matter["updated_at"],
+                "can_close": not any(blockers.values()) and matter["status"] != "completed",
+                "blockers": blockers,
+                "blocker_count": sum(len(items) for items in blockers.values()),
+            }
+        )
+
+    def close_matter(
+        self,
+        matter_id: str,
+        completion_note: str,
+        expected_updated_at: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        note = completion_note.strip()
+        if not note:
+            raise ValueError("请填写事项收尾说明")
+        matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
+        if not matter:
+            raise KeyError("事项不存在")
+        if expected_updated_at and expected_updated_at != matter.get("updated_at"):
+            raise StaleWriteError("事项已被更新，请刷新收尾检查后再关闭")
+        preview = self.close_preview(matter_id)
+        if matter["status"] == "completed":
+            return self.get_matter(matter_id) or matter
+        if not preview["can_close"]:
+            raise ValueError("仍有未处理的行动、提醒、待确认项或后台任务")
+        now = utc_now()
+        payload = {
+            "before": matter["status"],
+            "after": "completed",
+            "completion_note": note,
+        }
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            locked_row = connection.execute(
+                "SELECT * FROM matters WHERE id = ?", (matter_id,)
+            ).fetchone()
+            if not locked_row:
+                raise KeyError("事项不存在")
+            locked_matter = dict(locked_row)
+            if expected_updated_at and expected_updated_at != locked_matter.get("updated_at"):
+                raise StaleWriteError("事项已被更新，请刷新收尾检查后再关闭")
+            locked_preview = self.close_preview(matter_id)
+            if not locked_preview["can_close"]:
+                raise ValueError("仍有未处理的行动、提醒、待确认项或后台任务")
+            updated = connection.execute(
+                "UPDATE matters SET status = 'completed', status_override = 1, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (now, matter_id, locked_matter["updated_at"]),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("事项已被更新，请重新执行收尾检查")
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "matter.closed",
+                "matter",
+                matter_id,
+                matter_id,
+                payload,
+                connection=connection,
+            )
+            self.record_matter_event(
+                matter_id,
+                "matter.closed",
+                actor,
+                "matter",
+                matter_id,
+                "事项已完成收尾检查并关闭",
+                payload,
+                connection=connection,
+            )
+        closed = self.get_matter(matter_id)
+        if not closed:
+            raise RuntimeError("事项关闭失败")
+        return closed
 
     def add_matter_progress(
         self, matter_id: str, summary: str, detail: str, actor: str
@@ -2119,6 +2941,7 @@ class WorkbenchService:
         date_from: str = "",
         date_to: str = "",
         amount: str = "",
+        include_answer: bool = False,
     ) -> dict[str, Any]:
         query = query.strip()
         if not query:
@@ -2250,7 +3073,7 @@ class WorkbenchService:
                 r"<[^>]+>", "", item.get("snippet") or item.get("body") or ""
             )[:260]
             item["href"] = (
-                f"#/matter/{item['matter_id']}"
+                f"#/matters/{item['matter_id']}"
                 if item.get("matter_id")
                 else "#/policies"
                 if item["entity_type"] == "policy"
@@ -2285,7 +3108,7 @@ class WorkbenchService:
             "inferences": [],
             "missing": [] if items else ["当前允许检索的资料中没有找到直接证据"],
             "sources": sources,
-        }
+        } if include_answer else None
         return public_labels({"query": query, "items": items, "answer": answer})
 
     def today_brief(self, brief_date: str | None = None) -> dict[str, Any]:
@@ -2362,6 +3185,7 @@ class WorkbenchService:
             cached = parse_json(existing.get("payload_json"), {})
             if (
                 cached.get("source_watermark") == source_watermark
+                and cached.get("attention_version") == 3
                 and "attention" in cached
                 and "attention_counts" in cached
             ):
@@ -2510,6 +3334,7 @@ class WorkbenchService:
         payload = {
             "headline": f"{target} 工作简报",
             "source_watermark": source_watermark,
+            "attention_version": 3,
             "now": execution[0] if execution else None,
             "next": execution[1:4],
             "waiting": waiting[:12],
@@ -2836,6 +3661,9 @@ class WorkbenchService:
         review = self.database.fetch_one("SELECT * FROM review_items WHERE id = ?", (review_id,))
         if not review:
             raise KeyError("待确认项不存在")
+        if review.get("kind") == "action_suggestion" and review.get("status") != "pending":
+            review["payload"] = parse_json(review.pop("payload_json", "{}"), {})
+            return review
         now = utc_now()
         evidence_status = "confirmed" if resolution in {"accepted", "edited"} else "rejected"
         review_payload = parse_json(review.get("payload_json"), {})
@@ -2857,12 +3685,22 @@ class WorkbenchService:
             "reason": str(review_payload.get("reason") or "")[:500],
             "evidence": completion_evidence,
         }
+        created_action_id = ""
         with self.database.connect() as connection:
-            connection.execute(
+            updated_review = connection.execute(
                 "UPDATE review_items SET status = ?, resolution_note = ?, resolved_at = ? "
-                "WHERE id = ?",
+                "WHERE id = ? AND status = 'pending'",
                 (resolution, note[:500], now, review_id),
             )
+            if updated_review.rowcount != 1:
+                resolved = connection.execute(
+                    "SELECT * FROM review_items WHERE id = ?", (review_id,)
+                ).fetchone()
+                if not resolved:
+                    raise RuntimeError("确认结果写入失败")
+                result = dict(resolved)
+                result["payload"] = parse_json(result.pop("payload_json", "{}"), {})
+                return result
             connection.execute(
                 "UPDATE reminders SET status = 'done', updated_at = ? WHERE fingerprint = ?",
                 (now, f"review:{review_id}"),
@@ -2892,11 +3730,77 @@ class WorkbenchService:
                     "WHERE action_id = ? AND status = 'pending'",
                     (now, completion_action_id),
                 )
+            if review.get("kind") == "action_suggestion" and resolution in {
+                "accepted",
+                "edited",
+            }:
+                title = (
+                    note.strip()
+                    if resolution == "edited"
+                    else str(review_payload.get("title") or "").strip()
+                )
+                if not title:
+                    raise ValueError("建议行动缺少标题")
+                kind = str(review_payload.get("kind") or "task")
+                if kind not in ACTION_KINDS:
+                    kind = "task"
+                created_action_id = new_id("action")
+                due_date = review_payload.get("due_date") or None
+                connection.execute(
+                    "INSERT INTO actions "
+                    "(id, matter_id, material_id, kind, title, detail, status, owner, "
+                    "due_date, created_by, created_at, updated_at, flow_state, schedule_basis, "
+                    "completion_evidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?, '[]')",
+                    (
+                        created_action_id,
+                        review["matter_id"],
+                        review.get("material_id"),
+                        kind,
+                        title[:200],
+                        str(review_payload.get("detail") or "")[:2000],
+                        due_date,
+                        actor,
+                        now,
+                        now,
+                        default_flow_state(kind),
+                        "user_entered" if due_date else "legacy",
+                    ),
+                )
             if review["evidence_id"]:
                 if resolution == "edited" and note.strip():
+                    original = connection.execute(
+                        "SELECT * FROM evidence WHERE id = ?", (review["evidence_id"],)
+                    ).fetchone()
+                    if not original:
+                        raise KeyError("事实依据不存在")
+                    corrected_id = new_id("evidence")
                     connection.execute(
-                        "UPDATE evidence SET status = ?, value = ? WHERE id = ?",
-                        (evidence_status, note.strip()[:1000], review["evidence_id"]),
+                        "UPDATE evidence SET status = 'superseded' WHERE id = ?",
+                        (review["evidence_id"],),
+                    )
+                    connection.execute(
+                        "INSERT INTO evidence "
+                        "(id, matter_id, material_id, claim_type, field_type, value, "
+                        "source_locator, quote, confidence, status, created_by, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)",
+                        (
+                            corrected_id,
+                            original["matter_id"],
+                            original["material_id"],
+                            original["claim_type"],
+                            original["field_type"],
+                            note.strip()[:1000],
+                            original["source_locator"],
+                            original["quote"],
+                            original["confidence"],
+                            actor,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE review_items SET evidence_id = ? WHERE id = ?",
+                        (corrected_id, review_id),
                     )
                 else:
                     connection.execute(
@@ -2940,6 +3844,29 @@ class WorkbenchService:
                 "行动完成已确认",
                 completion_event,
             )
+        if created_action_id:
+            action_event = {
+                "source_review_id": review_id,
+                "resolution": resolution,
+            }
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "action.created",
+                "action",
+                created_action_id,
+                review["matter_id"],
+                action_event,
+            )
+            self.record_matter_event(
+                review["matter_id"],
+                "action.created",
+                actor,
+                "action",
+                created_action_id,
+                "建议行动已由人工采纳",
+                action_event,
+            )
         resolved = self.database.fetch_one(
             "SELECT * FROM review_items WHERE id = ?", (review_id,)
         )
@@ -2956,7 +3883,8 @@ class WorkbenchService:
             connection.execute(
                 "UPDATE reminders SET status = 'open', updated_at = ? "
                 "WHERE status = 'scheduled' AND due_at IS NOT NULL "
-                "AND datetime(due_at) <= datetime('now')",
+                "AND ((length(due_at) = 10 AND date(due_at) <= date('now', 'localtime')) "
+                "OR (length(due_at) > 10 AND datetime(due_at) <= datetime('now')))",
                 (now,),
             )
         overdue = self.database.fetch_all(
@@ -3181,6 +4109,82 @@ class WorkbenchService:
             "next_follow_up": next_follow_up,
             "agent_activity": agent_activity,
         })
+
+    def update_reminder(
+        self, reminder_id: str, changes: dict[str, Any], actor: str
+    ) -> dict[str, Any]:
+        reminder = self.database.fetch_one(
+            "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+        )
+        if not reminder:
+            raise KeyError("提醒不存在")
+        expected_updated_at = changes.pop("expected_updated_at", None)
+        change_reason = str(changes.pop("change_reason", "") or "")[:500]
+        if expected_updated_at and expected_updated_at != reminder.get("updated_at"):
+            raise StaleWriteError("提醒已被更新，请刷新后再保存")
+        values = {
+            key: value
+            for key, value in changes.items()
+            if key in {"title", "reason", "due_at", "action_id"}
+        }
+        if not values:
+            raise ValueError("请提供需要修改的提醒内容")
+        if "title" in values:
+            values["title"] = str(values["title"] or "").strip()[:200]
+            if not values["title"]:
+                raise ValueError("提醒标题不能为空")
+        if "reason" in values:
+            values["reason"] = str(values["reason"] or "")[:1000]
+        if "due_at" in values:
+            values["due_at"] = values["due_at"] or None
+            if values["due_at"]:
+                try:
+                    datetime.fromisoformat(str(values["due_at"]).replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("提醒时间格式不正确") from exc
+        if "action_id" in values:
+            values["action_id"] = values["action_id"] or None
+            if values["action_id"]:
+                action = self.database.fetch_one(
+                    "SELECT matter_id FROM actions WHERE id = ?", (values["action_id"],)
+                )
+                if not action or action["matter_id"] != reminder.get("matter_id"):
+                    raise ValueError("关联行动不属于当前事项")
+        now = utc_now()
+        if now <= reminder["updated_at"]:
+            now = (
+                datetime.fromisoformat(reminder["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        payload = {
+            "before": {key: reminder.get(key) for key in values},
+            "after": values,
+            "reason": change_reason,
+        }
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                f"UPDATE reminders SET {assignments}, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (*values.values(), now, reminder_id, reminder["updated_at"]),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("提醒已被更新，请刷新后再保存")
+            self.database.audit(
+                new_id("audit"), actor, "reminder.updated", "reminder", reminder_id,
+                reminder.get("matter_id"), payload, connection=connection,
+            )
+            if reminder.get("matter_id"):
+                self.record_matter_event(
+                    reminder["matter_id"], "reminder.updated", actor, "reminder",
+                    reminder_id, "提醒内容已修改", payload, connection=connection,
+                )
+        result = self.database.fetch_one(
+            "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+        )
+        if not result:
+            raise RuntimeError("提醒写入失败")
+        return result
 
     def resolve_reminder(self, reminder_id: str, status: str, actor: str) -> dict[str, Any]:
         if status not in {"done", "dismissed", "snoozed"}:

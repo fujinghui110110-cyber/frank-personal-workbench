@@ -12,6 +12,7 @@ dist/
 work/
 output/
 outputs/
+backups/
 .omx/
 .playwright-cli/
 .tools/

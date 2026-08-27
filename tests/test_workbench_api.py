@@ -120,6 +120,29 @@ def complete_result(*, fact: bool = False, inference: bool = False) -> dict:
     return result
 
 
+def get_work_package(client: TestClient, matter_id: str) -> dict:
+    response = client.get(f"/api/matters/{matter_id}/work-package")
+    assert response.status_code == 200, response.text
+    return response.json().get("work_package", response.json())
+
+
+def apply_work_package(
+    client: TestClient, matter_id: str, step_indexes: list[int] | None = None
+) -> dict:
+    package = get_work_package(client, matter_id)
+    response = client.post(
+        f"/api/matters/{matter_id}/work-package/apply",
+        json={
+            "step_indexes": step_indexes if step_indexes is not None else [0],
+            "expected_updated_at": package["updated_at"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    detail = client.get(f"/api/matters/{matter_id}")
+    assert detail.status_code == 200, detail.text
+    return detail.json()
+
+
 def test_claimed_job_cannot_skip_start(client: TestClient) -> None:
     owner_login(client)
     receive(client, key="claimed-must-start")
@@ -175,6 +198,7 @@ def test_completing_action_closes_scheduled_reminder(client: TestClient) -> None
         json={"worker_id": "mac-air", "lease_token": token, "result": result},
         headers=worker_headers(),
     ).json()
+    matter = apply_work_package(client, matter["id"])
     action = matter["actions"][0]
     with client.app.state.database.connect() as connection:
         connection.execute(
@@ -293,16 +317,25 @@ def test_worker_claim_start_complete_and_provenance(client: TestClient) -> None:
     assert matter["materials"][0]["id"] == material_id
     assert matter["materials"][0]["status"] == "processed"
 
+    assert matter["actions"] == []
+    package = get_work_package(client, matter["id"])
+    assert [step["title"] for step in package["draft"]["steps"]] == ["复核预算"]
+
     evidence = {item["claim_type"]: item for item in matter["evidence"]}
     assert evidence["fact"]["material_id"] == material_id
     assert evidence["fact"]["source_locator"] == "原文第1行"
     assert evidence["fact"]["quote"] == "金额：10万元"
     assert evidence["inference"]["source_locator"] == "基于材料类型"
 
+    assert evidence["fact"]["status"] == "pending"
+    assert evidence["inference"]["status"] == "pending"
     reviews = matter["reviews"]
-    assert len(reviews) == 1
-    assert reviews[0]["status"] == "pending"
-    assert reviews[0]["evidence_id"] == evidence["inference"]["id"]
+    assert len(reviews) == 2
+    assert {item["evidence_id"] for item in reviews} == {
+        evidence["fact"]["id"],
+        evidence["inference"]["id"],
+    }
+    assert all(item["status"] == "pending" for item in reviews)
 
     detail = client.get(f"/api/matters/{matter['id']}")
     assert detail.status_code == 200
@@ -535,21 +568,30 @@ def test_workbuddy_trace_and_follow_up_are_visible(client: TestClient) -> None:
 
     assert completed.status_code == 200, completed.text
     matter = completed.json()
-    assert matter["title"] == "预算口径确认"
+    assert matter["title"] == "原始材料标题"
     assert matter["assistant"]["display_name"] == "贾维斯"
     assert matter["assistant"]["brief"]["headline"] == "当前只差经营部门确认口径"
-    assert matter["actions"][0]["material_id"] == material_id
+    assert matter["actions"] == []
+    package = get_work_package(client, matter["id"])
+    assert package["draft"]["steps"][0]["source_material_id"] == material_id
+    assert package["draft"]["steps"][0]["title"] == "等待经营部门确认口径"
+    assert any(
+        "检查经营部门是否已回复" in question
+        for question in package["draft"]["questions"]
+    )
 
     overview = client.get("/api/overview").json()
-    assert all(
-        reminder["reason"] != "WorkBuddy env: node: No such file or directory"
-        for reminder in overview["reminders"]
-    )
+    assert client.app.state.database.fetch_one(
+        "SELECT status, reason FROM reminders WHERE id = ?",
+        ("reminder-old-job-error",),
+    ) == {
+        "status": "open",
+        "reason": "WorkBuddy env: node: No such file or directory",
+    }
     assert overview["agent_activity"][0]["id"] == material_id
-    assert overview["next_follow_up"]["reason"] == "检查经营部门是否已回复"
 
 
-def test_requeue_replaces_unconfirmed_machine_output(client: TestClient) -> None:
+def test_requeue_preserves_existing_draft_and_appends_new_suggestions(client: TestClient) -> None:
     owner_login(client)
     received = receive(client, key="workbuddy-requeue", note="第一次分析")
     material_id = received.json()["material"]["id"]
@@ -598,9 +640,13 @@ def test_requeue_replaces_unconfirmed_machine_output(client: TestClient) -> None
     )
 
     assert second.status_code == 200, second.text
-    open_actions = [item["title"] for item in second.json()["actions"] if item["status"] == "open"]
-    assert open_actions == ["新动作"]
-    assert all(item["status"] != "pending" for item in second.json()["reviews"])
+    assert second.json()["actions"] == []
+    package = get_work_package(client, second.json()["id"])
+    assert [step["title"] for step in package["draft"]["steps"]] == [
+        "旧动作",
+        "新动作",
+    ]
+    assert any(item["status"] == "pending" for item in second.json()["reviews"])
 
 
 def test_matters_expose_reliable_completion_state(client: TestClient) -> None:
@@ -617,6 +663,7 @@ def test_matters_expose_reliable_completion_state(client: TestClient) -> None:
         headers=worker_headers(),
     )
     assert completed.status_code == 200, completed.text
+    completed_matter = apply_work_package(client, completed.json()["id"])
 
     before = client.get("/api/matters").json()[0]
     assert before["open_action_count"] == 1
@@ -624,7 +671,7 @@ def test_matters_expose_reliable_completion_state(client: TestClient) -> None:
     assert before["active_job_count"] == 0
     assert before["is_completed"] is False
 
-    action_id = completed.json()["actions"][0]["id"]
+    action_id = completed_matter["actions"][0]["id"]
     resolved = client.post(
         f"/api/actions/{action_id}/resolve",
         json={"status": "done"},
@@ -633,7 +680,18 @@ def test_matters_expose_reliable_completion_state(client: TestClient) -> None:
 
     after = client.get("/api/matters").json()[0]
     assert after["open_action_count"] == 0
-    assert after["is_completed"] is True
+    assert after["is_completed"] is False
+    ready = client.get(f"/api/matters/{after['id']}/close-preview").json()
+    assert ready["can_close"] is True
+    closed = client.post(
+        f"/api/matters/{after['id']}/close",
+        json={
+            "expected_updated_at": ready["updated_at"],
+            "completion_note": "已核对全部行动和提醒。",
+        },
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["is_completed"] is True
 
 
 def test_action_assignees_are_suggested_and_confirmed(client: TestClient) -> None:
@@ -662,7 +720,8 @@ def test_action_assignees_are_suggested_and_confirmed(client: TestClient) -> Non
         headers=worker_headers(),
     )
     assert completed.status_code == 200, completed.text
-    action = completed.json()["actions"][0]
+    completed_matter = apply_work_package(client, completed.json()["id"])
+    action = completed_matter["actions"][0]
     assert action["assignees"] == []
     assert action["assignee_suggestions"][0]["person_id"] == "person_li_jing"
 
@@ -675,8 +734,11 @@ def test_action_assignees_are_suggested_and_confirmed(client: TestClient) -> Non
         json={"person_ids": ["person_li_jing", "person_ou_bo"], "note": "Frank确认"},
     )
     assert saved.status_code == 200, saved.text
-    assert [item["display_name"] for item in saved.json()["assignees"]] == ["李静", "欧波"]
-    assert saved.json()["owner"] == "李静、欧波"
+    assert {item["display_name"] for item in saved.json()["assignees"]} == {
+        "李静",
+        "欧波",
+    }
+    assert set(saved.json()["owner"].split("、")) == {"李静", "欧波"}
 
     people = client.get("/api/people").json()
     counts = {item["id"]: item["open_action_count"] for item in people}
@@ -709,7 +771,9 @@ def test_pending_assignees_close_when_action_is_dismissed(client: TestClient) ->
         },
         headers=worker_headers(),
     )
-    action_id = completed.json()["actions"][0]["id"]
+    assert completed.status_code == 200, completed.text
+    completed_matter = apply_work_package(client, completed.json()["id"])
+    action_id = completed_matter["actions"][0]["id"]
     assert client.get("/api/assignee-reviews?status=pending").json()
 
     resolved = client.post(
@@ -743,11 +807,11 @@ def test_frontend_markup_matches_javascript_and_hidden_contracts(
     assert 'id="login-submit"' in response.text
     assert stylesheet.status_code == 200
     assert "[hidden] { display: none !important; }" in stylesheet.text
-    assert '/static/app.css?v=52' in response.text
+    assert '/static/app.css?v=73' in response.text
     assert '/static/app-evolution.css' not in response.text
-    assert '/static/app.js?v=52' in response.text
+    assert '/static/app.js?v=73' in response.text
     assert service_worker.status_code == 200
-    assert "frank-personal-workbench-shell-v52" in service_worker.text
+    assert "frank-personal-workbench-shell-v73" in service_worker.text
     assert "fetch(request).then" in service_worker.text
     assert ".catch(() => caches.match(request))" in service_worker.text
     assert "Mac 关机时" in response.text
@@ -782,9 +846,8 @@ def test_frontend_refreshes_actions_without_full_page_jump(client: TestClient) -
     script = client.get("/static/app.js").text
 
     assert "async function refreshRouteWithoutJump(focusSelectorOverride = null)" in script
-    assert 'data-today-disclosure="rules"' in script
+    assert 'route.name === "today"' not in script
     assert "focusTarget.focus({ preventScroll: true })" in script
-    assert 'if (routeFromHash().name === "today") refreshRouteWithoutJump();' in script
     for start, end in (
         ("async function resolveWechatCandidate", "async function changeWechatConversation"),
         ("async function resolveReview", "async function resolveAction"),
@@ -861,7 +924,7 @@ def test_frontend_exposes_persistent_source_receipt_and_useful_work_rules(
     assert "本次读取结果" in script
     assert "读取和整理分开" in script
     assert "同一件事持续合并" in script
-    assert 'item.rule_type !== "conversation_ignore"' in script
+    assert "function renderToday(" not in script
     assert "管理监听范围" in script
 
 
@@ -893,7 +956,9 @@ def test_duplicate_job_completion_creates_result_once(client: TestClient) -> Non
     assert database.fetch_one(
         "SELECT COUNT(*) AS total FROM actions WHERE material_id = ?",
         (material["id"],),
-    )["total"] == len(result["actions"])
+    )["total"] == 0
+    package = get_work_package(client, first.json()["id"])
+    assert len(package["draft"]["steps"]) == len(result["actions"])
     assert database.fetch_one(
         "SELECT COUNT(*) AS total FROM evidence WHERE material_id = ?",
         (material["id"],),

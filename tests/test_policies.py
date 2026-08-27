@@ -127,13 +127,13 @@ def test_revision_and_authoritative_evidence_merge_then_undo(
         ),
         headers=worker_headers(),
     ).json()
-    assert evidence["status"] == "auto_applied"
-    undone = policy_client.post(
-        f"/api/policy-candidates/{evidence['id']}/resolve", json={"action": "undo"}
+    assert evidence["status"] == "pending"
+    resolved_evidence = policy_client.post(
+        f"/api/policy-candidates/{evidence['id']}/resolve",
+        json={"action": "merge", "policy_id": policy_id},
     )
-    assert undone.status_code == 200
-    assert undone.json()["status"] == "undone"
-    assert len(policy_client.get(f"/api/policies/{policy_id}/versions").json()) == 2
+    assert resolved_evidence.status_code == 200, resolved_evidence.text
+    assert resolved_evidence.json()["status"] == "applied"
 
 
 def test_non_policy_is_not_stored(policy_client: TestClient) -> None:

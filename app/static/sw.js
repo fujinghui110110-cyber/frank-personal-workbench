@@ -1,10 +1,10 @@
-const SHELL_CACHE = "frank-personal-workbench-shell-v52";
+const SHELL_CACHE = "frank-personal-workbench-shell-v73";
 const SHELL = [
   "/",
   "/static/index.html",
-  "/static/app.css?v=52",
-  "/static/app.js?v=52",
-  "/manifest.webmanifest?v=29",
+  "/static/app.css?v=73",
+  "/static/app.js?v=73",
+  "/manifest.webmanifest?v=73",
 ];
 
 self.addEventListener("install", (event) => {

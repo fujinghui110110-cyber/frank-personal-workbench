@@ -289,7 +289,7 @@ def test_same_conversation_different_topics_keep_separate_pending_cards(
     }
 
 
-def test_high_confidence_new_chat_continues_one_open_matter_with_audit(
+def test_high_confidence_new_chat_waits_for_manual_acceptance(
     client: TestClient,
 ) -> None:
     login(client)
@@ -342,12 +342,17 @@ def test_high_confidence_new_chat_continues_one_open_matter_with_audit(
 
     reconciled = client.post("/api/analysis/reconcile")
     assert reconciled.status_code == 200, reconciled.text
-    continued = client.get(
-        "/api/wechat/candidates?candidate_status=accepted&limit=20"
+    pending = client.get(
+        "/api/wechat/candidates?candidate_status=pending&limit=20"
     ).json()
-    new_candidate = next(item for item in continued if item["id"] == second["candidate_id"])
-    assert new_candidate["matter_id"] == matter_id
-    assert new_candidate["status_label"] == "已纳入事项"
+    new_candidate = next(item for item in pending if item["id"] == second["candidate_id"])
+    assert new_candidate["matter_id"] is None
+    accepted = client.post(
+        f"/api/wechat/candidates/{second['candidate_id']}/resolve",
+        json={"action": "accept", "matter_id": matter_id},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status_label"] == "已纳入事项"
     audit = client.get("/api/audit?limit=100").json()
     assert any(
         item["action"] == "wechat.candidate.accepted"
@@ -356,7 +361,7 @@ def test_high_confidence_new_chat_continues_one_open_matter_with_audit(
     )
 
 
-def test_batch_reconcile_can_continue_a_non_chat_open_matter(client: TestClient) -> None:
+def test_batch_reconcile_keeps_non_chat_match_pending(client: TestClient) -> None:
     login(client)
     now = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     with client.app.state.database.connect() as connection:
@@ -394,11 +399,11 @@ def test_batch_reconcile_can_continue_a_non_chat_open_matter(client: TestClient)
     )
     reconciled = client.post("/api/analysis/reconcile")
     assert reconciled.status_code == 200, reconciled.text
-    accepted = client.get(
-        "/api/wechat/candidates?candidate_status=accepted&limit=20"
+    pending = client.get(
+        "/api/wechat/candidates?candidate_status=pending&limit=20"
     ).json()
-    candidate = next(item for item in accepted if item["id"] == created["candidate_id"])
-    assert candidate["matter_id"] == "matter-existing"
+    candidate = next(item for item in pending if item["id"] == created["candidate_id"])
+    assert candidate["matter_id"] is None
 
 
 def test_low_confidence_or_conflicting_new_chat_stays_pending(client: TestClient) -> None:

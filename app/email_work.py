@@ -4,11 +4,11 @@ import json
 import hashlib
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .db import Database, utc_now
+from .services import StaleWriteError
 
 
 def _id(prefix: str) -> str:
@@ -42,6 +42,47 @@ def _clean_email_routing(value: Any) -> str:
 class EmailWorkService:
     def __init__(self, database: Database):
         self.database = database
+
+    def _store_action_suggestions(
+        self,
+        connection: Any,
+        *,
+        matter_id: str,
+        material_id: str | None,
+        message_id: str,
+        actions: list[dict[str, Any]],
+        fallback_title: str,
+        fallback_detail: str,
+        now: str,
+    ) -> None:
+        suggestions = actions or [{"title": fallback_title, "detail": fallback_detail}]
+        for item in suggestions[:12]:
+            title = _clean_email_routing(item.get("title"))
+            if not title:
+                continue
+            payload = {
+                "kind": item.get("kind")
+                if item.get("kind") in {"task", "risk", "decision", "waiting", "conclusion"}
+                else "task",
+                "title": title[:160],
+                "detail": _clean_email_routing(item.get("detail"))[:1000],
+                "owner": str(item.get("owner") or "")[:80] or None,
+                "due_date": item.get("due_date") or None,
+                "source": f"email:{message_id}",
+            }
+            connection.execute(
+                "INSERT INTO review_items "
+                "(id, matter_id, material_id, kind, title, payload_json, created_at) "
+                "VALUES (?, ?, ?, 'action_suggestion', ?, ?, ?)",
+                (
+                    _id("review"),
+                    matter_id,
+                    material_id,
+                    f"建议行动：{title[:160]}",
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
 
     def request_sync(self, actor: str) -> dict[str, Any]:
         if not self.database.fetch_one("SELECT account_id FROM email_accounts LIMIT 1"):
@@ -316,27 +357,53 @@ class EmailWorkService:
             if existing and self._matter_is_open(existing["matter_id"]):
                 matter_id = existing["matter_id"]
 
+        source_text = str(payload.get("source_text") or "").strip()
+        material_id = _id("mat") if source_text else None
+        material_metadata = {
+            "email_message_id": message_id,
+            "attachment_paths": payload.get("attachment_paths", [])[:20],
+            "sender_key": payload.get("sender_key", ""),
+        }
+
         with self.database.connect() as connection:
             if work and not matter_id:
                 matter_id = _id("matter")
                 title = (payload.get("matter_title") or payload["subject"] or "邮件工作事项")[:120]
                 connection.execute(
-                    "INSERT INTO matters (id, title, summary, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO matters (id, title, status, summary, created_at, updated_at) "
+                    "VALUES (?, ?, 'needs_decision', ?, ?, ?)",
                     (matter_id, title, payload.get("summary", "")[:1000], now, now),
                 )
-            elif work and matter_id:
+
+            if material_id:
                 connection.execute(
-                    "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
-                    (payload.get("summary", "")[:1000], now, matter_id),
+                    "INSERT INTO materials "
+                    "(id, idempotency_key, sha256, source_type, filename, content_type, size, "
+                    "text_note, status, matter_id, received_at, updated_at, metadata_json) "
+                    "VALUES (?, ?, ?, 'email_auto', ?, 'text/plain', ?, ?, "
+                    "'processed', ?, ?, ?, ?)",
+                    (
+                        material_id,
+                        f"email:{payload['account_id']}:{payload.get('folder') or 'INBOX'}:"
+                        f"{payload['uid_validity']}:{payload['uid']}",
+                        hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+                        (payload.get("subject") or "工作邮件")[:255],
+                        len(source_text.encode("utf-8")),
+                        source_text,
+                        matter_id,
+                        now,
+                        now,
+                        json.dumps(material_metadata, ensure_ascii=False),
+                    ),
                 )
 
             connection.execute(
                 "INSERT INTO email_messages "
                 "(id, account_id, folder, uid_validity, uid, message_id_hash, thread_key, "
                 "sender_key, sender_name, sender_hint, subject, sent_at, classification, "
-                "needs_follow_up, summary, reason, evidence_json, status, matter_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "needs_follow_up, summary, reason, evidence_json, source_text, material_id, "
+                "status, matter_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
                 (
                     message_id,
                     payload["account_id"],
@@ -355,6 +422,7 @@ class EmailWorkService:
                     payload.get("summary", "")[:1000],
                     payload.get("reason", "")[:500],
                     json.dumps(payload.get("evidence", [])[:4], ensure_ascii=False),
+                    material_id,
                     "active",
                     matter_id,
                     now,
@@ -362,42 +430,22 @@ class EmailWorkService:
                 ),
             )
             if work and matter_id:
-                for item in payload.get("actions", [])[:12]:
-                    title = str(item.get("title") or "").strip()
-                    if not title:
-                        continue
-                    connection.execute(
-                        "INSERT INTO actions "
-                        "(id, matter_id, material_id, kind, title, detail, status, owner, due_date, "
-                        "created_by, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
-                        (
-                            _id("action"),
-                            matter_id,
-                            item.get("kind") if item.get("kind") in {"task", "risk", "decision", "waiting", "conclusion"} else "task",
-                            title[:160],
-                            str(item.get("detail") or "")[:1000],
-                            str(item.get("owner") or "")[:80] or None,
-                            item.get("due_date") or None,
-                            f"email:{message_id}",
-                            now,
-                            now,
-                        ),
-                    )
-                if not payload.get("actions"):
-                    connection.execute(
-                        "INSERT INTO actions "
-                        "(id, matter_id, material_id, kind, title, detail, status, owner, created_by, created_at, updated_at) "
-                        "VALUES (?, ?, NULL, 'task', ?, ?, 'open', '财务负责人', ?, ?, ?)",
-                        (
-                            _id("action"),
-                            matter_id,
-                            (payload.get("summary") or payload["subject"] or "跟进邮件要求")[:160],
-                            payload.get("reason", "")[:1000],
-                            f"email:{message_id}",
-                            now,
-                            now,
-                        ),
-                    )
+                self._store_action_suggestions(
+                    connection,
+                    matter_id=matter_id,
+                    material_id=material_id,
+                    message_id=message_id,
+                    actions=[
+                        item
+                        for item in payload.get("actions", [])
+                        if isinstance(item, dict)
+                    ],
+                    fallback_title=str(
+                        payload.get("summary") or payload["subject"] or "跟进邮件要求"
+                    ),
+                    fallback_detail=str(payload.get("reason") or ""),
+                    now=now,
+                )
 
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
         return self._public_message(row or {})
@@ -437,14 +485,6 @@ class EmailWorkService:
             if existing and self._matter_is_open(existing["matter_id"]):
                 matter_id = existing["matter_id"]
 
-        material_metadata: dict[str, Any] = {}
-        if message.get("material_id"):
-            material = self.database.fetch_one(
-                "SELECT metadata_json FROM materials WHERE id = ?", (message["material_id"],)
-            )
-            material_metadata = _json(
-                material.get("metadata_json") if material else "{}", {}
-            )
         now = utc_now()
         with self.database.connect() as connection:
             if work and not matter_id:
@@ -455,21 +495,16 @@ class EmailWorkService:
                     or "邮件工作事项"
                 )[:120]
                 connection.execute(
-                    "INSERT INTO matters (id, title, summary, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO matters (id, title, status, summary, created_at, updated_at) "
+                    "VALUES (?, ?, 'needs_decision', ?, ?, ?)",
                     (matter_id, title, summary, now, now),
-                )
-            elif work and matter_id:
-                connection.execute(
-                    "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
-                    (summary, now, matter_id),
                 )
 
             status = "active" if work or policy_relevant else "ignored"
             connection.execute(
                 "UPDATE email_messages SET classification = ?, needs_follow_up = ?, "
                 "summary = ?, reason = ?, evidence_json = ?, status = ?, matter_id = ?, "
-                "source_text = '', updated_at = ? WHERE id = ?",
+                "updated_at = ? WHERE id = ?",
                 (
                     classification,
                     int(needs_follow_up),
@@ -483,51 +518,101 @@ class EmailWorkService:
                 ),
             )
             if work and matter_id:
-                for item in actions:
-                    title = _clean_email_routing(item.get("title"))
-                    if not title:
-                        continue
-                    connection.execute(
-                        "INSERT INTO actions "
-                        "(id, matter_id, material_id, kind, title, detail, status, owner, due_date, "
-                        "created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
-                        (
-                            _id("action"),
-                            matter_id,
-                            message.get("material_id"),
-                            item.get("kind")
-                            if item.get("kind") in {"task", "risk", "decision", "waiting", "conclusion"}
-                            else "task",
-                            title[:160],
-                            _clean_email_routing(item.get("detail"))[:1000],
-                            str(item.get("owner") or "")[:80] or None,
-                            item.get("due_date") or None,
-                            f"email:{message_id}",
-                            now,
-                            now,
-                        ),
-                    )
+                self._store_action_suggestions(
+                    connection,
+                    matter_id=matter_id,
+                    material_id=message.get("material_id"),
+                    message_id=message_id,
+                    actions=actions,
+                    fallback_title=summary or message.get("subject") or "跟进邮件要求",
+                    fallback_detail=reason,
+                    now=now,
+                )
             if message.get("material_id"):
-                if status == "ignored":
-                    connection.execute(
-                        "UPDATE materials SET text_note = '', size = 0, metadata_json = '{}', "
-                        "status = 'processed', updated_at = ? WHERE id = ?",
-                        (now, message["material_id"]),
-                    )
-                else:
-                    connection.execute(
-                        "UPDATE materials SET status = 'processed', matter_id = ?, updated_at = ? "
-                        "WHERE id = ?",
-                        (matter_id, now, message["material_id"]),
-                    )
-
-        if not work and not policy_relevant:
-            for value in material_metadata.get("attachment_paths", []):
-                path = Path(str(value))
-                if path.is_file():
-                    path.unlink(missing_ok=True)
+                connection.execute(
+                    "UPDATE materials SET status = 'processed', matter_id = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (matter_id, now, message["material_id"]),
+                )
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
         return self._public_message(row or {})
+
+    def update_message(
+        self,
+        message_id: str,
+        changes: dict[str, Any],
+        expected_updated_at: str | None,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        message = self.database.fetch_one(
+            "SELECT * FROM email_messages WHERE id = ?", (message_id,)
+        )
+        if not message:
+            raise KeyError("邮件工作不存在")
+        if expected_updated_at and expected_updated_at != message.get("updated_at"):
+            raise StaleWriteError("邮件已被更新，请刷新后再保存")
+
+        values: dict[str, Any] = {}
+        if "subject" in changes:
+            subject = _clean_email_subject(changes["subject"])
+            if not subject:
+                raise ValueError("邮件主题不能为空")
+            values["subject"] = subject[:300]
+        if "summary" in changes:
+            values["summary"] = _clean_email_routing(changes["summary"])[:1000]
+        if "needs_follow_up" in changes:
+            values["needs_follow_up"] = int(bool(changes["needs_follow_up"]))
+        if "classification" in changes:
+            classification = str(changes["classification"] or "").strip().lower()
+            if classification not in {"pending", "work", "irrelevant"}:
+                raise ValueError("不支持的邮件分类")
+            values["classification"] = classification
+        if "matter_id" in changes:
+            matter_id = str(changes["matter_id"] or "").strip() or None
+            if matter_id and not self.database.fetch_one(
+                "SELECT id FROM matters WHERE id = ?", (matter_id,)
+            ):
+                raise KeyError("事项不存在")
+            values["matter_id"] = matter_id
+        if not values:
+            raise ValueError("请提供需要修改的邮件内容")
+
+        now = utc_now()
+        if now <= message["updated_at"]:
+            now = (
+                datetime.fromisoformat(message["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        assignments = ", ".join(f"{field} = ?" for field in values)
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                f"UPDATE email_messages SET {assignments}, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (*values.values(), now, message_id, message["updated_at"]),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("邮件已被更新，请刷新后再保存")
+
+        self.database.audit(
+            _id("audit"),
+            actor,
+            "email.updated",
+            "email_message",
+            message_id,
+            values.get("matter_id", message.get("matter_id")),
+            {
+                "old": {field: message.get(field) for field in values},
+                "new": values,
+                "reason": str(reason or "").strip()[:500],
+            },
+        )
+        return self._public_message(
+            self.database.fetch_one(
+                "SELECT * FROM email_messages WHERE id = ?", (message_id,)
+            )
+            or {}
+        )
 
     def ignore_message(self, message_id: str, actor: str) -> dict[str, Any]:
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
@@ -554,6 +639,13 @@ class EmailWorkService:
             connection.execute(
                 "UPDATE email_messages SET ignored_action_ids_json = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(ignored_action_ids, ensure_ascii=False), now, message_id),
+            )
+            connection.execute(
+                "UPDATE review_items SET status = 'dismissed', resolved_at = ?, "
+                "resolution_note = '邮件线索已标记为不是工作' "
+                "WHERE kind = 'action_suggestion' AND status = 'pending' "
+                "AND json_extract(payload_json, '$.source') = ?",
+                (now, f"email:{message_id}"),
             )
         self.database.audit(
             _id("audit"), actor, "email.ignored", "email_message", message_id, row.get("matter_id")
@@ -582,6 +674,13 @@ class EmailWorkService:
                     f"WHERE id IN ({placeholders}) AND status = 'dismissed'",
                     (now, *ignored_action_ids),
                 )
+            connection.execute(
+                "UPDATE review_items SET status = 'pending', resolved_at = NULL, "
+                "resolution_note = NULL WHERE kind = 'action_suggestion' "
+                "AND status = 'dismissed' AND resolution_note = '邮件线索已标记为不是工作' "
+                "AND json_extract(payload_json, '$.source') = ?",
+                (f"email:{message_id}",),
+            )
         self.database.audit(
             _id("audit"), actor, "email.restored", "email_message", message_id, row.get("matter_id")
         )

@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS matters (
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     summary TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    completion_criteria TEXT NOT NULL DEFAULT '',
     owner TEXT NOT NULL DEFAULT '财务负责人',
     target_date TEXT,
     created_at TEXT NOT NULL,
@@ -478,6 +480,20 @@ CREATE TABLE IF NOT EXISTS matter_events (
 CREATE INDEX IF NOT EXISTS idx_matter_events_timeline
 ON matter_events(matter_id, created_at DESC, id DESC);
 
+CREATE TABLE IF NOT EXISTS work_packages (
+    id TEXT PRIMARY KEY,
+    matter_id TEXT NOT NULL UNIQUE REFERENCES matters(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    draft_json TEXT NOT NULL DEFAULT '{}',
+    source_fingerprint TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_packages_matter
+ON work_packages(matter_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS daily_briefs (
     id TEXT PRIMARY KEY,
     brief_date TEXT NOT NULL UNIQUE,
@@ -736,6 +752,14 @@ class Database:
             }
             if "target_date" not in matter_columns:
                 connection.execute("ALTER TABLE matters ADD COLUMN target_date TEXT")
+            if "goal" not in matter_columns:
+                connection.execute(
+                    "ALTER TABLE matters ADD COLUMN goal TEXT NOT NULL DEFAULT ''"
+                )
+            if "completion_criteria" not in matter_columns:
+                connection.execute(
+                    "ALTER TABLE matters ADD COLUMN completion_criteria TEXT NOT NULL DEFAULT ''"
+                )
             if "status_override" not in matter_columns:
                 connection.execute(
                     "ALTER TABLE matters ADD COLUMN status_override INTEGER NOT NULL DEFAULT 0"
@@ -893,22 +917,25 @@ class Database:
         object_id: str,
         matter_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO audit_events
-                (id, actor, action, object_type, object_id, matter_id, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    actor,
-                    action,
-                    object_type,
-                    object_id,
-                    matter_id,
-                    json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":")),
-                    utc_now(),
-                ),
-            )
+        values = (
+            event_id,
+            actor,
+            action,
+            object_type,
+            object_id,
+            matter_id,
+            json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":")),
+            utc_now(),
+        )
+        query = """
+            INSERT INTO audit_events
+            (id, actor, action, object_type, object_id, matter_id, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        if connection is not None:
+            connection.execute(query, values)
+            return
+        with self.connect() as own_connection:
+            own_connection.execute(query, values)

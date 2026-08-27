@@ -50,6 +50,12 @@ def complete_result(
         headers={"Idempotency-Key": key},
     )
     assert received.status_code == 201, received.text
+    if result.get("matter_id"):
+        assigned = client.post(
+            f"/api/materials/{received.json()['material']['id']}/assign",
+            json={"matter_id": result["matter_id"]},
+        )
+        assert assigned.status_code == 200, assigned.text
     released = client.post("/api/analysis/run")
     assert released.status_code == 200, released.text
     claimed = client.post(
@@ -73,6 +79,72 @@ def complete_result(
     )
     assert completed.status_code == 200, completed.text
     return completed.json()
+
+
+def test_ai_result_cannot_reassign_unbound_material_or_create_actions(
+    client: TestClient,
+) -> None:
+    login(client)
+    existing = client.app.state.service.create_matter(
+        "既有事项",
+        "test",
+        "不得由 AI 自动归属",
+    )
+    received = client.post(
+        "/api/intake",
+        data={"source_type": "text", "text_note": "一条尚未人工归属的新材料"},
+        headers={"Idempotency-Key": "ai-matter-boundary"},
+    )
+    assert received.status_code == 201, received.text
+    material_id = received.json()["material"]["id"]
+
+    assert client.post("/api/analysis/run").status_code == 200
+    claimed = client.post(
+        "/api/jobs/claim",
+        json={"worker_id": "ai-matter-boundary"},
+        headers=worker_headers(),
+    )
+    job = claimed.json()["job"]
+    lease = {
+        "worker_id": "ai-matter-boundary",
+        "lease_token": job["lease_token"],
+    }
+    assert client.post(f"/api/jobs/{job['id']}/start", json=lease).status_code == 200
+    completed = client.post(
+        f"/api/jobs/{job['id']}/complete",
+        json={
+            **lease,
+            "result": {
+                "matter_id": existing["id"],
+                "matter_title": "AI 建议的新事项",
+                "summary": "仅作为待确认事项草稿",
+                "facts": [],
+                "inferences": [],
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "AI 建议动作",
+                        "detail": "不得直接创建正式行动",
+                    }
+                ],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert completed.status_code == 200, completed.text
+
+    material = client.app.state.database.fetch_one(
+        "SELECT matter_id FROM materials WHERE id = ?",
+        (material_id,),
+    )
+    assert material["matter_id"] != existing["id"]
+    drafted = client.get(f"/api/matters/{material['matter_id']}").json()
+    assert drafted["status"] == "needs_decision"
+    assert not [
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == material["matter_id"]
+    ]
 
 
 def complete_material(
@@ -124,7 +196,18 @@ def complete_material(
                 "confidence": 0.8,
             }
         ]
-    return complete_result(client, key=key, note=note, result=result)
+    matter = complete_result(client, key=key, note=note, result=result)
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    applied = client.post(
+        f"/api/matters/{matter['id']}/work-package/apply",
+        json={"step_indexes": [0], "expected_updated_at": package["updated_at"]},
+    )
+    assert applied.status_code == 200, applied.text
+    refreshed = client.get(f"/api/matters/{matter['id']}")
+    assert refreshed.status_code == 200, refreshed.text
+    return refreshed.json()
 
 
 def action_for_matter(client: TestClient, matter_id: str) -> dict:
@@ -305,11 +388,23 @@ def test_unverified_action_date_becomes_suggestion_and_does_not_remind(
         },
     )
 
-    action = action_for_matter(client, matter["id"])
-    assert action["schedule_basis"] == "suggested"
-    assert action["due_date"] is None
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    step = package["draft"]["steps"][0]
+    assert step["schedule_basis"] == "suggested"
+    assert step["due_date"] is None
+    assert step["suggested_due_date"] == due_date
+    assert not [
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == matter["id"]
+    ]
     reviews = client.get("/api/reviews").json()
-    assert any(item["kind"] == "schedule" for item in reviews)
+    assert not any(
+        item["kind"] == "schedule" and item["matter_id"] == matter["id"]
+        for item in reviews
+    )
     scan = client.post("/api/proactive/scan")
     assert scan.status_code == 200
     reminders = client.app.state.database.fetch_all(
@@ -352,16 +447,38 @@ def test_explicit_action_date_can_create_local_reminder(client: TestClient) -> N
         },
     )
 
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    step = package["draft"]["steps"][0]
+    assert step["schedule_basis"] == "material_explicit"
+    assert step["due_date"] == due_date
+    applied = client.post(
+        f"/api/matters/{matter['id']}/work-package/apply",
+        json={"step_indexes": [0], "expected_updated_at": package["updated_at"]},
+    )
+    assert applied.status_code == 200, applied.text
     action = action_for_matter(client, matter["id"])
-    assert action["schedule_basis"] == "material_explicit"
+    assert action["schedule_basis"] == "user_entered"
     assert action["due_date"] == due_date
+    scan = client.post("/api/proactive/scan")
+    assert scan.status_code == 200, scan.text
     brief = client.get("/api/today/brief", params={"brief_date": due_date})
     assert brief.status_code == 200, brief.text
     attention = [
         item for item in brief.json()["attention"] if item["matter_id"] == matter["id"]
     ]
     assert len(attention) == 1
-    assert attention[0]["item_type"] == "reminder"
+    reminders = client.app.state.database.fetch_all(
+        "SELECT action_id, status, due_at FROM reminders WHERE matter_id = ?",
+        (matter["id"],),
+    )
+    assert any(
+        item["action_id"] == action["id"]
+        and item["status"] == "open"
+        and str(item["due_at"]).startswith(due_date)
+        for item in reminders
+    )
 
 
 def test_manual_follow_up_uses_user_entered_schedule_basis(client: TestClient) -> None:
@@ -539,9 +656,13 @@ def test_search_covers_work_and_excludes_unconfirmed_auto_chat(
     assert found.status_code == 200, found.text
     body = found.json()
     assert body["items"]
+    assert body["answer"] is None
     assert all(item["searchable"] for item in body["items"])
     assert any(item["title"] == "供应商付款复核" for item in body["items"])
-    assert 1 <= len(body["answer"]["sources"]) <= 4
+    answered = client.get(
+        "/api/search", params={"q": "付款", "include_answer": "true"}
+    ).json()
+    assert 1 <= len(answered["answer"]["sources"]) <= 4
     excluded = client.get("/api/search", params={"q": "私人晚餐暗号"})
     assert excluded.status_code == 200, excluded.text
     assert excluded.json()["items"] == []
@@ -616,7 +737,7 @@ def test_review_queue_resolves_normal_items_in_one_request(client: TestClient) -
     assert resolved.json()["updated_count"] == 2
 
 
-def test_completion_suggestion_is_deduplicated_and_acceptance_closes_follow_up(
+def test_completion_suggestion_is_deduplicated_in_work_package_without_closing_follow_up(
     client: TestClient,
 ) -> None:
     login(client)
@@ -667,34 +788,34 @@ def test_completion_suggestion_is_deduplicated_and_acceptance_closes_follow_up(
         for item in client.get("/api/reviews").json()
         if item["kind"] == "action_completion" and item["status"] == "pending"
     ]
-    assert len(completion_reviews) == 1
-    accepted = client.post(
-        "/api/review-queue/resolve",
-        json={"review_id": completion_reviews[0]["id"], "resolution": "accepted"},
-    )
-    assert accepted.status_code == 200, accepted.text
-    assert action_for_matter(client, matter["id"])["status"] == "done"
+    assert completion_reviews == []
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    prefix = f"是否确认行动 {action['id']} 已完成"
+    questions = [
+        question
+        for question in package["draft"]["questions"]
+        if question.startswith(prefix)
+    ]
+    assert len(questions) == 1
+    assert "再次确认盘点差异已经处理完成" not in questions[0]
+    assert action_for_matter(client, matter["id"])["status"] == "open"
     reminder = client.app.state.database.fetch_one(
         "SELECT status FROM reminders WHERE id = ?",
         ("reminder-completion-test",),
     )
-    assert reminder["status"] == "done"
+    assert reminder["status"] == "open"
     pending_assignees = client.get(
         "/api/assignee-reviews", params={"status": "pending"}
     )
     assert pending_assignees.status_code == 200, pending_assignees.text
-    assert all(
-        item["action_id"] != action["id"] for item in pending_assignees.json()
-    )
+    assert any(item["action_id"] == action["id"] for item in pending_assignees.json())
     timeline = client.get(f"/api/matters/{matter['id']}/timeline").json()
-    assert any(
-        item["type"] == "action.completed"
-        and "盘点差异表已复核并确认无误" in str(item.get("payload", {}))
-        for item in timeline
-    )
+    assert not any(item["type"] == "action.completed" for item in timeline)
 
 
-def test_rejected_completion_suggestion_keeps_action_open(client: TestClient) -> None:
+def test_unapplied_completion_question_keeps_action_open(client: TestClient) -> None:
     login(client)
     matter = complete_material(
         client,
@@ -710,16 +831,17 @@ def test_rejected_completion_suggestion_keeps_action_open(client: TestClient) ->
         action_id=action["id"],
         evidence="对方说材料可能已经盖章",
     )
-    review = next(
-        item
+    assert not any(
+        item["kind"] == "action_completion" and item["status"] == "pending"
         for item in client.get("/api/reviews").json()
-        if item["kind"] == "action_completion" and item["status"] == "pending"
     )
-    rejected = client.post(
-        "/api/review-queue/resolve",
-        json={"review_id": review["id"], "resolution": "rejected"},
+    package_response = client.get(f"/api/matters/{matter['id']}/work-package")
+    assert package_response.status_code == 200, package_response.text
+    package = package_response.json().get("work_package", package_response.json())
+    assert any(
+        question.startswith(f"是否确认行动 {action['id']} 已完成")
+        for question in package["draft"]["questions"]
     )
-    assert rejected.status_code == 200, rejected.text
     assert action_for_matter(client, matter["id"])["status"] == "open"
 
 
@@ -763,7 +885,7 @@ def test_matter_target_date_and_progress_are_recorded_in_timeline(
     assert progress.json()["type"] == "progress.note"
 
     timeline = client.get(f"/api/matters/{matter['id']}/timeline").json()
-    assert any(item["type"] == "matter.target_date.updated" for item in timeline)
+    assert any(item["type"] == "matter.updated" for item in timeline)
     assert any(
         item["type"] == "progress.note"
         and item["summary"] == "已完成第一轮差异核对"
@@ -772,7 +894,7 @@ def test_matter_target_date_and_progress_are_recorded_in_timeline(
     )
 
 
-def test_manual_matter_status_closes_children_and_can_reopen(client: TestClient) -> None:
+def test_matter_close_requires_clean_preview_and_can_reopen(client: TestClient) -> None:
     login(client)
     matter = complete_material(
         client,
@@ -782,13 +904,28 @@ def test_manual_matter_status_closes_children_and_can_reopen(client: TestClient)
     )
     assert action_for_matter(client, matter["id"])["status"] == "open"
 
-    completed = client.patch(
+    rejected = client.patch(
         f"/api/matters/{matter['id']}", json={"status": "completed"}
     )
-    assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "completed"
-    assert completed.json()["is_completed"] is True
-    assert all(item["status"] == "done" for item in completed.json()["actions"])
+    assert rejected.status_code == 422, rejected.text
+    action = action_for_matter(client, matter["id"])
+    assert action["status"] == "open"
+
+    resolved = client.post(
+        f"/api/actions/{action['id']}/resolve", json={"status": "done"}
+    )
+    assert resolved.status_code == 200, resolved.text
+    ready = client.get(f"/api/matters/{matter['id']}/close-preview").json()
+    assert ready["can_close"] is True
+    closed = client.post(
+        f"/api/matters/{matter['id']}/close",
+        json={
+            "expected_updated_at": ready["updated_at"],
+            "completion_note": "已人工核对全部未完成内容。",
+        },
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["is_completed"] is True
 
     reopened = client.patch(
         f"/api/matters/{matter['id']}", json={"status": "active"}
@@ -796,5 +933,7 @@ def test_manual_matter_status_closes_children_and_can_reopen(client: TestClient)
     assert reopened.status_code == 200, reopened.text
     assert reopened.json()["status"] == "active"
     assert reopened.json()["is_completed"] is False
+    assert action_for_matter(client, matter["id"])["status"] == "done"
     timeline = client.get(f"/api/matters/{matter['id']}/timeline").json()
-    assert [item["type"] for item in timeline].count("matter.status.updated") == 2
+    assert any(item["type"] == "matter.closed" for item in timeline)
+    assert any(item["type"] == "matter.updated" for item in timeline)

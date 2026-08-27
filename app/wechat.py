@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from .assignees import normalize_suggestions, resolve_person_alias, upsert_action_suggestions
 from .db import Database, utc_now
+from .services import StaleWriteError
 
 
 _WORK_SIGNAL_RE = re.compile(
@@ -502,7 +503,6 @@ class WechatService:
         ).replace("+00:00", "Z")
         ignored = 0
         merged = 0
-        keeper_ids: list[str] = []
         with self.database.connect() as connection:
             rows = connection.execute(
                 "SELECT x.*, m.text_note FROM wechat_candidates x "
@@ -562,16 +562,7 @@ class WechatService:
                     merged += 1
                 else:
                     keepers.append(row)
-            keeper_ids = [str(row["id"]) for row in keepers]
-        continued = 0
-        for candidate_id in keeper_ids:
-            candidate = self.database.fetch_one(
-                "SELECT * FROM wechat_candidates WHERE id = ? AND status = 'pending'",
-                (candidate_id,),
-            )
-            if candidate and self._auto_continue_open_matter(candidate, "jarvis-batch"):
-                continued += 1
-        return {"ignored": ignored, "merged": merged, "continued": continued}
+        return {"ignored": ignored, "merged": merged, "continued": 0}
 
     def request_sync(
         self,
@@ -1083,25 +1074,6 @@ class WechatService:
             (account_fingerprint, session_id, source, sort_seq, create_time, local_id, now, now),
         )
 
-    def _auto_continue_open_matter(
-        self, candidate: dict[str, Any], actor: str
-    ) -> dict[str, Any] | None:
-        if candidate.get("classification") != "relevant":
-            return None
-        try:
-            confidence = float(candidate.get("confidence") or 0)
-        except (TypeError, ValueError):
-            confidence = 0
-        if confidence < 0.9 or candidate.get("uncertainty_reason"):
-            return None
-        extracted = _json(candidate.get("extracted_json"), {})
-        if extracted.get("conflict") or extracted.get("conflicts"):
-            return None
-        matter_id = self._find_open_matter(candidate, require_unique=True)
-        if not matter_id:
-            return None
-        return self.resolve_candidate(candidate["id"], "accept", actor, matter_id)
-
     def complete_classification(
         self,
         job_id: str,
@@ -1235,6 +1207,129 @@ class WechatService:
                     str(row["material_status"]), "等待处理"
                 )
         return rows
+
+    def update_candidate(
+        self,
+        candidate_id: str,
+        changes: dict[str, Any],
+        expected_updated_at: str,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        candidate = self.database.fetch_one(
+            "SELECT * FROM wechat_candidates WHERE id = ?", (candidate_id,)
+        )
+        if not candidate:
+            raise KeyError("微信线索不存在")
+        if expected_updated_at != candidate["updated_at"]:
+            raise StaleWriteError("微信线索已被更新，请刷新后再保存")
+
+        allowed = {
+            "summary",
+            "classification",
+            "uncertainty_reason",
+            "extracted",
+            "evidence",
+            "matter_id",
+        }
+        unsupported = set(changes) - allowed
+        if unsupported:
+            raise ValueError(f"不支持修改字段：{', '.join(sorted(unsupported))}")
+        if not changes:
+            raise ValueError("请提供需要修改的微信线索内容")
+
+        values: dict[str, Any] = {}
+        if "summary" in changes:
+            values["summary"] = str(changes["summary"] or "").strip()[:1000]
+        if "classification" in changes:
+            classification = str(changes["classification"] or "").strip().lower()
+            if classification not in {"relevant", "uncertain", "irrelevant"}:
+                raise ValueError("不支持的微信线索分类")
+            values["classification"] = classification
+        if "uncertainty_reason" in changes:
+            values["uncertainty_reason"] = str(
+                changes["uncertainty_reason"] or ""
+            ).strip()[:500]
+        if "extracted" in changes:
+            if not isinstance(changes["extracted"], dict):
+                raise ValueError("提取内容必须是对象")
+            values["extracted_json"] = json.dumps(
+                changes["extracted"], ensure_ascii=False, separators=(",", ":")
+            )
+        if "evidence" in changes:
+            if not isinstance(changes["evidence"], list):
+                raise ValueError("依据必须是列表")
+            values["evidence_json"] = json.dumps(
+                changes["evidence"], ensure_ascii=False, separators=(",", ":")
+            )
+        if "matter_id" in changes:
+            matter_id = changes["matter_id"] or None
+            if matter_id and not self.database.fetch_one(
+                "SELECT id FROM matters WHERE id = ?", (matter_id,)
+            ):
+                raise KeyError("关联事项不存在")
+            values["matter_id"] = matter_id
+
+        old: dict[str, Any] = {}
+        new: dict[str, Any] = {}
+        for key, value in values.items():
+            public_key = {"extracted_json": "extracted", "evidence_json": "evidence"}.get(
+                key, key
+            )
+            fallback = {} if key == "extracted_json" else []
+            old[public_key] = (
+                _json(candidate[key], fallback)
+                if key in {"extracted_json", "evidence_json"}
+                else candidate.get(key)
+            )
+            new[public_key] = (
+                _json(value, fallback)
+                if key in {"extracted_json", "evidence_json"}
+                else value
+            )
+        now = utc_now()
+        if now <= candidate["updated_at"]:
+            now = (
+                datetime.fromisoformat(candidate["updated_at"].replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        metadata = {"old": old, "new": new, "reason": str(reason or "")[:500]}
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                f"UPDATE wechat_candidates SET {assignments}, updated_at = ? "
+                "WHERE id = ? AND updated_at = ?",
+                (*values.values(), now, candidate_id, expected_updated_at),
+            )
+            if updated.rowcount != 1:
+                raise StaleWriteError("微信线索已被更新，请刷新后再保存")
+            connection.execute(
+                "INSERT INTO audit_events "
+                "(id, actor, action, object_type, object_id, matter_id, metadata_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _id("audit"),
+                    actor,
+                    "wechat.candidate.updated",
+                    "wechat_candidate",
+                    candidate_id,
+                    values.get("matter_id", candidate.get("matter_id")),
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+
+        result = self.database.fetch_one(
+            "SELECT * FROM wechat_candidates WHERE id = ?", (candidate_id,)
+        )
+        if not result:
+            raise RuntimeError("微信线索写入失败")
+        result["evidence"] = _json(result.pop("evidence_json", "[]"), [])
+        result["extracted"] = _json(result.pop("extracted_json", "{}"), {})
+        result["status_label"] = _WECHAT_STATUS_LABELS.get(
+            str(result.get("status") or ""), "等待处理"
+        )
+        return result
 
     def export_listening_windows(
         self,
