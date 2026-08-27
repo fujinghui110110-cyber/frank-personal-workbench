@@ -3661,6 +3661,9 @@ class WorkbenchService:
         review = self.database.fetch_one("SELECT * FROM review_items WHERE id = ?", (review_id,))
         if not review:
             raise KeyError("待确认项不存在")
+        if review.get("kind") == "action_suggestion" and review.get("status") != "pending":
+            review["payload"] = parse_json(review.pop("payload_json", "{}"), {})
+            return review
         now = utc_now()
         evidence_status = "confirmed" if resolution in {"accepted", "edited"} else "rejected"
         review_payload = parse_json(review.get("payload_json"), {})
@@ -3682,6 +3685,7 @@ class WorkbenchService:
             "reason": str(review_payload.get("reason") or "")[:500],
             "evidence": completion_evidence,
         }
+        created_action_id = ""
         with self.database.connect() as connection:
             connection.execute(
                 "UPDATE review_items SET status = ?, resolution_note = ?, resolved_at = ? "
@@ -3716,6 +3720,43 @@ class WorkbenchService:
                     "UPDATE action_assignees SET status = 'superseded', updated_at = ? "
                     "WHERE action_id = ? AND status = 'pending'",
                     (now, completion_action_id),
+                )
+            if review.get("kind") == "action_suggestion" and resolution in {
+                "accepted",
+                "edited",
+            }:
+                title = (
+                    note.strip()
+                    if resolution == "edited"
+                    else str(review_payload.get("title") or "").strip()
+                )
+                if not title:
+                    raise ValueError("建议行动缺少标题")
+                kind = str(review_payload.get("kind") or "task")
+                if kind not in ACTION_KINDS:
+                    kind = "task"
+                created_action_id = new_id("action")
+                due_date = review_payload.get("due_date") or None
+                connection.execute(
+                    "INSERT INTO actions "
+                    "(id, matter_id, material_id, kind, title, detail, status, owner, "
+                    "due_date, created_by, created_at, updated_at, flow_state, schedule_basis, "
+                    "completion_evidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?, '[]')",
+                    (
+                        created_action_id,
+                        review["matter_id"],
+                        review.get("material_id"),
+                        kind,
+                        title[:200],
+                        str(review_payload.get("detail") or "")[:2000],
+                        due_date,
+                        actor,
+                        now,
+                        now,
+                        default_flow_state(kind),
+                        "user_entered" if due_date else "legacy",
+                    ),
                 )
             if review["evidence_id"]:
                 if resolution == "edited" and note.strip():
@@ -3784,6 +3825,29 @@ class WorkbenchService:
                 completion_action_id,
                 review["matter_id"],
                 completion_event,
+            )
+        if created_action_id:
+            action_event = {
+                "source_review_id": review_id,
+                "resolution": resolution,
+            }
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "action.created",
+                "action",
+                created_action_id,
+                review["matter_id"],
+                action_event,
+            )
+            self.record_matter_event(
+                review["matter_id"],
+                "action.created",
+                actor,
+                "action",
+                created_action_id,
+                "建议行动已由人工采纳",
+                action_event,
             )
             self.record_matter_event(
                 review["matter_id"],

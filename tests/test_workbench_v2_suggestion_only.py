@@ -41,6 +41,12 @@ def test_mcp_can_prepare_work_package_but_cannot_change_business_state(
     client: TestClient,
 ) -> None:
     matter = client.app.state.service.create_matter("合成权限边界事项", "仅用于权限测试")
+    owner_intake = client.post(
+        "/api/intake",
+        data={"source_type": "text", "text_note": "合成材料"},
+        headers={"Idempotency-Key": "mcp-authority-boundary"},
+    )
+    material_id = owner_intake.json()["material"]["id"]
 
     generated = client.post(
         f"/api/matters/{matter['id']}/work-package/generate",
@@ -71,7 +77,29 @@ def test_mcp_can_prepare_work_package_but_cannot_change_business_state(
         ),
     ]
 
-    assert [response.status_code for response in forbidden_requests] == [403, 403, 403, 403]
+    forbidden_requests.extend(
+        [
+            client.post(
+                "/api/intake",
+                data={"source_type": "text", "text_note": "MCP 不得直接投递"},
+                headers={
+                    **mcp_headers(),
+                    "Idempotency-Key": "mcp-forbidden-intake",
+                },
+            ),
+            client.post(
+                f"/api/materials/{material_id}/assign",
+                json={"matter_id": matter["id"]},
+                headers=mcp_headers(),
+            ),
+            client.post(
+                "/api/wechat/candidates/synthetic-candidate/resolve",
+                json={"action": "accept", "matter_id": matter["id"]},
+                headers=mcp_headers(),
+            ),
+        ]
+    )
+    assert [response.status_code for response in forbidden_requests] == [403] * 7
 
 
 def start_analysis(client: TestClient) -> dict:

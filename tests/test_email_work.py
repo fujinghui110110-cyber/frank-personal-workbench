@@ -132,6 +132,86 @@ def test_direct_work_email_preserves_original_material(client: TestClient) -> No
     }
 
 
+def test_email_action_suggestion_requires_human_acceptance(client: TestClient) -> None:
+    owner_login(client)
+    assert client.post(
+        "/api/email/accounts/register",
+        json=ACCOUNT,
+        headers=worker_headers(),
+    ).status_code == 200
+    saved = client.post(
+        "/api/email/messages",
+        json=message(3, work=True),
+        headers=worker_headers(),
+    ).json()
+    matter_id = saved["matter_id"]
+    assert not [
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == matter_id
+    ]
+
+    review = next(
+        item
+        for item in client.get("/api/reviews").json()
+        if item["matter_id"] == matter_id and item["kind"] == "action_suggestion"
+    )
+    accepted = client.post(
+        f"/api/reviews/{review['id']}/resolve",
+        json={"resolution": "accepted", "note": ""},
+    )
+    assert accepted.status_code == 200, accepted.text
+    actions = [
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == matter_id
+    ]
+    assert len(actions) == 1
+    assert actions[0]["title"] == "复核预算差异并回复"
+    assert actions[0]["owner"] is None
+    assert actions[0]["due_date"] == "2026-08-22"
+    assert actions[0]["schedule_basis"] == "user_entered"
+    repeated = client.post(
+        f"/api/reviews/{review['id']}/resolve",
+        json={"resolution": "accepted", "note": ""},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert len(
+        [
+            item
+            for item in client.get("/api/actions", params={"status": "all"}).json()
+            if item["matter_id"] == matter_id
+        ]
+    ) == 1
+
+
+def test_email_action_suggestion_can_be_edited_before_acceptance(client: TestClient) -> None:
+    owner_login(client)
+    client.post("/api/email/accounts/register", json=ACCOUNT, headers=worker_headers())
+    saved = client.post(
+        "/api/email/messages",
+        json=message(4, work=True),
+        headers=worker_headers(),
+    ).json()
+    review = next(
+        item
+        for item in client.get("/api/reviews").json()
+        if item["matter_id"] == saved["matter_id"] and item["kind"] == "action_suggestion"
+    )
+    edited = client.post(
+        f"/api/reviews/{review['id']}/resolve",
+        json={"resolution": "edited", "note": "复核预算差异并形成书面反馈"},
+    )
+    assert edited.status_code == 200, edited.text
+    action = next(
+        item
+        for item in client.get("/api/actions", params={"status": "all"}).json()
+        if item["matter_id"] == saved["matter_id"]
+    )
+    assert action["title"] == "复核预算差异并形成书面反馈"
+    assert action["owner"] is None
+
+
 def test_email_sync_filters_nonwork_and_merges_open_thread(client: TestClient) -> None:
     owner_login(client)
     assert client.get("/api/email/status").json()["configured"] is False

@@ -32,7 +32,6 @@ WORKER_SCOPES = frozenset(
 )
 MCP_SCOPES = frozenset(
     {
-        "intake:write",
         "jobs:claim",
         "jobs:write",
         "materials:read",
@@ -41,7 +40,6 @@ MCP_SCOPES = frozenset(
         "work_packages:write",
         "nodes:write",
         "wechat:read",
-        "wechat:write",
     }
 )
 

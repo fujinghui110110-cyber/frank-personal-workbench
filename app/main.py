@@ -278,7 +278,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def assign_material(
         material_id: str,
         payload: AssignmentRequest,
-        context: AuthContext = Depends(auth_context),
+    context: AuthContext = Depends(require_scope("materials:write")),
     ) -> dict[str, Any]:
         return service.assign_material(
             material_id, context.actor, payload.matter_id, payload.title
