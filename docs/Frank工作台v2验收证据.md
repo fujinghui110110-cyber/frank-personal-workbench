@@ -25,7 +25,7 @@
 
 ## 自动验证
 
-- `.venv/bin/pytest -q`：209 项测试全部通过。
+- `.venv/bin/pytest -q`：210 项测试全部通过。
 - `.venv/bin/python -m py_compile app/services.py`：通过。
 - `node --check app/static/app.js`：通过。
 - `node --check app/static/sw.js`：通过。

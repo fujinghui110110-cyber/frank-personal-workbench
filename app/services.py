@@ -3687,11 +3687,20 @@ class WorkbenchService:
         }
         created_action_id = ""
         with self.database.connect() as connection:
-            connection.execute(
+            updated_review = connection.execute(
                 "UPDATE review_items SET status = ?, resolution_note = ?, resolved_at = ? "
-                "WHERE id = ?",
+                "WHERE id = ? AND status = 'pending'",
                 (resolution, note[:500], now, review_id),
             )
+            if updated_review.rowcount != 1:
+                resolved = connection.execute(
+                    "SELECT * FROM review_items WHERE id = ?", (review_id,)
+                ).fetchone()
+                if not resolved:
+                    raise RuntimeError("确认结果写入失败")
+                result = dict(resolved)
+                result["payload"] = parse_json(result.pop("payload_json", "{}"), {})
+                return result
             connection.execute(
                 "UPDATE reminders SET status = 'done', updated_at = ? WHERE fingerprint = ?",
                 (now, f"review:{review_id}"),
@@ -3826,6 +3835,15 @@ class WorkbenchService:
                 review["matter_id"],
                 completion_event,
             )
+            self.record_matter_event(
+                review["matter_id"],
+                "action.completed",
+                actor,
+                "action",
+                completion_action_id,
+                "行动完成已确认",
+                completion_event,
+            )
         if created_action_id:
             action_event = {
                 "source_review_id": review_id,
@@ -3848,15 +3866,6 @@ class WorkbenchService:
                 created_action_id,
                 "建议行动已由人工采纳",
                 action_event,
-            )
-            self.record_matter_event(
-                review["matter_id"],
-                "action.completed",
-                actor,
-                "action",
-                completion_action_id,
-                "行动完成已确认",
-                completion_event,
             )
         resolved = self.database.fetch_one(
             "SELECT * FROM review_items WHERE id = ?", (review_id,)
