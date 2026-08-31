@@ -743,11 +743,11 @@ def test_frontend_markup_matches_javascript_and_hidden_contracts(
     assert 'id="login-submit"' in response.text
     assert stylesheet.status_code == 200
     assert "[hidden] { display: none !important; }" in stylesheet.text
-    assert '/static/app.css?v=52' in response.text
+    assert '/static/app.css?v=54' in response.text
     assert '/static/app-evolution.css' not in response.text
-    assert '/static/app.js?v=52' in response.text
+    assert '/static/app.js?v=54' in response.text
     assert service_worker.status_code == 200
-    assert "frank-personal-workbench-shell-v52" in service_worker.text
+    assert "frank-personal-workbench-shell-v54" in service_worker.text
     assert "fetch(request).then" in service_worker.text
     assert ".catch(() => caches.match(request))" in service_worker.text
     assert "Mac 关机时" in response.text

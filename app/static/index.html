@@ -12,7 +12,7 @@
       content="Frank 的个人工作台"
     />
     <link rel="manifest" href="/manifest.webmanifest?v=24" />
-  <link rel="stylesheet" href="/static/app.css?v=52" />
+    <link rel="stylesheet" href="/static/app.css?v=54" />
     <title>Frank 的个人工作台</title>
   </head>
   <body>
@@ -25,8 +25,8 @@
             <h2>把零散信息交给贾维斯，<br />只把判断留给你。</h2>
             <ul>
               <li><span>01</span> 录音、聊天、审批随手投递</li>
-              <li><span>02</span> 自动归并事项和下一步</li>
-              <li><span>03</span> 到时间主动回来追踪</li>
+            <li><span>02</span> 自动整理事项和对接人</li>
+            <li><span>03</span> 每天复盘，完成后归档</li>
             </ul>
           </div>
         </div>
@@ -38,7 +38,7 @@
             <p class="eyebrow">欢迎回来</p>
             <h1 id="login-title">进入你的工作台</h1>
             <p class="login-lead">
-              今天的重点、待确认和贾维斯已完成的工作都在里面。
+          今天需要跟进的人和事项都在里面。
             </p>
             <form id="login-form" class="stack-form" data-testid="login-form">
               <label for="passcode">访问口令</label>
@@ -93,18 +93,10 @@
           </div>
 
           <nav class="rail-nav" id="desktop-nav" aria-label="主导航">
-            <p class="nav-section-label">主导航</p>
+            <p class="nav-section-label">工作台</p>
             <a href="#/today" data-route="today">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4l8 7.2v8.3a.5.5 0 0 1-.5.5H15v-6H9v6H4.5a.5.5 0 0 1-.5-.5z" /></svg>
-              <span>今天</span>
-            </a>
-            <a href="#/matters" data-route="matters">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
-              <span>事项</span>
-            </a>
-            <a href="#/policies" data-route="policies">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zM9 8h6M9 12h6M9 16h4" /></svg>
-              <span>规定</span>
+              <span>跟进事项</span>
             </a>
             <a href="#/search" data-route="search">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 5 5" /></svg>
@@ -133,9 +125,12 @@
               <p class="eyebrow" id="page-kicker">Frank 的个人工作台</p>
               <h1 id="page-title">今天</h1>
             </div>
-          <div class="topbar-actions">
-            <span class="offline-pill" id="offline-pill" hidden>连接中断，材料暂存在当前设备</span>
-          </div>
+            <div class="topbar-actions">
+              <button class="button button-secondary" id="run-source-sync-global" type="button">读取新信息</button>
+              <button class="button button-secondary" id="run-analysis-global" type="button">整理新内容</button>
+              <button class="button button-primary" type="button" data-open-intake>导入材料</button>
+              <span class="offline-pill" id="offline-pill" hidden>连接中断，材料暂存在当前设备</span>
+            </div>
           </header>
 
           <section class="workflow-band" aria-label="工作台三步流程">
@@ -145,7 +140,7 @@
                 <span>读取新信息</span>
                 <small id="source-sync-detail">个人微信、企业微信和邮箱</small>
               </div>
-              <button class="button button-primary" id="run-source-sync-global" type="button">立即读取</button>
+              <button class="button button-primary" id="run-source-sync-workflow" type="button">立即读取</button>
             </article>
             <article class="workflow-step workflow-step-action">
               <div class="workflow-step-number">2</div>
@@ -153,7 +148,7 @@
                 <span>整理新内容</span>
                 <small id="analysis-run-detail">仅手工启动，不会自动消耗额度</small>
               </div>
-              <button class="button button-secondary" id="run-analysis-global" type="button">让贾维斯整理</button>
+              <button class="button button-secondary" id="run-analysis-workflow" type="button">让贾维斯整理</button>
             </article>
             <article class="workflow-step workflow-step-attention">
               <div class="workflow-step-number">3</div>
@@ -410,6 +405,6 @@
         <span></span><strong>贾维斯正在整理页面</strong>
       </div>
     </template>
-  <script src="/static/app.js?v=52" defer></script>
+    <script src="/static/app.js?v=54" defer></script>
   </body>
 </html>

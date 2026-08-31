@@ -1491,6 +1491,17 @@ class WorkbenchService:
             raise RuntimeError("处理结果写入失败")
         return detail
 
+    def _attach_matter_contact(self, matter: dict[str, Any]) -> dict[str, Any]:
+        person = None
+        if matter.get("contact_person_id"):
+            person = self.database.fetch_one(
+                "SELECT id, display_name, role FROM people WHERE id = ? AND enabled = 1",
+                (matter["contact_person_id"],),
+            )
+        matter["contact_person"] = person
+        matter["contact_name"] = person["display_name"] if person else ""
+        return matter
+
     def list_matters(self, limit: int = 100) -> list[dict[str, Any]]:
         matters = self.database.fetch_all(
             "SELECT m.*, "
@@ -1511,6 +1522,7 @@ class WorkbenchService:
             (limit,),
         )
         for matter in matters:
+            self._attach_matter_contact(matter)
             status_override = bool(matter.pop("status_override", 0))
             computed_complete = not any(
                 matter[field]
@@ -1717,6 +1729,7 @@ class WorkbenchService:
         matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
         if not matter:
             return None
+        self._attach_matter_contact(matter)
         matter["materials"] = [
             public_material(row)
             for row in self.database.fetch_all(
@@ -1798,7 +1811,7 @@ class WorkbenchService:
             raise KeyError("事项不存在")
         rows = self.database.fetch_all(
             "SELECT * FROM matter_events WHERE matter_id = ? "
-            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            "ORDER BY created_at ASC, rowid ASC LIMIT ?",
             (matter_id, min(max(limit, 1), 500)),
         )
         events: list[dict[str, Any]] = []
@@ -1820,6 +1833,89 @@ class WorkbenchService:
         matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
         if not matter:
             raise KeyError("事项不存在")
+        detail_keys = {"title", "summary", "contact_name"} & changes.keys()
+        if detail_keys:
+            if {"status", "target_date"} & changes.keys():
+                raise ValueError("事项内容与状态或日期请分别保存")
+            values: dict[str, Any] = {}
+            event_changes: dict[str, dict[str, Any]] = {}
+            if "title" in changes:
+                title = str(changes.get("title") or "").strip()
+                if not title:
+                    raise ValueError("事项标题不能为空")
+                values["title"] = title
+                event_changes["title"] = {"before": matter.get("title", ""), "after": title}
+            if "summary" in changes:
+                summary = str(changes.get("summary") or "").strip()
+                values["summary"] = summary
+                event_changes["summary"] = {
+                    "before": matter.get("summary", ""),
+                    "after": summary,
+                }
+            if "contact_name" in changes:
+                contact_name = str(changes.get("contact_name") or "").strip()
+                before_person = None
+                if matter.get("contact_person_id"):
+                    before_person = self.database.fetch_one(
+                        "SELECT display_name FROM people WHERE id = ?",
+                        (matter["contact_person_id"],),
+                    )
+                person = None
+                person_id = None
+                if contact_name:
+                    person = self.database.fetch_one(
+                        "SELECT id FROM people WHERE display_name = ? AND enabled = 1",
+                        (contact_name,),
+                    )
+                    person_id = person["id"] if person else new_id("person")
+                values["contact_person_id"] = person_id
+                event_changes["contact_name"] = {
+                    "before": before_person["display_name"] if before_person else "",
+                    "after": contact_name,
+                }
+            now = utc_now()
+            with self.database.connect() as connection:
+                if "contact_name" in changes and contact_name and not person:
+                    connection.execute(
+                        "INSERT INTO people "
+                        "(id, display_name, role, aliases_json, phonetic_aliases_json, "
+                        "is_self, enabled, created_at, updated_at) "
+                        "VALUES (?, ?, '', ?, '[]', 0, 1, ?, ?)",
+                        (
+                            person_id,
+                            contact_name,
+                            json.dumps([contact_name], ensure_ascii=False),
+                            now,
+                            now,
+                        ),
+                    )
+                assignments = ", ".join(f"{key} = ?" for key in values)
+                connection.execute(
+                    f"UPDATE matters SET {assignments}, updated_at = ? WHERE id = ?",
+                    (*values.values(), now, matter_id),
+                )
+            self.database.audit(
+                new_id("audit"),
+                actor,
+                "matter.details.updated",
+                "matter",
+                matter_id,
+                matter_id,
+                event_changes,
+            )
+            self.record_matter_event(
+                matter_id,
+                "matter.details.updated",
+                actor,
+                "matter",
+                matter_id,
+                "事项信息已人工修改",
+                event_changes,
+            )
+            updated = self.get_matter(matter_id)
+            if not updated:
+                raise RuntimeError("事项信息写入失败")
+            return updated
         if "status" in changes:
             status = changes.get("status")
             if status not in {"active", "completed"}:

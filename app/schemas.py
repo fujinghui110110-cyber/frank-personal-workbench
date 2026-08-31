@@ -21,6 +21,9 @@ class AssignmentRequest(BaseModel):
 
 
 class MatterUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    summary: str | None = Field(default=None, max_length=4000)
+    contact_name: str | None = Field(default=None, max_length=80)
     target_date: str | None = Field(default=None, max_length=10)
     status: Literal["active", "completed"] | None = None
 

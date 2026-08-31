@@ -32,6 +32,12 @@ searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
     todayDisclosures: { weekly: false, rules: false },
     sourceSyncRunning: false,
     sourceReceiptDismissed: false,
+    followUpMatterId: null,
+    followUpContact: "all",
+    followUpQuery: "",
+    followUpView: "open",
+    followUpMatter: null,
+    followUpTimeline: [],
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -183,19 +189,8 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     );
   }
 
-  const DEFAULT_PEOPLE = [
-    { id: "person_self", name: "我自己", role: "Frank" },
-    { id: "person_sun_qing", name: "孙庆", role: "片区财务领导" },
-    { id: "person_li_jing", name: "李静", role: "仓管员" },
-    { id: "person_ou_bo", name: "欧波", role: "仓管员" },
-    { id: "person_feng_lixiang", name: "冯李香", role: "采购" },
-    { id: "person_chen_zhenting", name: "陈贞婷", role: "出纳、兼职文员" },
-    { id: "person_pan_chaohui", name: "潘朝荟", role: "应收、收入、资产管理、收入审计" },
-    { id: "person_zhu_qingxia", name: "朱青霞", role: "总账主管" },
-  ];
-
   function normalizePeople(items) {
-    const source = Array.isArray(items) && items.length ? items : DEFAULT_PEOPLE;
+    const source = Array.isArray(items) ? items : [];
     return source
       .map((item) => ({
         id: String(item.id || item.person_id || item.name || item.display_name || "").trim(),
@@ -527,7 +522,7 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
       link.classList.toggle("active", link.dataset.route === active),
     );
     const titles = {
-      today: "今天",
+      today: "今日跟进",
       intake: "随手投递",
       wechat: "聊天线索",
       email: "邮件工作",
@@ -539,6 +534,10 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
       search: "搜索",
     };
     $("#page-title").textContent = titles[route.name] || "工作台";
+    page().classList.toggle(
+      "follow-up-page",
+      ["today", "matters", "matter"].includes(route.name),
+    );
     $("#page-kicker").textContent = new Intl.DateTimeFormat("zh-CN", {
       month: "long",
       day: "numeric",
@@ -556,18 +555,8 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     setRoute(route);
     if (!quiet) showLoading();
     try {
-if (route.name === "today") {
-const [brief, overview, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules] = await Promise.all([
-api("/api/today/brief"),
-api("/api/overview"),
-api("/api/materials?limit=30"),
-api("/api/wechat/status"),
-api("/api/policies/status"),
-apiOptional("/api/assignee-reviews?status=pending", []),
-apiOptional("/api/weekly-review", null),
-apiOptional("/api/learning-rules", []),
-]);
-renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules);
+      if (route.name === "today") {
+        await renderFollowUpDesk(await api("/api/matters?limit=500"));
     } else if (route.name === "intake") {
       renderIntakePage(await api("/api/analysis/issues"));
     } else if (route.name === "wechat") {
@@ -598,20 +587,9 @@ renderToday(brief, overview, materials, wechatStatus, policyStatus, assigneeRevi
         ]);
         renderPolicies(policyStatus, candidates, activePolicies, repealedPolicies);
       } else if (route.name === "matters") {
-        const [matters, people, openActions, doneActions] = await Promise.all([
-          api("/api/matters?limit=100"),
-          apiOptional("/api/people", []),
-          apiOptional("/api/actions?status=open", []),
-          apiOptional("/api/actions?status=done", []),
-        ]);
-        renderMatters(matters, people, { open: openActions, done: doneActions });
-} else if (route.name === "matter") {
-const [matter, people, timeline] = await Promise.all([
-api(`/api/matters/${encodeURIComponent(route.id)}`),
-apiOptional("/api/people", []),
-apiOptional(`/api/matters/${encodeURIComponent(route.id)}/timeline`, []),
-]);
-renderMatter(matter, people, timeline);
+        await renderFollowUpDesk(await api("/api/matters?limit=500"));
+      } else if (route.name === "matter") {
+        await renderFollowUpDesk(await api("/api/matters?limit=500"), route.id);
       } else if (route.name === "reviews") {
         const [reviews, assigneeReviews, people] = await Promise.all([
           api("/api/reviews?review_status=pending"),
@@ -1658,6 +1636,485 @@ function renderEmail(status, messages, matters) {
           `<section class="person-group ${group.pinned ? "is-pinned" : ""}" data-person-group="${escapeHtml(group.id)}"><header><div><h3>${escapeHtml(group.name)}${group.pinned ? " · 置顶" : ""}</h3><p>${escapeHtml(group.role || "")}</p></div><strong>${group.actions.length} 项</strong></header>${renderPersonActionRows(group.actions, people)}</section>`,
       )
       .join("")}</div>${emptyCount ? `<button class="button button-quiet people-empty-toggle" type="button" data-toggle-empty-people>${state.showEmptyPeople ? "隐藏没有行动的人员" : `显示 ${emptyCount} 位暂无行动的人员`}</button>` : ""}`;
+  }
+
+  function matterContactName(item, fallback = "未指定") {
+    const name = String(
+      item?.contact_name || item?.contact_person?.display_name || "",
+    ).trim();
+    return name ? humanText(name, fallback, 80) : fallback;
+  }
+
+  function followUpVisibleMatters() {
+    const query = state.followUpQuery.trim().toLowerCase();
+    return state.matters.filter((item) => {
+      const completed = Boolean(item.is_completed || item.status === "completed");
+      const statusMatches = state.followUpView === "completed" ? completed : !completed;
+      const contact = matterContactName(item);
+      const contactMatches =
+        state.followUpContact === "all" || contact === state.followUpContact;
+      const searchMatches =
+        !query ||
+        `${matterTitle(item.title)} ${contact} ${humanText(item.summary, "", 500)}`
+          .toLowerCase()
+          .includes(query);
+      return statusMatches && contactMatches && searchMatches;
+    });
+  }
+
+  function renderFollowUpList({ chooseMatter = true } = {}) {
+    const list = $("#follow-up-list");
+    if (!list) return;
+    const oldScroll = list.scrollTop;
+    const contacts = new Map();
+    state.matters.forEach((item) => {
+      const name = matterContactName(item);
+      contacts.set(name, (contacts.get(name) || 0) + 1);
+    });
+    if (
+      state.followUpContact !== "all" &&
+      !contacts.has(state.followUpContact)
+    ) {
+      state.followUpContact = "all";
+    }
+    const contactSelect = $("#follow-up-contact");
+    if (contactSelect) {
+      const options = [...contacts.entries()].sort(([left], [right]) =>
+        left.localeCompare(right, "zh-CN"),
+      );
+      contactSelect.innerHTML = `<option value="all">全部对接人（${state.matters.length}）</option>${options
+        .map(
+          ([name, count]) =>
+            `<option value="${escapeHtml(name)}">${escapeHtml(name)}（${count}）</option>`,
+        )
+        .join("")}`;
+      contactSelect.value = state.followUpContact;
+    }
+
+    const visible = followUpVisibleMatters();
+    if (
+      chooseMatter &&
+      !visible.some((item) => item.id === state.followUpMatterId)
+    ) {
+      state.followUpMatterId = visible[0]?.id || null;
+    }
+    list.innerHTML = visible.length
+      ? visible
+          .map((item) => {
+            const sources = [
+              ...new Set((item.materials || []).map((source) => sourceLabel(source.source_type))),
+            ];
+            const sourceText = sources.length ? sources.join("、") : "工作信息";
+            return `<button class="follow-up-row ${item.id === state.followUpMatterId ? "active" : ""}" type="button" data-follow-up-id="${escapeHtml(item.id)}">
+              <strong>${escapeHtml(matterTitle(item.title))}</strong>
+              <span>${escapeHtml(matterContactName(item))} · ${escapeHtml(sourceText)}</span>
+              <small>${item.target_date ? `下次复盘 ${escapeHtml(item.target_date)}` : item.is_completed ? "已完成归档" : "尚未完成"}</small>
+            </button>`;
+          })
+          .join("")
+      : `<div class="follow-up-empty"><strong>当前没有符合条件的事项</strong><span>可更换对接人或修改搜索内容。</span></div>`;
+    list.scrollTop = oldScroll;
+
+    const openCount = state.matters.filter(
+      (item) => !item.is_completed && item.status !== "completed",
+    ).length;
+    const doneCount = state.matters.length - openCount;
+    $("#follow-up-open-count").textContent = openCount;
+    $("#follow-up-done-count").textContent = doneCount;
+    const openContacts = new Set(
+      state.matters
+        .filter((item) => !item.is_completed && item.status !== "completed")
+        .map((item) => matterContactName(item)),
+    );
+    if ($("#follow-up-brief-text")) {
+      $("#follow-up-brief-text").textContent = `${openCount} 项尚未完成，涉及 ${openContacts.size} 位对接人。复盘后记录进展，完成后直接归档。`;
+    }
+    $$('[data-follow-up-view]', page()).forEach((button) =>
+      button.classList.toggle("active", button.dataset.followUpView === state.followUpView),
+    );
+
+    if (chooseMatter) {
+      if (state.followUpMatterId) selectFollowUpMatter(state.followUpMatterId);
+      else renderFollowUpMatter(null, []);
+    }
+  }
+
+  function followUpEventContent(item) {
+    const payload = item.payload || {};
+    if (item.type === "progress.note") {
+      return {
+        title: "已记录工作进展",
+        text: humanText(payload.detail || item.summary, "本次推进情况已记录。", 800),
+      };
+    }
+    if (item.type === "matter.status.updated") {
+      const completed = payload.after === "completed";
+      return {
+        title: completed ? "事项已完成" : "事项已重新打开",
+        text: completed
+          ? "Frank 已确认事项完成，推进记录已归档。"
+          : "事项已恢复为继续跟进。",
+      };
+    }
+    if (item.type === "matter.details.updated") {
+      const labels = { title: "标题", summary: "跟进内容", contact_name: "对接人" };
+      const changed = Object.keys(payload)
+        .map((key) => labels[key])
+        .filter(Boolean);
+      return {
+        title: "已修改事项信息",
+        text: changed.length ? `${changed.join("、")}已更新。` : "事项信息已更新。",
+      };
+    }
+    if (["material.received", "material.assigned", "worker.result", "job.completed"].includes(item.type)) {
+      return {
+        title: "识别为跟进事项",
+        text: humanText(item.summary, "已从原始信息中整理出需要继续跟进的事项。", 800),
+      };
+    }
+    return {
+      title: "事项有新进展",
+      text: humanText(item.summary || payload.detail || payload.note, "事项记录已更新。", 800),
+    };
+  }
+
+  function followUpTimelineHtml(events) {
+    const visible = events.filter((item) =>
+      [
+        "progress.note",
+        "matter.status.updated",
+        "matter.details.updated",
+        "material.received",
+        "material.assigned",
+        "worker.result",
+        "job.completed",
+      ].includes(item.type),
+    );
+    if (!visible.length) {
+      return `<div class="follow-up-timeline-empty">尚无推进记录。</div>`;
+    }
+    return visible
+      .slice()
+      .reverse()
+      .map((item) => {
+        const content = followUpEventContent(item);
+        return `<article class="follow-up-timeline-item">
+          <time>${escapeHtml(fmtDate(item.created_at))}</time>
+          <strong>${escapeHtml(content.title)}</strong>
+          <p>${escapeHtml(content.text)}</p>
+        </article>`;
+      })
+      .join("");
+  }
+
+  function followUpSourcesHtml(matter) {
+    const materials = Array.isArray(matter.materials) ? matter.materials : [];
+    if (!materials.length) return "";
+    const rows = materials
+      .map((item) => {
+        const note = humanText(
+          item.text_note || item.source_text || item.metadata?.transcription,
+          "",
+          500,
+        );
+        return `<article class="follow-up-source">
+          <div><strong>${escapeHtml(sourceLabel(item.source_type))}</strong><time>${escapeHtml(fmtDate(item.received_at))}</time></div>
+          <h4>${escapeHtml(materialTitle(item))}</h4>
+          ${note ? `<p>${escapeHtml(note)}</p>` : ""}
+          ${["audio", "video"].includes(item.source_type) && item.metadata?.transcription ? `<button class="button button-quiet" type="button" data-view-transcript="${escapeHtml(item.id)}" data-transcript-name="${escapeHtml(item.filename || "会议录音")}">查看原始转写</button>` : ""}
+        </article>`;
+      })
+      .join("");
+    return `<details class="follow-up-sources"><summary>查看原始信息（${materials.length}）</summary>${rows}</details>`;
+  }
+
+  function renderFollowUpMatter(matter, timeline = []) {
+    const detail = $("#follow-up-detail");
+    if (!detail) return;
+    if (!matter) {
+      detail.innerHTML = `<div class="follow-up-detail-empty"><strong>请选择一项跟进事项</strong><span>左侧可以按对接人筛选或搜索。</span></div>`;
+      return;
+    }
+    state.followUpMatter = matter;
+    state.followUpTimeline = timeline;
+    const completed = Boolean(matter.is_completed || matter.status === "completed");
+    const hasProgress = timeline.some((item) => item.type === "progress.note");
+    const currentStep = completed ? 3 : hasProgress ? 2 : 1;
+    const steps = ["识别事项", "每日复盘", "持续跟进", "完成归档"]
+      .map(
+        (label, index) =>
+          `<span class="${index < currentStep ? "passed" : index === currentStep ? "current" : ""}">${escapeHtml(label)}</span>`,
+      )
+      .join("");
+    const contact = matterContactName(matter);
+    const sourceNames = [
+      ...new Set((matter.materials || []).map((item) => sourceLabel(item.source_type))),
+    ];
+    const summary = String(matter.summary || "").trim();
+    const review = completed
+      ? `<section class="follow-up-complete-panel"><h2>事项已完成</h2><p>全部推进记录已经保留，可随时回查。</p><button class="button button-secondary" type="button" data-follow-up-reopen>重新打开事项</button></section>`
+      : `<section class="follow-up-review">
+          <h2>本次复盘</h2>
+          <div class="follow-up-question"><strong>今天与 ${escapeHtml(contact)} 复盘后，这项工作是否已经完成？</strong><span>完成后直接归档；尚未完成，只需记录本次进展和下次复盘日期。</span></div>
+          <div class="follow-up-actions"><button class="button button-secondary" type="button" data-follow-up-progress-open>记录工作进展</button><button class="button button-primary" type="button" data-follow-up-complete>事项已完成</button></div>
+          <form class="follow-up-progress-form" data-follow-up-progress hidden>
+            <label>本次工作进展<textarea name="detail" rows="4" maxlength="2000" required placeholder="例如：已与对接人复盘，资料还差一项，预计明天下午补齐。"></textarea></label>
+            <label>下次复盘日期<input name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"></label>
+            <div><button class="button button-quiet" type="button" data-follow-up-progress-cancel>取消</button><button class="button button-primary" type="submit">保存进展</button></div>
+          </form>
+        </section>`;
+    detail.innerHTML = `<article class="follow-up-sheet">
+      <header class="follow-up-heading">
+        <div><p>${completed ? "已完成归档" : "尚未完成"} · 更新于 ${escapeHtml(fmtDate(matter.updated_at))}</p><h1 contenteditable="true" spellcheck="false" data-matter-edit="title" aria-label="修改事项标题">${escapeHtml(matterTitle(matter.title))}</h1><small>点击标题可直接修改</small></div>
+        <div class="follow-up-meta"><span>对接人：<strong contenteditable="true" spellcheck="false" data-matter-edit="contact_name" aria-label="修改对接人">${escapeHtml(contact)}</strong></span><span>来源：<strong>${escapeHtml(sourceNames.join("、") || "工作信息")}</strong></span>${matter.target_date ? `<span>下次复盘：<strong>${escapeHtml(matter.target_date)}</strong></span>` : ""}</div>
+        <div class="follow-up-journey" aria-label="事项闭环过程">${steps}</div>
+      </header>
+      <div class="follow-up-body">
+        <main>
+          <section class="follow-up-summary"><div><h2>当前需要跟进的内容</h2><small>点击内容可直接修改</small></div><p class="${summary ? "" : "empty"}" contenteditable="true" data-matter-edit="summary" aria-label="修改跟进内容">${escapeHtml(summary || "点击填写当前需要跟进的内容")}</p>${followUpSourcesHtml(matter)}</section>
+          ${review}
+        </main>
+        <aside><h2>工作推进时间线</h2><div class="follow-up-timeline">${followUpTimelineHtml(timeline)}</div></aside>
+      </div>
+      <section id="transcript-panel" class="transcript-panel" hidden></section>
+    </article>`;
+    bindFollowUpMatterEvents();
+  }
+
+  function updateFollowUpMatter(updated) {
+    const index = state.matters.findIndex((item) => item.id === updated.id);
+    if (index >= 0) state.matters[index] = { ...state.matters[index], ...updated };
+    state.followUpMatter = updated;
+  }
+
+  async function refreshFollowUpMatter() {
+    const matterId = state.followUpMatterId;
+    if (!matterId) return;
+    const [matter, timeline] = await Promise.all([
+      api(`/api/matters/${encodeURIComponent(matterId)}`),
+      apiOptional(`/api/matters/${encodeURIComponent(matterId)}/timeline`, []),
+    ]);
+    if (matterId !== state.followUpMatterId) return;
+    updateFollowUpMatter(matter);
+    renderFollowUpList({ chooseMatter: false });
+    renderFollowUpMatter(matter, timeline);
+  }
+
+  async function selectFollowUpMatter(matterId) {
+    state.followUpMatterId = matterId;
+    $$("[data-follow-up-id]", page()).forEach((item) =>
+      item.classList.toggle("active", item.dataset.followUpId === matterId),
+    );
+    const detail = $("#follow-up-detail");
+    if (detail) detail.innerHTML = `<div class="loading-view compact"><span></span><strong>正在打开事项</strong></div>`;
+    try {
+      await refreshFollowUpMatter();
+    } catch (error) {
+      if (detail && matterId === state.followUpMatterId) {
+        detail.innerHTML = `<div class="error-panel"><strong>事项暂时打不开</strong><p>${escapeHtml(friendlyError(error))}</p></div>`;
+      }
+    }
+  }
+
+  async function saveFollowUpInline(editable) {
+    const field = editable.dataset.matterEdit;
+    const labels = { title: "事项标题", summary: "跟进内容", contact_name: "对接人" };
+    const before = editable.dataset.before || "";
+    let value = editable.textContent.trim();
+    if (editable.classList.contains("empty") && value === "点击填写当前需要跟进的内容") value = "";
+    if (field === "title" && !value) {
+      editable.textContent = before;
+      toast("事项标题不能为空");
+      return;
+    }
+    if (value === before) return;
+    editable.contentEditable = "false";
+    try {
+      const updated = await api(
+        `/api/matters/${encodeURIComponent(state.followUpMatterId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [field]: value }),
+        },
+      );
+      if (field === "contact_name" && state.followUpContact === before) {
+        state.followUpContact = value || "all";
+      }
+      updateFollowUpMatter(updated);
+      const timeline = await apiOptional(
+        `/api/matters/${encodeURIComponent(updated.id)}/timeline`,
+        [],
+      );
+      renderFollowUpList({ chooseMatter: false });
+      renderFollowUpMatter(updated, timeline);
+      toast(`${labels[field]}已保存`);
+    } catch (error) {
+      editable.contentEditable = "true";
+      editable.textContent = before || (field === "contact_name" ? "未指定" : "");
+      toast(friendlyError(error, `${labels[field]}保存失败`));
+    }
+  }
+
+  function bindFollowUpMatterEvents() {
+    const detail = $("#follow-up-detail");
+    if (!detail) return;
+    $$('[data-matter-edit]', detail).forEach((editable) => {
+      editable.addEventListener("focus", () => {
+        const field = editable.dataset.matterEdit;
+        editable.dataset.before =
+          field === "contact_name"
+            ? matterContactName(state.followUpMatter, "")
+            : String(state.followUpMatter?.[field] || "").trim();
+        if (
+          editable.classList.contains("empty") ||
+          (field === "contact_name" && !editable.dataset.before)
+        ) {
+          editable.textContent = "";
+        }
+      });
+      editable.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          editable.textContent = editable.dataset.before || "";
+          editable.blur();
+        }
+        if (event.key === "Enter" && editable.dataset.matterEdit !== "summary") {
+          event.preventDefault();
+          editable.blur();
+        }
+      });
+      editable.addEventListener("blur", () => saveFollowUpInline(editable));
+    });
+    $("[data-follow-up-progress-open]", detail)?.addEventListener("click", () => {
+      const form = $("[data-follow-up-progress]", detail);
+      form.hidden = false;
+      form.elements.detail.focus();
+    });
+    $("[data-follow-up-progress-cancel]", detail)?.addEventListener("click", () => {
+      $("[data-follow-up-progress]", detail).hidden = true;
+    });
+    $("[data-follow-up-progress]", detail)?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const progress = form.elements.detail.value.trim();
+      if (!progress) return;
+      const submit = form.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}/progress`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ summary: progress.slice(0, 200), detail: progress }),
+        });
+        const targetDate = form.elements.target_date.value;
+        if (targetDate !== (state.followUpMatter?.target_date || "")) {
+          await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_date: targetDate || null }),
+          });
+        }
+        await refreshFollowUpMatter();
+        toast("本次工作进展已保存");
+      } catch (error) {
+        toast(friendlyError(error, "工作进展保存失败"));
+        submit.disabled = false;
+      }
+    });
+    $("[data-follow-up-complete]", detail)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const updated = await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "completed" }),
+        });
+        updateFollowUpMatter(updated);
+        state.followUpView = "completed";
+        renderFollowUpList({ chooseMatter: false });
+        await refreshFollowUpMatter();
+        toast("事项已完成并归档");
+      } catch (error) {
+        button.disabled = false;
+        toast(friendlyError(error, "事项完成失败"));
+      }
+    });
+    $("[data-follow-up-reopen]", detail)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const updated = await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "active" }),
+        });
+        updateFollowUpMatter(updated);
+        state.followUpView = "open";
+        renderFollowUpList({ chooseMatter: false });
+        await refreshFollowUpMatter();
+        toast("事项已重新打开");
+      } catch (error) {
+        button.disabled = false;
+        toast(friendlyError(error, "事项重新打开失败"));
+      }
+    });
+    $$('[data-view-transcript]', detail).forEach((button) =>
+      button.addEventListener("click", () =>
+        viewTranscript(button.dataset.viewTranscript, button.dataset.transcriptName),
+      ),
+    );
+  }
+
+  async function renderFollowUpDesk(items, preferredId = null) {
+    state.matters = Array.isArray(items) ? items : [];
+    if (preferredId) {
+      const preferred = state.matters.find((item) => item.id === preferredId);
+      if (preferred) {
+        state.followUpMatterId = preferred.id;
+        state.followUpView = preferred.is_completed || preferred.status === "completed" ? "completed" : "open";
+        state.followUpContact = "all";
+      }
+    }
+    const openItems = state.matters.filter(
+      (item) => !item.is_completed && item.status !== "completed",
+    );
+    const contacts = new Set(openItems.map((item) => matterContactName(item)));
+    page().innerHTML = `<section class="follow-up-desk">
+      <aside class="follow-up-sidebar">
+        <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待复盘 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
+        <div id="follow-up-list" class="follow-up-list"></div>
+      </aside>
+      <section class="follow-up-workspace"><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。复盘后记录进展，完成后直接归档。</span></div><div id="follow-up-detail"></div></section>
+    </section>`;
+    $("#follow-up-search")?.addEventListener("input", (event) => {
+      state.followUpQuery = event.target.value;
+      renderFollowUpList();
+    });
+    $("#follow-up-contact")?.addEventListener("change", (event) => {
+      state.followUpContact = event.target.value;
+      renderFollowUpList();
+    });
+    $$('[data-follow-up-view]', page()).forEach((button) =>
+      button.addEventListener("click", () => {
+        state.followUpView = button.dataset.followUpView;
+        $$('[data-follow-up-view]', page()).forEach((item) =>
+          item.classList.toggle("active", item === button),
+        );
+        renderFollowUpList();
+      }),
+    );
+    $("#follow-up-list")?.addEventListener("click", (event) => {
+      const row = event.target.closest("[data-follow-up-id]");
+      if (row) selectFollowUpMatter(row.dataset.followUpId);
+    });
+    const visible = followUpVisibleMatters();
+    const initial =
+      visible.find((item) => item.id === state.followUpMatterId) || visible[0] || null;
+    state.followUpMatterId = initial?.id || null;
+    renderFollowUpList({ chooseMatter: false });
+    if (initial) await selectFollowUpMatter(initial.id);
+    else renderFollowUpMatter(null, []);
   }
 
   function renderMatters(items, people = [], actionGroups = {}) {
@@ -2893,7 +3350,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-    navigator.serviceWorker.register("/sw.js?v=51").catch(() => {});
+      navigator.serviceWorker.register("/sw.js?v=54").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;

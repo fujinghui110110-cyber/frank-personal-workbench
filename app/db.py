@@ -740,6 +740,10 @@ class Database:
                 connection.execute(
                     "ALTER TABLE matters ADD COLUMN status_override INTEGER NOT NULL DEFAULT 0"
                 )
+            if "contact_person_id" not in matter_columns:
+                connection.execute(
+                    "ALTER TABLE matters ADD COLUMN contact_person_id TEXT REFERENCES people(id)"
+                )
             action_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(actions)")
             }

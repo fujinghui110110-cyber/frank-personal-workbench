@@ -772,6 +772,42 @@ def test_matter_target_date_and_progress_are_recorded_in_timeline(
     )
 
 
+def test_matter_text_and_dynamic_contact_can_be_edited_without_changing_sources(
+    client: TestClient,
+) -> None:
+    login(client)
+    matter = complete_material(
+        client,
+        key="matter-editable-contact",
+        title="AI 生成的标题",
+        note="王经理反馈合同资料仍需补充。",
+    )
+    before = client.get(f"/api/matters/{matter['id']}").json()
+
+    changed = client.patch(
+        f"/api/matters/{matter['id']}",
+        json={
+            "title": "合同资料补充跟进",
+            "summary": "与赵楠复盘合同资料补充情况，未完成时继续记录进展。",
+            "contact_name": "赵楠",
+        },
+    )
+
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["title"] == "合同资料补充跟进"
+    assert changed.json()["summary"].startswith("与赵楠复盘")
+    assert changed.json()["contact_name"] == "赵楠"
+    assert changed.json()["materials"] == before["materials"]
+
+    people = client.get("/api/people").json()
+    assert sum(item["display_name"] == "赵楠" for item in people) == 1
+    listed = client.get("/api/matters?limit=100").json()
+    assert next(item for item in listed if item["id"] == matter["id"])["contact_name"] == "赵楠"
+    timeline = client.get(f"/api/matters/{matter['id']}/timeline").json()
+    edit_event = next(item for item in timeline if item["type"] == "matter.details.updated")
+    assert edit_event["payload"]["contact_name"]["after"] == "赵楠"
+
+
 def test_manual_matter_status_closes_children_and_can_reopen(client: TestClient) -> None:
     login(client)
     matter = complete_material(
