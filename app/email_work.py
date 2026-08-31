@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .assignees import prefill_matter_contact
 from .db import Database, utc_now
 
 
@@ -507,6 +508,9 @@ class EmailWorkService:
                             now,
                         ),
                     )
+            if work and matter_id:
+                prefill_matter_contact(connection, matter_id, actions, now)
+
             if message.get("material_id"):
                 if status == "ignored":
                     connection.execute(

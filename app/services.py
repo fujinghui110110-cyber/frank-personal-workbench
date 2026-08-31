@@ -13,7 +13,12 @@ from uuid import uuid4
 
 from fastapi import UploadFile
 
-from .assignees import PEOPLE_SEED, normalize_suggestions, upsert_action_suggestions
+from .assignees import (
+    PEOPLE_SEED,
+    normalize_suggestions,
+    prefill_matter_contact,
+    upsert_action_suggestions,
+)
 from .config import Settings
 from .db import Database, utc_now
 
@@ -1358,6 +1363,8 @@ class WorkbenchService:
                             now,
                         ),
                     )
+            prefill_matter_contact(connection, matter_id, actions, now)
+
             for suggestion in result.get("completion_suggestions") or []:
                 if not isinstance(suggestion, dict):
                     continue

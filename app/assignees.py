@@ -4,6 +4,7 @@ import json
 import re
 from sqlite3 import Connection
 from typing import Any
+from uuid import uuid4
 
 
 PEOPLE_SEED = [
@@ -239,3 +240,78 @@ def upsert_action_suggestions(
         )
         created += 1
     return created
+
+
+def prefill_matter_contact(
+    connection: Connection,
+    matter_id: str,
+    actions: list[dict[str, Any]],
+    now: str,
+) -> str | None:
+    current = connection.execute(
+        "SELECT contact_person_id FROM matters WHERE id = ?", (matter_id,)
+    ).fetchone()
+    if not current or current["contact_person_id"]:
+        return None
+
+    candidates: list[tuple[float, str, str | None]] = []
+    ignored_names = {"", "待明确", "负责人", "财务负责人", "对接人", "我自己"}
+    for action in actions:
+        suggestions = action.get("assignee_suggestions")
+        if not isinstance(suggestions, list):
+            continue
+        for suggestion in suggestions:
+            if not isinstance(suggestion, dict):
+                continue
+            try:
+                confidence = float(suggestion.get("confidence") or 0)
+            except (TypeError, ValueError):
+                continue
+            if confidence < 0.75 or not suggestion.get("evidence"):
+                continue
+            match = resolve_person_alias(
+                str(
+                    suggestion.get("person")
+                    or suggestion.get("name")
+                    or suggestion.get("detected_alias")
+                    or ""
+                )
+            )
+            name = str(
+                (match or {}).get("display_name")
+                or suggestion.get("person")
+                or suggestion.get("name")
+                or suggestion.get("detected_alias")
+                or ""
+            ).strip()[:80]
+            if name in ignored_names:
+                continue
+            candidates.append((confidence, name, (match or {}).get("person_id")))
+    if not candidates:
+        return None
+
+    _, name, person_id = max(candidates, key=lambda item: item[0])
+    if not person_id:
+        existing = connection.execute(
+            "SELECT id FROM people WHERE display_name = ? AND enabled = 1", (name,)
+        ).fetchone()
+        person_id = existing["id"] if existing else f"person_{uuid4().hex}"
+    if not connection.execute("SELECT 1 FROM people WHERE id = ?", (person_id,)).fetchone():
+        connection.execute(
+            "INSERT INTO people "
+            "(id, display_name, role, aliases_json, phonetic_aliases_json, is_self, "
+            "enabled, created_at, updated_at) VALUES (?, ?, '', ?, '[]', 0, 1, ?, ?)",
+            (
+                person_id,
+                name,
+                json.dumps([name], ensure_ascii=False, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
+    updated = connection.execute(
+        "UPDATE matters SET contact_person_id = ?, updated_at = ? "
+        "WHERE id = ? AND contact_person_id IS NULL",
+        (person_id, now, matter_id),
+    )
+    return name if updated.rowcount else None

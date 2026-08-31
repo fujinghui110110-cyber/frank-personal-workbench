@@ -219,6 +219,59 @@ def test_pending_email_waits_for_manual_analysis_and_creates_work(client: TestCl
     assert client.get("/api/analysis/status").json()["pending"] == 0
 
 
+def test_email_ai_prefills_dynamic_contact(client: TestClient) -> None:
+    owner_login(client)
+    client.post("/api/email/accounts/register", json=ACCOUNT, headers=worker_headers())
+    pending = client.post(
+        "/api/email/messages",
+        json=pending_message(88),
+        headers=worker_headers(),
+    ).json()
+    client.post("/api/analysis/run")
+    job = claim_email_analysis(client)
+    lease = {"worker_id": "mac-air", "lease_token": job["lease_token"]}
+    client.post(
+        f"/api/jobs/{job['id']}/start",
+        json=lease,
+        headers=worker_headers(),
+    )
+    completed = client.post(
+        f"/api/email/jobs/{job['id']}/complete",
+        json={
+            **lease,
+            "message_id": pending["id"],
+            "result": {
+                "classification": "work",
+                "needs_follow_up": True,
+                "summary": "预算差异需要复核并反馈",
+                "reason": "邮件明确安排了跟进人",
+                "evidence": ["请赵楠复核预算差异并反馈"],
+                "matter_title": "预算差异复核",
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "复核预算差异并反馈",
+                        "detail": "由赵楠负责复核",
+                        "assignee_suggestions": [
+                            {
+                                "person": "赵楠",
+                                "detected_alias": "赵楠",
+                                "reason": "邮件明确安排赵楠负责",
+                                "evidence": ["请赵楠复核预算差异并反馈"],
+                                "confidence": 0.95,
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert completed.status_code == 200, completed.text
+    matter = client.get(f"/api/matters/{completed.json()['matter_id']}").json()
+    assert matter["contact_name"] == "赵楠"
+
+
 def test_irrelevant_email_analysis_erases_content_and_attachment(
     client: TestClient, tmp_path: Path
 ) -> None:

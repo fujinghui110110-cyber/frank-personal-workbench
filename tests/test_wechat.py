@@ -1139,6 +1139,112 @@ def test_duplicate_channel_intake_is_not_offered_as_undoable(client: TestClient)
     ) == {"total": 1}
 
 
+def test_ai_prefills_dynamic_contact_and_manual_edit_remains_available(
+    client: TestClient,
+) -> None:
+    login(client)
+    now = int(datetime.now(UTC).timestamp())
+    created = client.post(
+        "/api/wechat/windows",
+        json=window_payload(
+            [message(901, now, "请赵楠继续跟进采购预算复核并反馈")],
+            session_id="contact-prefill",
+        ),
+        headers=worker_headers(),
+    ).json()
+    _complete_next_wechat_job(
+        client,
+        {
+            "classification": "relevant",
+            "summary": "采购预算需要继续复核并反馈",
+            "confidence": 0.96,
+            "evidence": ["请赵楠继续跟进采购预算复核并反馈"],
+            "extracted": {
+                "matter_title": "采购预算复核",
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "继续复核采购预算并反馈",
+                        "detail": "由赵楠继续核对预算差异",
+                        "assignee_suggestions": [
+                            {
+                                "person": "赵楠",
+                                "detected_alias": "赵楠",
+                                "reason": "原文明确要求赵楠继续跟进",
+                                "evidence": ["请赵楠继续跟进采购预算复核并反馈"],
+                                "confidence": 0.96,
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+    )
+    accepted = client.post(
+        f"/api/wechat/candidates/{created['candidate_id']}/resolve",
+        json={"action": "accept"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    matter_id = accepted.json()["matter_id"]
+    matter = client.get(f"/api/matters/{matter_id}").json()
+    assert matter["contact_name"] == "赵楠"
+    assert any(item["display_name"] == "赵楠" for item in client.get("/api/people").json())
+
+    edited = client.patch(
+        f"/api/matters/{matter_id}",
+        json={"contact_name": "李静"},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["contact_name"] == "李静"
+
+    later = client.post(
+        "/api/wechat/windows",
+        json=window_payload(
+            [message(902, now + 60, "采购预算复核继续推进")],
+            session_id="contact-prefill-later",
+        ),
+        headers=worker_headers(),
+    ).json()
+    _complete_next_wechat_job(
+        client,
+        {
+            "classification": "relevant",
+            "summary": "采购预算复核继续推进",
+            "confidence": 0.97,
+            "evidence": ["采购预算复核继续推进"],
+            "extracted": {
+                "matter_title": "采购预算复核",
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "继续推进采购预算复核",
+                        "assignee_suggestions": [
+                            {
+                                "person": "王强",
+                                "detected_alias": "王强",
+                                "reason": "后续信息中的建议",
+                                "evidence": ["采购预算复核继续推进"],
+                                "confidence": 0.97,
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+    )
+    reconciled = client.post("/api/analysis/reconcile")
+    assert reconciled.status_code == 200, reconciled.text
+    merged = next(
+        item
+        for item in client.get(
+            "/api/wechat/candidates?candidate_status=accepted&limit=20"
+        ).json()
+        if item["id"] == later["candidate_id"]
+    )
+    assert merged["matter_id"] == matter_id
+    assert client.get(f"/api/matters/{matter_id}").json()["contact_name"] == "李静"
+
+
 def test_wechat_user_actions_are_audited(client: TestClient) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())

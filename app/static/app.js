@@ -1560,7 +1560,7 @@ function renderEmail(status, messages, matters) {
       : renderPolicyRows([], "近期没有规定变化");
 
     page().innerHTML = `<section class="policy-page">
-      <header class="policy-command"><div><p>公司规定</p><h2>零散要求，整理成一份持续有效的执行口径。</h2><span>只分析已监听聊天和已配置邮箱，重要变化确认后才会改写现行规定。</span></div><button class="button button-secondary" type="button" data-policy-sync>重试同步</button></header>
+      <header class="policy-command"><div><p>公司规定</p><h2>零散要求，整理成一份持续有效的执行口径。</h2><span>贾维斯先识别变化，你确认后才整理到 Obsidian；原始规定和历史版本都会保留。</span></div><button class="button button-secondary" type="button" data-policy-sync>重试同步</button></header>
       <section class="policy-summary"><article><span>待我确认</span><strong>${pending.length}</strong><small>新增、修订、废止或重要解释</small></article><article><span>当前有效</span><strong>${activePolicies.length}</strong><small>已写入 Obsidian 的执行口径</small></article><article><span>今日新增</span><strong>${Number(status?.counts?.added || 0)}</strong><small>今天确认的新规定</small></article><article><span>今日修订</span><strong>${Number(status?.counts?.revised || 0)}</strong><small>今天确认的变更</small></article></section>
       <section class="policy-vault-card ${obsidian.status === "failed" ? "is-failed" : ""}"><div><span>Obsidian 保存位置</span><h3>${escapeHtml(syncText)}</h3><code>${escapeHtml(obsidian.path || "尚未配置")}</code></div><aside><strong>${written}</strong><small>最近更新文件</small><button class="button button-quiet" type="button" data-copy-path data-copy-path="${escapeHtml(obsidian.path || "")}">复制位置</button></aside></section>
       <nav class="wechat-tabs policy-tabs" aria-label="公司规定分类"><button class="active" aria-selected="true" data-policy-tab="pending">待我确认 <span>${pending.length}</span></button><button aria-selected="false" data-policy-tab="active">当前有效 <span>${activePolicies.length}</span></button><button aria-selected="false" data-policy-tab="recent">最近变更 <span>${recent.length}</span></button><button aria-selected="false" data-policy-tab="repealed">已废止 <span>${repealedPolicies.length}</span></button></nav>
@@ -1727,7 +1727,7 @@ function renderEmail(status, messages, matters) {
         .map((item) => matterContactName(item)),
     );
     if ($("#follow-up-brief-text")) {
-      $("#follow-up-brief-text").textContent = `${openCount} 项尚未完成，涉及 ${openContacts.size} 位对接人。复盘后记录进展，完成后直接归档。`;
+      $("#follow-up-brief-text").textContent = `${openCount} 项尚未完成，涉及 ${openContacts.size} 位对接人。新信息会先与未完成事项比对，同一事项会自动归并。`;
     }
     $$('[data-follow-up-view]', page()).forEach((button) =>
       button.classList.toggle("active", button.dataset.followUpView === state.followUpView),
@@ -1866,7 +1866,7 @@ function renderEmail(status, messages, matters) {
     detail.innerHTML = `<article class="follow-up-sheet">
       <header class="follow-up-heading">
         <div><p>${completed ? "已完成归档" : "尚未完成"} · 更新于 ${escapeHtml(fmtDate(matter.updated_at))}</p><h1 contenteditable="true" spellcheck="false" data-matter-edit="title" aria-label="修改事项标题">${escapeHtml(matterTitle(matter.title))}</h1><small>点击标题可直接修改</small></div>
-        <div class="follow-up-meta"><span>对接人：<strong contenteditable="true" spellcheck="false" data-matter-edit="contact_name" aria-label="修改对接人">${escapeHtml(contact)}</strong></span><span>来源：<strong>${escapeHtml(sourceNames.join("、") || "工作信息")}</strong></span>${matter.target_date ? `<span>下次复盘：<strong>${escapeHtml(matter.target_date)}</strong></span>` : ""}</div>
+        <div class="follow-up-meta"><span>对接人（可直接修改）：<strong contenteditable="true" spellcheck="false" data-matter-edit="contact_name" aria-label="修改对接人">${escapeHtml(contact)}</strong></span><span>来源：<strong>${escapeHtml(sourceNames.join("、") || "工作信息")}</strong></span>${matter.target_date ? `<span>下次复盘：<strong>${escapeHtml(matter.target_date)}</strong></span>` : ""}</div>
         <div class="follow-up-journey" aria-label="事项闭环过程">${steps}</div>
       </header>
       <div class="follow-up-body">
@@ -2085,7 +2085,7 @@ function renderEmail(status, messages, matters) {
         <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待复盘 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
         <div id="follow-up-list" class="follow-up-list"></div>
       </aside>
-      <section class="follow-up-workspace"><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。复盘后记录进展，完成后直接归档。</span></div><div id="follow-up-detail"></div></section>
+      <section class="follow-up-workspace"><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。新信息会先与未完成事项比对，同一事项会自动归并。</span></div><div id="follow-up-detail"></div></section>
     </section>`;
     $("#follow-up-search")?.addEventListener("input", (event) => {
       state.followUpQuery = event.target.value;
@@ -3350,7 +3350,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-      navigator.serviceWorker.register("/sw.js?v=54").catch(() => {});
+      navigator.serviceWorker.register("/sw.js?v=55").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;

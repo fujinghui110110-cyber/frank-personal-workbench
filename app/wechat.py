@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from .assignees import normalize_suggestions, resolve_person_alias, upsert_action_suggestions
+from .assignees import (
+    normalize_suggestions,
+    prefill_matter_contact,
+    resolve_person_alias,
+    upsert_action_suggestions,
+)
 from .db import Database, utc_now
 
 
@@ -1408,6 +1413,17 @@ class WechatService:
                         normalize_suggestions(item),
                         now,
                     )
+
+                prefill_matter_contact(
+                    connection,
+                    matter_id,
+                    [
+                        item
+                        for item in (extracted.get("actions") or [])[:20]
+                        if isinstance(item, dict)
+                    ],
+                    now,
+                )
 
         self.database.audit(
             _id("audit"),

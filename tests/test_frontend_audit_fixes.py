@@ -4,6 +4,16 @@ from pathlib import Path
 STATIC = Path(__file__).parents[1] / "app" / "static"
 
 
+def test_simple_workbench_keeps_policy_entry_and_explains_auto_merge() -> None:
+    index = (STATIC / "index.html").read_text(encoding="utf-8")
+    desktop_nav = index.split('id="desktop-nav"', 1)[1].split("</nav>", 1)[0]
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert 'href="#/policies"' in desktop_nav
+    assert "公司规定" in desktop_nav
+    assert "同一事项会自动归并" in script
+
+
 def test_assistant_copy_matches_manual_analysis_contract() -> None:
     script = (STATIC / "app.js").read_text(encoding="utf-8")
 
