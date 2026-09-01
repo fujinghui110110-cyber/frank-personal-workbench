@@ -24,7 +24,10 @@ from scripts.personal_wechat_crypto import (
     snapshot_dataset,
 )
 import scripts.personal_wechat_sync as personal_wechat_sync
-from scripts.compare_personal_wechat_readers import comparison_summary
+from scripts.compare_personal_wechat_readers import (
+    comparison_summary,
+    update_window_state,
+)
 from scripts.personal_wechat_sync import (
     _decode_dat,
     _decode_wxgf,
@@ -446,6 +449,46 @@ def test_parallel_comparison_reports_only_counts() -> None:
         {"session_id": "bob", "id": "1", "timestamp_ms": 1000, "kind": "1"}
     ]
     assert comparison_summary(direct, other_session)["consistent"] is False
+
+
+def test_parity_windows_only_count_distinct_matching_additions() -> None:
+    first = [{"session_id": "a", "id": "1", "timestamp_ms": 1, "kind": "text"}]
+    second = first + [
+        {"session_id": "a", "id": "2", "timestamp_ms": 2, "kind": "text"}
+    ]
+    third = second + [
+        {"session_id": "a", "id": "3", "timestamp_ms": 3, "kind": "image"}
+    ]
+    fourth = third + [
+        {"session_id": "a", "id": "4", "timestamp_ms": 4, "kind": "voice"}
+    ]
+
+    state, baseline = update_window_state({}, first, first, checked_at="t0")
+    state, waiting = update_window_state(state, first, first, checked_at="t1")
+    state, window_one = update_window_state(state, second, second, checked_at="t2")
+    state, window_two = update_window_state(state, third, third, checked_at="t3")
+    state, passed = update_window_state(state, fourth, fourth, checked_at="t4")
+
+    assert baseline["status"] == "baseline"
+    assert waiting["status"] == "waiting"
+    assert window_one["passed_windows"] == 1
+    assert window_two["passed_windows"] == 2
+    assert passed["status"] == "passed"
+    assert passed["passed_windows"] == 3
+
+
+def test_parity_window_rejects_mismatched_additions() -> None:
+    first = [{"session_id": "a", "id": "1", "timestamp_ms": 1, "kind": "text"}]
+    state, _ = update_window_state({}, first, first, checked_at="t0")
+    direct = first + [
+        {"session_id": "a", "id": "2", "timestamp_ms": 2, "kind": "text"}
+    ]
+
+    state, result = update_window_state(state, direct, first, checked_at="t1")
+
+    assert result["status"] == "mismatch"
+    assert result["passed_windows"] == 0
+    assert state["failed_windows"] == 1
 
 
 def test_sqlcipher_decryption_rejects_wrong_key(tmp_path: Path) -> None:

@@ -350,6 +350,10 @@ def _message_kind(raw_type: Any, content: str, path: str) -> str:
         return "voice"
     if value in {43, 62}:
         return "video"
+    if value == 47:
+        return "emoji"
+    if value == 50:
+        return "voip"
     if value == 49:
         lowered = f"{content} {path}".lower()
         if any(
@@ -358,6 +362,8 @@ def _message_kind(raw_type: Any, content: str, path: str) -> str:
         ):
             return "file"
         return "link" if "<url>" in lowered else "quote"
+    if value in {10000, 10002}:
+        return "system"
     return "text" if content.strip() else "other"
 
 
