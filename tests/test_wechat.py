@@ -13,7 +13,11 @@ from app.config import Settings
 from app.main import create_app
 from app.wechat import _merged_summary, _public_candidate, review_worthy_wechat_result
 from scripts import wechat_sync
-from scripts.wechat_sync import _is_missing_session, group_messages
+from scripts.wechat_sync import (
+    _is_missing_session,
+    group_messages,
+    run_personal_wechat_sync,
+)
 
 
 @pytest.fixture
@@ -44,6 +48,31 @@ def worker_headers() -> dict[str, str]:
 def test_only_missing_ciphertalk_sessions_are_skipped() -> None:
     assert _is_missing_session(RuntimeError("Session not found."))
     assert not _is_missing_session(RuntimeError("CipherTalk 尚未准备好"))
+
+
+def test_personal_wechat_reader_switch_keeps_ciphertalk_as_default(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.delenv("PERSONAL_WECHAT_READER", raising=False)
+    monkeypatch.setattr(
+        "scripts.wechat_sync.run_ciphertalk_sync",
+        lambda _client, mode: calls.append(("ciphertalk", mode)) or {"messages": 0},
+    )
+    assert run_personal_wechat_sync(object(), "incremental") == {"messages": 0}
+    assert calls == [("ciphertalk", "incremental")]
+
+
+def test_personal_wechat_reader_switch_uses_direct_only_when_enabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PERSONAL_WECHAT_READER", "direct")
+    monkeypatch.setattr(
+        "scripts.personal_wechat_sync.run_direct_wechat_sync",
+        lambda _client, mode: {"messages": 2, "mode": mode},
+    )
+    assert run_personal_wechat_sync(object(), "rescan") == {
+        "messages": 2,
+        "mode": "rescan",
+    }
 
 
 def message(local_id: int, timestamp: int, text: str = "请跟进合同付款") -> dict:
@@ -78,13 +107,17 @@ def test_message_windows_split_on_silence_and_limit() -> None:
 
 
 def test_merged_candidate_summary_stays_readable() -> None:
-    summary = _merged_summary("；".join(f"第{index}条需要持续跟进的业务线索" for index in range(30)))
+    summary = _merged_summary(
+        "；".join(f"第{index}条需要持续跟进的业务线索" for index in range(30))
+    )
 
     assert len(summary) <= 280
     assert "另有" in summary
 
 
-def test_waiting_business_status_is_localized_without_rewriting_storage_status() -> None:
+def test_waiting_business_status_is_localized_without_rewriting_storage_status() -> (
+    None
+):
     candidate = _public_candidate(
         {
             "status": "processing",
@@ -150,7 +183,9 @@ def _complete_next_wechat_job(client: TestClient, result: dict) -> dict:
         "/api/jobs/claim", json={"worker_id": "merge-test"}, headers=worker_headers()
     ).json()["job"]
     lease = {"worker_id": "merge-test", "lease_token": claimed["lease_token"]}
-    client.post(f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers())
+    client.post(
+        f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers()
+    )
     response = client.post(
         f"/api/wechat/jobs/{claimed['id']}/complete",
         json={**lease, "result": result},
@@ -210,7 +245,9 @@ def test_same_conversation_keeps_one_pending_confirmation_and_all_evidence(
         )
         _complete_next_wechat_job(client, result)
 
-    assert len(client.get("/api/wechat/candidates?candidate_status=pending").json()) == 2
+    assert (
+        len(client.get("/api/wechat/candidates?candidate_status=pending").json()) == 2
+    )
     reconciled = client.post("/api/analysis/reconcile")
     assert reconciled.status_code == 200, reconciled.text
     pending = client.get("/api/wechat/candidates?candidate_status=pending").json()
@@ -345,7 +382,9 @@ def test_high_confidence_new_chat_continues_one_open_matter_with_audit(
     continued = client.get(
         "/api/wechat/candidates?candidate_status=accepted&limit=20"
     ).json()
-    new_candidate = next(item for item in continued if item["id"] == second["candidate_id"])
+    new_candidate = next(
+        item for item in continued if item["id"] == second["candidate_id"]
+    )
     assert new_candidate["matter_id"] == matter_id
     assert new_candidate["status_label"] == "已纳入事项"
     audit = client.get("/api/audit?limit=100").json()
@@ -356,7 +395,9 @@ def test_high_confidence_new_chat_continues_one_open_matter_with_audit(
     )
 
 
-def test_batch_reconcile_can_continue_a_non_chat_open_matter(client: TestClient) -> None:
+def test_batch_reconcile_can_continue_a_non_chat_open_matter(
+    client: TestClient,
+) -> None:
     login(client)
     now = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     with client.app.state.database.connect() as connection:
@@ -401,7 +442,9 @@ def test_batch_reconcile_can_continue_a_non_chat_open_matter(client: TestClient)
     assert candidate["matter_id"] == "matter-existing"
 
 
-def test_low_confidence_or_conflicting_new_chat_stays_pending(client: TestClient) -> None:
+def test_low_confidence_or_conflicting_new_chat_stays_pending(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     created = client.post(
@@ -433,12 +476,16 @@ def test_low_confidence_or_conflicting_new_chat_stays_pending(client: TestClient
     assert candidate["status_label"] == "待确认"
 
 
-def test_existing_low_value_pending_candidate_is_auto_ignored(client: TestClient) -> None:
+def test_existing_low_value_pending_candidate_is_auto_ignored(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     created = client.post(
         "/api/wechat/windows",
-        json=window_payload([message(201, now, "别打卡"), message(202, now + 1, "好的")]),
+        json=window_payload(
+            [message(201, now, "别打卡"), message(202, now + 1, "好的")]
+        ),
         headers=worker_headers(),
     ).json()
     _complete_next_wechat_job(
@@ -650,7 +697,9 @@ def test_wechat_window_accepts_the_sync_window_limit(client: TestClient) -> None
     now = int(datetime.now(UTC).timestamp())
     payload = window_payload([message(index, now + index) for index in range(1, 201)])
 
-    response = client.post("/api/wechat/windows", json=payload, headers=worker_headers())
+    response = client.post(
+        "/api/wechat/windows", json=payload, headers=worker_headers()
+    )
 
     assert response.status_code == 200, response.text
 
@@ -662,11 +711,20 @@ def test_wechat_ingest_is_idempotent_and_validates_cursor(client: TestClient) ->
     first = client.post("/api/wechat/windows", json=payload, headers=worker_headers())
     assert first.status_code == 200, first.text
     assert first.json()["created"] is True
-    duplicate = client.post("/api/wechat/windows", json=payload, headers=worker_headers())
+    duplicate = client.post(
+        "/api/wechat/windows", json=payload, headers=worker_headers()
+    )
     assert duplicate.status_code == 200
     assert duplicate.json()["created"] is False
-    bad = payload | {"messages": [{"timestamp": now, "direction": "in", "kind": "text"}]}
-    assert client.post("/api/wechat/windows", json=bad, headers=worker_headers()).status_code == 422
+    bad = payload | {
+        "messages": [{"timestamp": now, "direction": "in", "kind": "text"}]
+    }
+    assert (
+        client.post(
+            "/api/wechat/windows", json=bad, headers=worker_headers()
+        ).status_code
+        == 422
+    )
 
 
 def test_conversations_list_active_by_latest_then_blocked(client: TestClient) -> None:
@@ -679,12 +737,16 @@ def test_conversations_list_active_by_latest_then_blocked(client: TestClient) ->
     ):
         response = client.post(
             "/api/wechat/windows",
-            json=window_payload([message(offset, base + offset)], session_id=session_id),
+            json=window_payload(
+                [message(offset, base + offset)], session_id=session_id
+            ),
             headers=worker_headers(),
         )
         assert response.status_code == 200, response.text
 
-    assert client.post("/api/wechat/conversations/blocked-newest/block").status_code == 200
+    assert (
+        client.post("/api/wechat/conversations/blocked-newest/block").status_code == 200
+    )
     conversations = client.get("/api/wechat/conversations").json()
 
     assert [item["session_id"] for item in conversations] == [
@@ -694,7 +756,9 @@ def test_conversations_list_active_by_latest_then_blocked(client: TestClient) ->
     ]
 
 
-def test_technical_session_id_is_not_shown_as_conversation_name(client: TestClient) -> None:
+def test_technical_session_id_is_not_shown_as_conversation_name(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     payload = window_payload([message(70, now)], session_id="52280232047@chatroom")
@@ -734,7 +798,9 @@ def test_chat_export_only_returns_listening_conversations(client: TestClient) ->
     assert "text_note" in rows[0]
 
 
-def test_sender_display_name_is_used_and_repairs_existing_candidate(client: TestClient) -> None:
+def test_sender_display_name_is_used_and_repairs_existing_candidate(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     old_message = message(801, now, "请 Hank 跟进合同付款")
@@ -839,7 +905,9 @@ def test_same_matter_is_merged_across_conversations(client: TestClient) -> None:
     assert len(client.get("/api/matters?limit=500").json()) == 1
 
 
-def test_accepted_follow_up_reuses_only_open_same_topic_matter(client: TestClient) -> None:
+def test_accepted_follow_up_reuses_only_open_same_topic_matter(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
 
@@ -942,7 +1010,9 @@ def test_export_status_is_reported_in_wechat_status(client: TestClient) -> None:
     assert export["output_paths"][0].endswith("微信数据")
 
 
-def test_block_conversation_ignores_candidates_and_is_idempotent(client: TestClient) -> None:
+def test_block_conversation_ignores_candidates_and_is_idempotent(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     created = client.post(
@@ -960,19 +1030,25 @@ def test_block_conversation_ignores_candidates_and_is_idempotent(client: TestCli
     ignored = client.get("/api/wechat/candidates?candidate_status=ignored").json()
     assert [item["id"] for item in ignored] == [created["candidate_id"]]
     assert client.get("/api/wechat/candidates?candidate_status=processing").json() == []
-    assert client.get(f"/api/materials/{created['material_id']}").json()["status"] == "processed"
+    assert (
+        client.get(f"/api/materials/{created['material_id']}").json()["status"]
+        == "processed"
+    )
 
     unblocked = client.post(
         "/api/wechat/conversations/session-block/unblock",
         json={"rescan_days": None},
     )
     assert unblocked.status_code == 200, unblocked.text
-    assert [item["id"] for item in client.get(
-        "/api/wechat/candidates?candidate_status=ignored"
-    ).json()] == [created["candidate_id"]]
+    assert [
+        item["id"]
+        for item in client.get("/api/wechat/candidates?candidate_status=ignored").json()
+    ] == [created["candidate_id"]]
 
 
-def test_wechat_classification_accept_ignore_restore_and_block(client: TestClient) -> None:
+def test_wechat_classification_accept_ignore_restore_and_block(
+    client: TestClient,
+) -> None:
     login(client)
     now = int(datetime.now(UTC).timestamp())
     created = client.post(
@@ -986,7 +1062,9 @@ def test_wechat_classification_accept_ignore_restore_and_block(client: TestClien
         "/api/jobs/claim", json={"worker_id": "mac-test"}, headers=worker_headers()
     ).json()["job"]
     lease = {"worker_id": "mac-test", "lease_token": claimed["lease_token"]}
-    client.post(f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers())
+    client.post(
+        f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers()
+    )
     with client.app.state.database.connect() as connection:
         connection.execute(
             "INSERT INTO reminders "
@@ -1080,10 +1158,39 @@ def test_wechat_sync_request_lifecycle(client: TestClient) -> None:
         headers=worker_headers(),
     )
     assert finished.json()["status"] == "completed"
-    latest = client.get("/api/wechat/status").json()["sources"]["personal_wechat"]["latest"]
+    latest = client.get("/api/wechat/status").json()["sources"]["personal_wechat"][
+        "latest"
+    ]
     assert latest["message_count"] == 18
     assert latest["window_count"] == 4
     assert latest["skipped_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("个人微信密钥不完整，需要重新配置", "需要重新配置密钥"),
+        ("当前微信版本暂不支持", "当前微信版本暂不支持"),
+    ],
+)
+def test_personal_wechat_direct_failures_use_business_status(
+    client: TestClient, error: str, message: str
+) -> None:
+    login(client)
+    client.post("/api/wechat/sync/run", json={"sources": ["personal_wechat"]})
+    claimed = client.post(
+        "/api/wechat/sync/claim",
+        json={"worker_id": "mac-test"},
+        headers=worker_headers(),
+    ).json()["request"]
+    client.post(
+        f"/api/wechat/sync/{claimed['id']}/finish",
+        json={"worker_id": "mac-test", "status": "failed", "error": error},
+        headers=worker_headers(),
+    )
+    source = client.get("/api/wechat/status").json()["sources"]["personal_wechat"]
+    assert source["available"] is False
+    assert source["message"] == message
 
 
 def test_default_chat_sync_requests_both_sources(client: TestClient) -> None:
@@ -1104,22 +1211,24 @@ def test_chat_sources_are_namespaced_and_filtered(client: TestClient) -> None:
     wecom["source"] = "wecom"
     wecom["display_name"] = "企业微信协同群"
 
-    assert client.post(
-        "/api/wechat/windows", json=personal, headers=worker_headers()
-    ).status_code == 200
-    assert client.post(
-        "/api/wechat/windows", json=wecom, headers=worker_headers()
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/wechat/windows", json=personal, headers=worker_headers()
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/wechat/windows", json=wecom, headers=worker_headers()
+        ).status_code
+        == 200
+    )
 
     personal_conversations = client.get(
         "/api/wechat/conversations?source=personal_wechat"
     ).json()
-    wecom_conversations = client.get(
-        "/api/wechat/conversations?source=wecom"
-    ).json()
-    assert [item["session_id"] for item in personal_conversations] == [
-        "shared-session"
-    ]
+    wecom_conversations = client.get("/api/wechat/conversations?source=wecom").json()
+    assert [item["session_id"] for item in personal_conversations] == ["shared-session"]
     assert [item["session_id"] for item in wecom_conversations] == [
         "wecom:shared-session"
     ]
@@ -1136,9 +1245,12 @@ def test_chat_sources_are_namespaced_and_filtered(client: TestClient) -> None:
     blocked = client.post("/api/wechat/conversations/wecom%3Ashared-session/block")
     assert blocked.status_code == 200
     assert blocked.json()["listen_status"] == "blocked"
-    assert client.get(
-        "/api/wechat/conversations?source=personal_wechat"
-    ).json()[0]["listen_status"] == "active"
+    assert (
+        client.get("/api/wechat/conversations?source=personal_wechat").json()[0][
+            "listen_status"
+        ]
+        == "active"
+    )
 
 
 def test_channel_intake_keeps_channels_distinct(client: TestClient) -> None:
@@ -1174,7 +1286,9 @@ def test_channel_intake_keeps_channels_distinct(client: TestClient) -> None:
     assert replay.json()["material"]["id"] == materials[0]
 
 
-def test_duplicate_channel_intake_is_not_offered_as_undoable(client: TestClient) -> None:
+def test_duplicate_channel_intake_is_not_offered_as_undoable(
+    client: TestClient,
+) -> None:
     login(client)
     payload = {
         "channel": "wechat",
@@ -1242,7 +1356,9 @@ def test_ai_prefills_dynamic_contact_and_manual_edit_remains_available(
     matter_id = accepted.json()["matter_id"]
     matter = client.get(f"/api/matters/{matter_id}").json()
     assert matter["contact_name"] == "赵楠"
-    assert any(item["display_name"] == "赵楠" for item in client.get("/api/people").json())
+    assert any(
+        item["display_name"] == "赵楠" for item in client.get("/api/people").json()
+    )
 
     edited = client.patch(
         f"/api/matters/{matter_id}",
@@ -1313,7 +1429,9 @@ def test_wechat_user_actions_are_audited(client: TestClient) -> None:
         "/api/jobs/claim", json={"worker_id": "audit-test"}, headers=worker_headers()
     ).json()["job"]
     lease = {"worker_id": "audit-test", "lease_token": claimed["lease_token"]}
-    client.post(f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers())
+    client.post(
+        f"/api/jobs/{claimed['id']}/start", json=lease, headers=worker_headers()
+    )
     client.post(
         f"/api/wechat/jobs/{claimed['id']}/complete",
         json={
@@ -1329,22 +1447,37 @@ def test_wechat_user_actions_are_audited(client: TestClient) -> None:
         headers=worker_headers(),
     )
     candidate_id = created["candidate_id"]
-    assert client.post(
-        f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "ignore"}
-    ).status_code == 200
-    assert client.post(
-        f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "restore"}
-    ).status_code == 200
-    assert client.post(
-        f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "accept"}
-    ).status_code == 200
-    assert client.post(
-        f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "undo"}
-    ).status_code == 200
+    assert (
+        client.post(
+            f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "ignore"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "restore"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "accept"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/api/wechat/candidates/{candidate_id}/resolve", json={"action": "undo"}
+        ).status_code
+        == 200
+    )
     assert client.post("/api/wechat/conversations/session-a/block").status_code == 200
-    assert client.post(
-        "/api/wechat/conversations/session-a/unblock", json={"rescan_days": None}
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/wechat/conversations/session-a/unblock", json={"rescan_days": None}
+        ).status_code
+        == 200
+    )
     actions = {event["action"] for event in client.get("/api/audit").json()}
     assert {
         "wechat.candidate.ignored",

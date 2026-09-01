@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 
 import sys
 
@@ -17,7 +16,9 @@ from scripts.mac_worker import (
 )
 
 
-def test_analysis_queue_uses_bounded_concurrency_and_reconciles_once(monkeypatch) -> None:
+def test_analysis_queue_uses_bounded_concurrency_and_reconciles_once(
+    monkeypatch,
+) -> None:
     state = {"remaining": 50, "active": 0, "max_active": 0}
     lock = threading.Lock()
     barrier = threading.Barrier(50)
@@ -46,9 +47,9 @@ def test_analysis_queue_uses_bounded_concurrency_and_reconciles_once(monkeypatch
 
     client = Client()
     monkeypatch.setattr("scripts.mac_worker.process_once", fake_process_once)
-    completed = __import__("scripts.mac_worker", fromlist=["drain_pending_work"]).drain_pending_work(
-        client, "mac-test", DEFAULT_ANALYSIS_CONCURRENCY
-    )
+    completed = __import__(
+        "scripts.mac_worker", fromlist=["drain_pending_work"]
+    ).drain_pending_work(client, "mac-test", DEFAULT_ANALYSIS_CONCURRENCY)
     assert completed == 50
     assert state["max_active"] == 50
     assert client.calls == 1
@@ -134,7 +135,7 @@ def test_failed_chat_sync_does_not_starve_manual_analysis(monkeypatch) -> None:
     monkeypatch.setattr(mac_worker, "email_configured", lambda: False)
     monkeypatch.setattr(
         mac_worker,
-        "run_ciphertalk_sync",
+        "run_personal_wechat_sync",
         lambda *_: (_ for _ in ()).throw(RuntimeError("CipherTalk 尚未准备好")),
     )
 
@@ -190,7 +191,9 @@ def test_worker_waits_when_service_is_not_ready(monkeypatch, capsys) -> None:
         "process_once",
         lambda *_: (_ for _ in ()).throw(RuntimeError("服务未就绪")),
     )
-    monkeypatch.setattr(mac_worker.time, "sleep", lambda *_: (_ for _ in ()).throw(StopIteration))
+    monkeypatch.setattr(
+        mac_worker.time, "sleep", lambda *_: (_ for _ in ()).throw(StopIteration)
+    )
     monkeypatch.setattr(sys, "argv", ["mac_worker", "--once", "--poll-seconds", "2"])
 
     with pytest.raises(StopIteration):

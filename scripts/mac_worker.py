@@ -15,7 +15,7 @@ from scripts.email_sync import configured as email_configured, run_email_sync
 from scripts.export_listening_chats import export_listening_chats
 from scripts.icloud_inbox import DEFAULT_SYNC_INBOX, scan_icloud_inbox
 from scripts.transcription import is_audio_video, transcribe_material
-from scripts.wechat_sync import run_ciphertalk_sync
+from scripts.wechat_sync import run_personal_wechat_sync
 from scripts.wecom_sync import run_wecom_sync
 from scripts.workbuddy_analysis import (
     analyze_with_workbuddy,
@@ -64,14 +64,19 @@ def request_incremental_sync(client: WorkbenchClient) -> None:
 def _classify_chat_policy(
     client: WorkbenchClient, material: dict, source_text: str
 ) -> dict:
-    source_type = "wecom" if material.get("source_type") == "wecom_auto" else "personal_wechat"
+    source_type = (
+        "wecom" if material.get("source_type") == "wecom_auto" else "personal_wechat"
+    )
     source_label = str(material.get("filename") or "聊天会话")
     policies = client.request_json("GET", "/api/policies?policy_status=active") or []
     try:
-        identity_hint = client.request_json(
-            "GET",
-            f"/api/policies/identity/hint?source_type={source_type}&source_key={quote(source_label)}",
-        ) or {}
+        identity_hint = (
+            client.request_json(
+                "GET",
+                f"/api/policies/identity/hint?source_type={source_type}&source_key={quote(source_label)}",
+            )
+            or {}
+        )
     except (OSError, RuntimeError):
         identity_hint = {}
     result = classify_policy_with_workbuddy(
@@ -154,11 +159,13 @@ def process_once(client: WorkbenchClient, worker_id: str) -> bool:
     sync_response = client.request_json(
         "POST", "/api/wechat/sync/claim", {"worker_id": worker_id}
     )
-    sync_request = sync_response.get("request") if isinstance(sync_response, dict) else None
+    sync_request = (
+        sync_response.get("request") if isinstance(sync_response, dict) else None
+    )
     if sync_request:
         source = str(sync_request.get("source") or "personal_wechat")
         try:
-            sync = run_wecom_sync if source == "wecom" else run_ciphertalk_sync
+            sync = run_wecom_sync if source == "wecom" else run_personal_wechat_sync
             result = sync(client, sync_request.get("mode") or "incremental")
             skipped = int(result.get("skipped") or 0)
             client.request_json(
@@ -200,11 +207,20 @@ def process_once(client: WorkbenchClient, worker_id: str) -> bool:
             client.request_json(
                 "POST",
                 f"/api/wechat/sync/{sync_request['id']}/finish",
-                {"worker_id": worker_id, "status": "failed", "error": error_text(error)},
+                {
+                    "worker_id": worker_id,
+                    "status": "failed",
+                    "error": error_text(error),
+                },
             )
-            print(f"{'企业微信' if source == 'wecom' else '个人微信'}检查暂未完成：{error}", flush=True)
+            print(
+                f"{'企业微信' if source == 'wecom' else '个人微信'}检查暂未完成：{error}",
+                flush=True,
+            )
         return True
-    claimed = client.request_json("POST", "/api/jobs/claim", {"worker_id": worker_id})["job"]
+    claimed = client.request_json("POST", "/api/jobs/claim", {"worker_id": worker_id})[
+        "job"
+    ]
     if not claimed:
         return False
     lease = {
@@ -234,14 +250,19 @@ def process_once(client: WorkbenchClient, worker_id: str) -> bool:
             message_id = str(metadata.get("email_message_id") or "")
             if not message_id:
                 raise RuntimeError("邮件分类任务缺少原始邮件定位")
-            policies = client.request_json("GET", "/api/policies?policy_status=active") or []
+            policies = (
+                client.request_json("GET", "/api/policies?policy_status=active") or []
+            )
             sender_key = str(metadata.get("sender_key") or "")
             try:
-                identity_hint = client.request_json(
-                    "GET",
-                    "/api/policies/identity/hint"
-                    f"?source_type=email&source_key={quote(sender_key)}",
-                ) or {}
+                identity_hint = (
+                    client.request_json(
+                        "GET",
+                        "/api/policies/identity/hint"
+                        f"?source_type=email&source_key={quote(sender_key)}",
+                    )
+                    or {}
+                )
             except (OSError, RuntimeError):
                 identity_hint = {}
             policy_result = classify_policy_with_workbuddy(
@@ -251,7 +272,10 @@ def process_once(client: WorkbenchClient, worker_id: str) -> bool:
                 policies,
                 identity_hint=identity_hint,
             )
-            policy_relevant = policy_result.get("classification") in {"policy", "uncertain"}
+            policy_relevant = policy_result.get("classification") in {
+                "policy",
+                "uncertain",
+            }
             result["_policy_relevant"] = policy_relevant
             if policy_relevant:
                 policy_result["attachments"] = metadata.get("attachment_paths") or []
@@ -341,7 +365,9 @@ def process_once(client: WorkbenchClient, worker_id: str) -> bool:
                 }
             )
         for matter in matters:
-            matter["open_actions"] = actions_by_matter.get(str(matter.get("id") or ""), [])
+            matter["open_actions"] = actions_by_matter.get(
+                str(matter.get("id") or ""), []
+            )
         result = (
             analyze_with_workbuddy(
                 analysis_material,
@@ -399,7 +425,9 @@ def drain_pending_work(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="mac_worker", description="财务工作台 Mac 执行节点")
+    parser = argparse.ArgumentParser(
+        prog="mac_worker", description="财务工作台 Mac 执行节点"
+    )
     parser.add_argument(
         "--base-url", default=os.getenv("WORKBENCH_BASE_URL", "http://127.0.0.1:8000")
     )
@@ -407,7 +435,8 @@ def main() -> None:
         "--token", default=os.getenv("WORKBENCH_WORKER_TOKEN", "local-worker-token")
     )
     parser.add_argument(
-        "--worker-id", default=os.getenv("WORKBENCH_WORKER_ID", f"mac-{socket.gethostname()}")
+        "--worker-id",
+        default=os.getenv("WORKBENCH_WORKER_ID", f"mac-{socket.gethostname()}"),
     )
     parser.add_argument(
         "--sync-inbox",
@@ -419,7 +448,9 @@ def main() -> None:
         "--analysis-concurrency",
         type=int,
         default=int(
-            os.getenv("WORKBENCH_ANALYSIS_CONCURRENCY", str(DEFAULT_ANALYSIS_CONCURRENCY))
+            os.getenv(
+                "WORKBENCH_ANALYSIS_CONCURRENCY", str(DEFAULT_ANALYSIS_CONCURRENCY)
+            )
         ),
     )
     args = parser.parse_args()
@@ -445,8 +476,7 @@ def main() -> None:
             else:
                 last_sync_epoch = now_epoch
                 print(
-                    "已在 Mac 启动、唤醒或两小时节点读取新内容；"
-                    "等待手工让贾维斯整理。",
+                    "已在 Mac 启动、唤醒或两小时节点读取新内容；等待手工让贾维斯整理。",
                     flush=True,
                 )
         imported = False

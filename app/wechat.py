@@ -95,7 +95,11 @@ def _iso_from_epoch(value: int | float | None) -> str:
     raw = float(value or 0)
     if raw > 10_000_000_000:
         raw /= 1000
-    return datetime.fromtimestamp(raw, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(raw, UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _cursor(message: dict[str, Any]) -> tuple[int, int, int]:
@@ -111,7 +115,9 @@ def review_worthy_wechat_result(result: dict[str, Any], source_text: str = "") -
     classification = str(result.get("classification") or "").strip().lower()
     if classification != "relevant":
         return False
-    extracted = result.get("extracted") if isinstance(result.get("extracted"), dict) else {}
+    extracted = (
+        result.get("extracted") if isinstance(result.get("extracted"), dict) else {}
+    )
     message_text = "\n".join(
         line
         for line in source_text.splitlines()
@@ -122,7 +128,9 @@ def review_worthy_wechat_result(result: dict[str, Any], source_text: str = "") -
         confidence = float(result.get("confidence") or 0)
     except (TypeError, ValueError):
         confidence = 0
-    actions = extracted.get("actions") if isinstance(extracted.get("actions"), list) else []
+    actions = (
+        extracted.get("actions") if isinstance(extracted.get("actions"), list) else []
+    )
     has_follow_up = any(
         isinstance(item, dict)
         and str(item.get("kind") or "").strip().lower() in _FOLLOW_UP_KINDS
@@ -145,7 +153,11 @@ def _unique(items: list[Any], limit: int = 100) -> list[Any]:
     result: list[Any] = []
     seen: set[str] = set()
     for item in items:
-        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, dict) else str(item)
+        key = (
+            json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if isinstance(item, dict)
+            else str(item)
+        )
         if not key or key in seen:
             continue
         seen.add(key)
@@ -170,24 +182,37 @@ def _sender_label(message: dict[str, Any]) -> str:
 def _sender_aliases(messages: list[dict[str, Any]]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for message in messages:
-        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        sender = (
+            message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        )
         username = str(sender.get("username") or "").strip()
-        display_name = str(sender.get("displayName") or sender.get("name") or "").strip()
+        display_name = str(
+            sender.get("displayName") or sender.get("name") or ""
+        ).strip()
         if (
             username
             and display_name
             and username != display_name
-            and (username.startswith("wxid_") or (len(username) >= 6 and username.isascii()))
+            and (
+                username.startswith("wxid_")
+                or (len(username) >= 6 and username.isascii())
+            )
         ):
             aliases[username] = display_name
     return aliases
 
 
-def _record_wecom_sender_identities(connection: Any, messages: list[dict[str, Any]], now: str) -> None:
+def _record_wecom_sender_identities(
+    connection: Any, messages: list[dict[str, Any]], now: str
+) -> None:
     for message in messages:
-        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        sender = (
+            message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        )
         stable_id = str(sender.get("username") or "").strip()
-        display_name = str(sender.get("displayName") or sender.get("name") or "").strip()
+        display_name = str(
+            sender.get("displayName") or sender.get("name") or ""
+        ).strip()
         if not stable_id:
             continue
         match = (
@@ -259,7 +284,11 @@ def _identity_names(connection: Any, source: str) -> dict[str, str]:
 def _conversation_display_name(session_id: str, display_name: str, kind: str) -> str:
     name = display_name.strip()
     if not name or name == session_id or _TECHNICAL_SESSION_NAME_RE.fullmatch(name):
-        return "未命名群聊" if kind == "group" or session_id.endswith("@chatroom") else "未命名联系人"
+        return (
+            "未命名群聊"
+            if kind == "group" or session_id.endswith("@chatroom")
+            else "未命名联系人"
+        )
     return name
 
 
@@ -388,7 +417,9 @@ def _same_matter_topic(
     right_pairs = _topic_bigrams(right_text)
     if not left_pairs or not right_pairs:
         return False
-    similarity = 2 * len(left_pairs & right_pairs) / (len(left_pairs) + len(right_pairs))
+    similarity = (
+        2 * len(left_pairs & right_pairs) / (len(left_pairs) + len(right_pairs))
+    )
     return similarity >= (0.42 if same_conversation else 0.58)
 
 
@@ -446,14 +477,19 @@ def _merged_summary(*values: str) -> str:
     return ("；".join(selected) + suffix)[:280]
 
 
-def _merge_pending_rows(connection: Any, target: dict[str, Any], source: dict[str, Any], now: str) -> None:
+def _merge_pending_rows(
+    connection: Any, target: dict[str, Any], source: dict[str, Any], now: str
+) -> None:
     classification = (
         "relevant"
         if "relevant" in {target.get("classification"), source.get("classification")}
         else "uncertain"
     )
     reasons = _unique(
-        [target.get("uncertainty_reason") or "", source.get("uncertainty_reason") or ""],
+        [
+            target.get("uncertainty_reason") or "",
+            source.get("uncertainty_reason") or "",
+        ],
         4,
     )
     evidence = _unique(
@@ -509,9 +545,11 @@ class WechatService:
         if not released:
             return {"ignored": 0, "merged": 0, "continued": 0}
         released_at = str(released["created_at"])
-        cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
+        cutoff = (
+            (datetime.now(UTC) - timedelta(days=7))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         ignored = 0
         merged = 0
         keeper_ids: list[str] = []
@@ -562,9 +600,15 @@ class WechatService:
                     ),
                 )
                 row["summary"] = compact_summary
-                row["extracted_json"] = json.dumps(compact_extracted, ensure_ascii=False)
+                row["extracted_json"] = json.dumps(
+                    compact_extracted, ensure_ascii=False
+                )
                 keeper = next(
-                    (candidate for candidate in keepers if _same_matter(candidate, row)),
+                    (
+                        candidate
+                        for candidate in keepers
+                        if _same_matter(candidate, row)
+                    ),
                     None,
                 )
                 if keeper:
@@ -583,7 +627,9 @@ class WechatService:
                 "SELECT * FROM wechat_candidates WHERE id = ? AND status = 'pending'",
                 (candidate_id,),
             )
-            if candidate and self._auto_accept_actionable_candidate(candidate, "jarvis-batch"):
+            if candidate and self._auto_accept_actionable_candidate(
+                candidate, "jarvis-batch"
+            ):
                 continued += 1
         return {"ignored": ignored, "merged": merged, "continued": continued}
 
@@ -594,7 +640,9 @@ class WechatService:
         sources: list[str] | None = None,
     ) -> dict[str, Any]:
         requested_sources = list(dict.fromkeys(sources or ["personal_wechat", "wecom"]))
-        if not requested_sources or any(source not in _CHAT_SOURCES for source in requested_sources):
+        if not requested_sources or any(
+            source not in _CHAT_SOURCES for source in requested_sources
+        ):
             raise ValueError("不支持的聊天来源")
         now = utc_now()
         requests: list[dict[str, Any]] = []
@@ -623,9 +671,11 @@ class WechatService:
 
     def claim_sync(self, worker_id: str) -> dict[str, Any] | None:
         now = utc_now()
-        stale_before = (datetime.now(UTC) - timedelta(minutes=15)).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
+        stale_before = (
+            (datetime.now(UTC) - timedelta(minutes=15))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -682,9 +732,12 @@ class WechatService:
             )
             if updated.rowcount != 1:
                 raise PermissionError("微信检查任务已失效")
-        return self.database.fetch_one(
-            "SELECT * FROM wechat_sync_requests WHERE id = ?", (request_id,)
-        ) or {}
+        return (
+            self.database.fetch_one(
+                "SELECT * FROM wechat_sync_requests WHERE id = ?", (request_id,)
+            )
+            or {}
+        )
 
     def report_export(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -735,16 +788,19 @@ class WechatService:
         latest = self.database.fetch_one(
             "SELECT * FROM wechat_sync_requests ORDER BY requested_at DESC LIMIT 1"
         )
-        counts = self.database.fetch_one(
-            "SELECT "
-            "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'pending') AS pending, "
-            "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'processing') AS processing, "
-            "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'ignored' "
-            "AND created_at >= datetime('now', '-7 day')) AS ignored_recent, "
-            "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'accepted') AS accepted, "
-            "(SELECT COUNT(*) FROM wechat_conversations WHERE listen_status = 'active') AS listening, "
-            "(SELECT COUNT(*) FROM wechat_conversations WHERE listen_status = 'blocked') AS blocked"
-        ) or {}
+        counts = (
+            self.database.fetch_one(
+                "SELECT "
+                "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'pending') AS pending, "
+                "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'processing') AS processing, "
+                "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'ignored' "
+                "AND created_at >= datetime('now', '-7 day')) AS ignored_recent, "
+                "(SELECT COUNT(*) FROM wechat_candidates WHERE status = 'accepted') AS accepted, "
+                "(SELECT COUNT(*) FROM wechat_conversations WHERE listen_status = 'active') AS listening, "
+                "(SELECT COUNT(*) FROM wechat_conversations WHERE listen_status = 'blocked') AS blocked"
+            )
+            or {}
+        )
         last_success = self.database.fetch_one(
             "SELECT completed_at FROM wechat_sync_requests WHERE status = 'completed' "
             "ORDER BY completed_at DESC LIMIT 1"
@@ -761,33 +817,46 @@ class WechatService:
                 "WHERE source = ? AND status = 'completed' ORDER BY completed_at DESC LIMIT 1",
                 (source,),
             )
-            source_counts = self.database.fetch_one(
-                "SELECT "
-                "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'pending') AS pending, "
-                "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'processing') AS processing, "
-                "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'ignored' "
-                "AND created_at >= datetime('now', '-7 day')) AS ignored_recent, "
-                "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'accepted') AS accepted, "
-                "(SELECT COUNT(*) FROM wechat_conversations WHERE source = ? AND listen_status = 'active') AS listening",
-                (source, source, source, source, source),
-            ) or {}
-            available = source == "personal_wechat" or bool(
-                source_latest and source_latest.get("status") == "completed"
+            source_counts = (
+                self.database.fetch_one(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'pending') AS pending, "
+                    "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'processing') AS processing, "
+                    "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'ignored' "
+                    "AND created_at >= datetime('now', '-7 day')) AS ignored_recent, "
+                    "(SELECT COUNT(*) FROM wechat_candidates WHERE source = ? AND status = 'accepted') AS accepted, "
+                    "(SELECT COUNT(*) FROM wechat_conversations WHERE source = ? AND listen_status = 'active') AS listening",
+                    (source, source, source, source, source),
+                )
+                or {}
             )
+            source_error = str((source_latest or {}).get("error") or "")
+            direct_key_error = source == "personal_wechat" and "密钥" in source_error
+            direct_version_error = (
+                source == "personal_wechat" and "当前微信版本暂不支持" in source_error
+            )
+            available = not (direct_key_error or direct_version_error) and (
+                source == "personal_wechat"
+                or bool(source_latest and source_latest.get("status") == "completed")
+            )
+            if direct_key_error:
+                source_message = "需要重新配置密钥"
+            elif direct_version_error:
+                source_message = "当前微信版本暂不支持"
+            elif source == "personal_wechat":
+                source_message = "个人微信已连接"
+            elif available:
+                source_message = "企业微信已连接"
+            else:
+                source_message = "本机企业微信读取尚未完成"
             sources[source] = {
                 "available": available,
                 "latest": source_latest,
-                "last_success_at": source_success["completed_at"] if source_success else None,
+                "last_success_at": source_success["completed_at"]
+                if source_success
+                else None,
                 "counts": source_counts,
-                "message": (
-                    "可读取本机个人微信新增消息"
-                    if source == "personal_wechat"
-                    else (
-                        "可读取本机企业微信新增消息"
-                        if available
-                        else "本机企业微信读取尚未完成"
-                    )
-                ),
+                "message": source_message,
             }
         return {
             "counts": counts,
@@ -859,12 +928,18 @@ class WechatService:
                 "updated_at = ? WHERE session_id = ? AND status IN ('pending', 'processing')",
                 (now, now, session_id),
             )
-        result = self.database.fetch_one(
-            "SELECT * FROM wechat_conversations WHERE session_id = ?", (session_id,)
-        ) or {}
+        result = (
+            self.database.fetch_one(
+                "SELECT * FROM wechat_conversations WHERE session_id = ?", (session_id,)
+            )
+            or {}
+        )
         self.database.audit(
-            _id("audit"), actor, "wechat.conversation.blocked",
-            "wechat_conversation", session_id,
+            _id("audit"),
+            actor,
+            "wechat.conversation.blocked",
+            "wechat_conversation",
+            session_id,
         )
         return result
 
@@ -873,7 +948,9 @@ class WechatService:
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         listen_from = now - timedelta(days=rescan_days) if rescan_days else now
-        listen_from_text = listen_from.isoformat(timespec="seconds").replace("+00:00", "Z")
+        listen_from_text = listen_from.isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
         with self.database.connect() as connection:
             updated = connection.execute(
                 "UPDATE wechat_conversations SET listen_status = 'active', blocked_at = NULL, "
@@ -887,19 +964,26 @@ class WechatService:
                     "DELETE FROM wechat_sync_state WHERE session_id = ?", (session_id,)
                 )
                 connection.execute(
-                    "DELETE FROM wechat_seen_messages WHERE session_id = ?", (session_id,)
+                    "DELETE FROM wechat_seen_messages WHERE session_id = ?",
+                    (session_id,),
                 )
-        result = self.database.fetch_one(
-            "SELECT * FROM wechat_conversations WHERE session_id = ?", (session_id,)
-        ) or {}
+        result = (
+            self.database.fetch_one(
+                "SELECT * FROM wechat_conversations WHERE session_id = ?", (session_id,)
+            )
+            or {}
+        )
         self.request_sync(
             actor,
             "rescan" if rescan_days else "incremental",
             [str(result.get("source") or "personal_wechat")],
         )
         self.database.audit(
-            _id("audit"), actor, "wechat.conversation.unblocked",
-            "wechat_conversation", session_id,
+            _id("audit"),
+            actor,
+            "wechat.conversation.unblocked",
+            "wechat_conversation",
+            session_id,
             metadata={"rescan_days": rescan_days},
         )
         return result
@@ -918,7 +1002,9 @@ class WechatService:
             str(payload.get("display_name") or ""),
             str(payload.get("kind") or ""),
         )
-        latest_at = _iso_from_epoch(messages[-1].get("timestampMs") or messages[-1].get("timestamp"))
+        latest_at = _iso_from_epoch(
+            messages[-1].get("timestampMs") or messages[-1].get("timestamp")
+        )
         aliases = _sender_aliases(messages)
         with self.database.connect() as connection:
             connection.execute(
@@ -960,9 +1046,13 @@ class WechatService:
             fresh: list[dict[str, Any]] = []
             fresh_keys: set[tuple[int, int, int]] = set()
             for message in messages:
-                if listen_from and _iso_from_epoch(
-                    message.get("timestampMs") or message.get("timestamp")
-                ) < listen_from:
+                if (
+                    listen_from
+                    and _iso_from_epoch(
+                        message.get("timestampMs") or message.get("timestamp")
+                    )
+                    < listen_from
+                ):
                     continue
                 cursor = _cursor(message)
                 if cursor in fresh_keys:
@@ -990,16 +1080,25 @@ class WechatService:
             material_id = _id("mat")
             job_id = _id("job")
             candidate_id = _id("wcand")
-            first_at = _iso_from_epoch(fresh[0].get("timestampMs") or fresh[0].get("timestamp"))
-            last_at = _iso_from_epoch(fresh[-1].get("timestampMs") or fresh[-1].get("timestamp"))
+            first_at = _iso_from_epoch(
+                fresh[0].get("timestampMs") or fresh[0].get("timestamp")
+            )
+            last_at = _iso_from_epoch(
+                fresh[-1].get("timestampMs") or fresh[-1].get("timestamp")
+            )
             digest = hashlib.sha256(
                 f"{session_id}:".encode("utf-8")
                 + json.dumps(fresh, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()
             channel_label = "企业微信" if source == "wecom" else "个人微信"
-            lines = [f"{channel_label}会话：{display_name}", f"时间：{first_at} 至 {last_at}"]
+            lines = [
+                f"{channel_label}会话：{display_name}",
+                f"时间：{first_at} 至 {last_at}",
+            ]
             for message in fresh:
-                when = _iso_from_epoch(message.get("timestampMs") or message.get("timestamp"))
+                when = _iso_from_epoch(
+                    message.get("timestampMs") or message.get("timestamp")
+                )
                 sender = _sender_label(message)
                 sender_data = (
                     message.get("sender")
@@ -1014,7 +1113,11 @@ class WechatService:
                     )
                     sender = identity_names.get(stable_sender_id, sender)
                 text = str(message.get("text") or "").strip()
-                media = message.get("media") if isinstance(message.get("media"), dict) else {}
+                media = (
+                    message.get("media")
+                    if isinstance(message.get("media"), dict)
+                    else {}
+                )
                 media_note = ""
                 if media:
                     media_note = f" [附件：{media.get('fileName') or media.get('type') or message.get('kind')}]"
@@ -1055,7 +1158,7 @@ class WechatService:
             connection.execute(
                 "INSERT INTO jobs "
                 "(id, material_id, job_type, status, requires_local, priority, created_at, updated_at) "
-                    "VALUES (?, ?, 'wechat_classify', 'held', 1, 90, ?, ?)",
+                "VALUES (?, ?, 'wechat_classify', 'held', 1, 90, ?, ?)",
                 (job_id, material_id, now, now),
             )
             connection.execute(
@@ -1063,7 +1166,16 @@ class WechatService:
                 "(id, material_id, session_id, source, window_start, window_end, summary, status, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '等待 贾维斯 理解', "
                 "'processing', ?, ?)",
-                (candidate_id, material_id, session_id, source, first_at, last_at, now, now),
+                (
+                    candidate_id,
+                    material_id,
+                    session_id,
+                    source,
+                    first_at,
+                    last_at,
+                    now,
+                    now,
+                ),
             )
             for message in fresh:
                 connection.execute(
@@ -1073,9 +1185,17 @@ class WechatService:
                     (session_id, source, *_cursor(message), material_id, now),
                 )
             self._update_cursor(
-                connection, payload["account_fingerprint"], session_id, messages[-1], source
+                connection,
+                payload["account_fingerprint"],
+                session_id,
+                messages[-1],
+                source,
             )
-        return {"created": True, "material_id": material_id, "candidate_id": candidate_id}
+        return {
+            "created": True,
+            "material_id": material_id,
+            "candidate_id": candidate_id,
+        }
 
     def _update_cursor(
         self,
@@ -1094,7 +1214,16 @@ class WechatService:
             "DO UPDATE SET source = excluded.source, sort_seq = excluded.sort_seq, create_time = excluded.create_time, "
             "local_id = excluded.local_id, last_success_at = excluded.last_success_at, "
             "error = NULL, updated_at = excluded.updated_at",
-            (account_fingerprint, session_id, source, sort_seq, create_time, local_id, now, now),
+            (
+                account_fingerprint,
+                session_id,
+                source,
+                sort_seq,
+                create_time,
+                local_id,
+                now,
+                now,
+            ),
         )
 
     def _auto_accept_actionable_candidate(
@@ -1141,13 +1270,20 @@ class WechatService:
         classification = str(result.get("classification") or "").strip()
         if classification not in {"relevant", "uncertain", "irrelevant"}:
             raise ValueError("贾维斯 没有给出有效的工作相关性判断")
-        material = self.database.fetch_one(
-            "SELECT text_note FROM materials WHERE id = ?", (job["material_id"],)
-        ) or {}
-        if not review_worthy_wechat_result(result, str(material.get("text_note") or "")):
+        material = (
+            self.database.fetch_one(
+                "SELECT text_note FROM materials WHERE id = ?", (job["material_id"],)
+            )
+            or {}
+        )
+        if not review_worthy_wechat_result(
+            result, str(material.get("text_note") or "")
+        ):
             classification = "irrelevant"
         candidate_status = "ignored" if classification == "irrelevant" else "pending"
-        material_status = "processed" if classification == "irrelevant" else "pending_review"
+        material_status = (
+            "processed" if classification == "irrelevant" else "pending_review"
+        )
         now = utc_now()
         with self.database.connect() as connection:
             reserved = connection.execute(
@@ -1176,7 +1312,8 @@ class WechatService:
                 ),
             )
             current_row = connection.execute(
-                "SELECT * FROM wechat_candidates WHERE material_id = ?", (job["material_id"],)
+                "SELECT * FROM wechat_candidates WHERE material_id = ?",
+                (job["material_id"],),
             ).fetchone()
             current = dict(current_row) if current_row else {}
             completed = connection.execute(
@@ -1197,19 +1334,25 @@ class WechatService:
                 "UPDATE materials SET status = ?, updated_at = ? WHERE id = ?",
                 (material_status, now, job["material_id"]),
             )
-        candidate = self.database.fetch_one(
-            "SELECT * FROM wechat_candidates WHERE id = ?",
-            (current.get("id"),),
-        ) or {}
+        candidate = (
+            self.database.fetch_one(
+                "SELECT * FROM wechat_candidates WHERE id = ?",
+                (current.get("id"),),
+            )
+            or {}
+        )
         if candidate:
             self.database.audit(
-                _id("audit"), worker_id, "wechat.candidate.classified",
-                "wechat_candidate", candidate["id"],
+                _id("audit"),
+                worker_id,
+                "wechat.candidate.classified",
+                "wechat_candidate",
+                candidate["id"],
                 metadata={
-                        "classification": classification,
-                        "status": candidate["status"],
-                        "material_id": job["material_id"],
-                        "merged": False,
+                    "classification": classification,
+                    "status": candidate["status"],
+                    "material_id": job["material_id"],
+                    "merged": False,
                 },
             )
         return candidate
@@ -1374,12 +1517,18 @@ class WechatService:
             if action == "accept" and not matter_id:
                 matter_id = self._find_open_matter(candidate)
             if matter_id:
-                matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
+                matter = self.database.fetch_one(
+                    "SELECT * FROM matters WHERE id = ?", (matter_id,)
+                )
                 if not matter:
                     raise KeyError("要合并的事项不存在")
             else:
                 matter_id = _id("matter")
-                title = str(extracted.get("matter_title") or candidate["summary"] or "微信工作线索")
+                title = str(
+                    extracted.get("matter_title")
+                    or candidate["summary"]
+                    or "微信工作线索"
+                )
                 with self.database.connect() as connection:
                     connection.execute(
                         "INSERT INTO matters (id, title, summary, created_at, updated_at) "
@@ -1401,10 +1550,19 @@ class WechatService:
                     "UPDATE matters SET updated_at = ? WHERE id = ?", (now, matter_id)
                 )
                 for item in (extracted.get("actions") or [])[:20]:
-                    if not isinstance(item, dict) or not str(item.get("title") or "").strip():
+                    if (
+                        not isinstance(item, dict)
+                        or not str(item.get("title") or "").strip()
+                    ):
                         continue
                     kind = str(item.get("kind") or "task")
-                    if kind not in {"conclusion", "task", "risk", "decision", "waiting"}:
+                    if kind not in {
+                        "conclusion",
+                        "task",
+                        "risk",
+                        "decision",
+                        "waiting",
+                    }:
                         kind = "task"
                     action_id = _id("action")
                     connection.execute(
@@ -1466,36 +1624,56 @@ class WechatService:
         return resolved
 
     def retract_material(self, material_id: str, actor: str) -> dict[str, Any]:
-        material = self.database.fetch_one("SELECT * FROM materials WHERE id = ?", (material_id,))
+        material = self.database.fetch_one(
+            "SELECT * FROM materials WHERE id = ?", (material_id,)
+        )
         if not material:
             raise KeyError("材料不存在")
         now = utc_now()
         with self.database.connect() as connection:
             connection.execute(
                 "UPDATE materials SET status = 'retracted', matter_id = NULL, updated_at = ? "
-                "WHERE id = ?", (now, material_id)
+                "WHERE id = ?",
+                (now, material_id),
             )
             connection.execute(
                 "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_token = NULL, "
                 "lease_expires_at = NULL, updated_at = ? WHERE material_id = ? "
-                "AND status NOT IN ('succeeded', 'cancelled')", (now, material_id)
+                "AND status NOT IN ('succeeded', 'cancelled')",
+                (now, material_id),
             )
             connection.execute(
                 "UPDATE wechat_candidates SET status = 'retracted', resolved_at = ?, updated_at = ? "
-                "WHERE material_id = ?", (now, now, material_id)
+                "WHERE material_id = ?",
+                (now, now, material_id),
             )
             connection.execute(
-                "UPDATE channel_intakes SET retracted_at = ? WHERE material_id = ?", (now, material_id)
+                "UPDATE channel_intakes SET retracted_at = ? WHERE material_id = ?",
+                (now, material_id),
             )
         self.database.audit(
-            _id("audit"), actor, "material.retracted", "material", material_id,
+            _id("audit"),
+            actor,
+            "material.retracted",
+            "material",
+            material_id,
             metadata={"source_type": material["source_type"]},
         )
-        return self.database.fetch_one("SELECT * FROM materials WHERE id = ?", (material_id,)) or {}
+        return (
+            self.database.fetch_one(
+                "SELECT * FROM materials WHERE id = ?", (material_id,)
+            )
+            or {}
+        )
 
     def record_channel_intake(
-        self, material_id: str, channel: str, external_message_id: str | None,
-        sender: str | None, sent_at: str | None, file_type: str | None,
+        self,
+        material_id: str,
+        channel: str,
+        external_message_id: str | None,
+        sender: str | None,
+        sent_at: str | None,
+        file_type: str | None,
     ) -> None:
         with self.database.connect() as connection:
             connection.execute(
@@ -1505,8 +1683,16 @@ class WechatService:
                 "(SELECT 1 FROM channel_intakes WHERE material_id = ? AND channel = ? "
                 "AND retracted_at IS NULL)",
                 (
-                    _id("channel"), material_id, channel, external_message_id,
-                    sender, sent_at, file_type, utc_now(), material_id, channel,
+                    _id("channel"),
+                    material_id,
+                    channel,
+                    external_message_id,
+                    sender,
+                    sent_at,
+                    file_type,
+                    utc_now(),
+                    material_id,
+                    channel,
                 ),
             )
 

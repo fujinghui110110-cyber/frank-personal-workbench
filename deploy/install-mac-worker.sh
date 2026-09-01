@@ -95,6 +95,7 @@ plutil -replace WorkingDirectory -string "$project_root" "$target"
 plutil -replace EnvironmentVariables.WORKBENCH_BASE_URL -string "http://127.0.0.1:8000" "$target"
 plutil -replace EnvironmentVariables.WORKBENCH_WORKER_TOKEN -string "$WORKBENCH_WORKER_TOKEN" "$target"
 plutil -replace EnvironmentVariables.WORKBENCH_SYNC_INBOX -string "$sync_inbox" "$target"
+plutil -replace EnvironmentVariables.PERSONAL_WECHAT_READER -string "${PERSONAL_WECHAT_READER:-ciphertalk}" "$target"
 plutil -replace EnvironmentVariables.PATH -string "$(dirname "$node_bin"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$target"
 plutil -lint "$target" >/dev/null
 

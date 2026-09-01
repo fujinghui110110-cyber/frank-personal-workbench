@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,7 +39,9 @@ def group_messages(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]
     previous_ms = 0
     for message in sorted(messages, key=_cursor):
         message_ms = _epoch_ms(message.get("timestampMs") or message.get("timestamp"))
-        if current and (len(current) >= 200 or message_ms - previous_ms > 24 * 60 * 60 * 1000):
+        if current and (
+            len(current) >= 200 or message_ms - previous_ms > 24 * 60 * 60 * 1000
+        ):
             windows.append(current)
             current = []
         current.append(message)
@@ -112,8 +115,14 @@ async def _enrich_messages(
         kind = str(message.get("kind") or media.get("type") or "").strip().lower()
         if kind in {"voice", "audio"}:
             transcript = str(media.get("transcript") or "").strip()
-            cursor = message.get("cursor") if isinstance(message.get("cursor"), dict) else {}
-            if not transcript and cursor.get("localId") is not None and cursor.get("createTime"):
+            cursor = (
+                message.get("cursor") if isinstance(message.get("cursor"), dict) else {}
+            )
+            if (
+                not transcript
+                and cursor.get("localId") is not None
+                and cursor.get("createTime")
+            ):
                 try:
                     result = await ciphertalk.call(
                         "transcribe_voice_message",
@@ -161,11 +170,15 @@ async def _run(client: WorkbenchClient, mode: str) -> dict[str, int]:
             or status.get("account")
             or "local-wechat"
         )
-        account_fingerprint = hashlib.sha256(account_hint.encode("utf-8")).hexdigest()[:24]
+        account_fingerprint = hashlib.sha256(account_hint.encode("utf-8")).hexdigest()[
+            :24
+        ]
         for session in await _sessions(ciphertalk):
             if session.get("kind") not in {"friend", "group"}:
                 continue
-            last_ms = _epoch_ms(session.get("lastTimestampMs") or session.get("lastTimestamp"))
+            last_ms = _epoch_ms(
+                session.get("lastTimestampMs") or session.get("lastTimestamp")
+            )
             existing = conversations.get(str(session.get("sessionId")))
             if existing and existing.get("listen_status") == "blocked":
                 continue
@@ -173,14 +186,18 @@ async def _run(client: WorkbenchClient, mode: str) -> dict[str, int]:
                 continue
             start_ms = cutoff_ms
             if existing and existing.get("create_time") and mode != "rescan":
-                start_ms = max(cutoff_ms, int(existing["create_time"]) * 1000 - 5 * 60 * 1000)
+                start_ms = max(
+                    cutoff_ms, int(existing["create_time"]) * 1000 - 5 * 60 * 1000
+                )
             if existing and existing.get("listen_from"):
                 listen_from = datetime.fromisoformat(
                     str(existing["listen_from"]).replace("Z", "+00:00")
                 )
                 start_ms = max(start_ms, int(listen_from.timestamp() * 1000))
             try:
-                messages = await _messages(ciphertalk, str(session["sessionId"]), start_ms)
+                messages = await _messages(
+                    ciphertalk, str(session["sessionId"]), start_ms
+                )
             except RuntimeError as error:
                 if not _is_missing_session(error):
                     raise
@@ -207,5 +224,20 @@ async def _run(client: WorkbenchClient, mode: str) -> dict[str, int]:
     return {"messages": scanned, "windows": created, "skipped": skipped}
 
 
-def run_ciphertalk_sync(client: WorkbenchClient, mode: str = "incremental") -> dict[str, int]:
+def run_ciphertalk_sync(
+    client: WorkbenchClient, mode: str = "incremental"
+) -> dict[str, int]:
     return asyncio.run(_run(client, mode))
+
+
+def run_personal_wechat_sync(
+    client: WorkbenchClient, mode: str = "incremental"
+) -> dict[str, int]:
+    reader = os.getenv("PERSONAL_WECHAT_READER", "ciphertalk").strip().lower()
+    if reader == "ciphertalk":
+        return run_ciphertalk_sync(client, mode)
+    if reader == "direct":
+        from scripts.personal_wechat_sync import run_direct_wechat_sync
+
+        return run_direct_wechat_sync(client, mode)
+    raise RuntimeError("个人微信读取方式配置无效")
