@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import tempfile
 from getpass import getpass
 from pathlib import Path
@@ -8,41 +7,54 @@ from pathlib import Path
 from scripts.personal_wechat_crypto import (
     SQLCIPHER,
     WechatDataset,
-    decrypt_database,
     discover_dataset,
+    probe_database_key,
     snapshot_dataset,
 )
-from scripts.personal_wechat_keys import load_key, store_key, validate_key
+from scripts.personal_wechat_keys import load_key, store_keys, validate_key
 
 
 def configure_dataset(dataset: WechatDataset, sqlcipher: Path = SQLCIPHER) -> int:
-    configured = 0
     with tempfile.TemporaryDirectory(
         prefix="finance-workbench-wechat-config-"
     ) as temporary:
         private = Path(temporary)
         encrypted = snapshot_dataset(dataset, private / "encrypted")
+        configured: list[tuple[str, str]] = []
+        missing: list[tuple[str, Path]] = []
         for source in dataset.databases:
             label = source.relative_to(dataset.root).as_posix()
-            clear = private / "clear" / label
             existing = load_key(dataset.account, label)
-            if existing:
-                try:
-                    decrypt_database(encrypted / label, clear, existing, sqlcipher)
-                    clear.unlink(missing_ok=True)
-                    configured += 1
-                    print(f"已验证：{label}")
-                    continue
-                except RuntimeError:
-                    clear.unlink(missing_ok=True)
-            key = validate_key(getpass(f"{label} 的数据库密钥（不会显示）："))
-            decrypt_database(encrypted / label, clear, key, sqlcipher)
-            clear.unlink(missing_ok=True)
-            store_key(dataset.account, label, key)
-            configured += 1
-            print(f"已验证并保存：{label}")
-        shutil.rmtree(private / "clear", ignore_errors=True)
-    return configured
+            if existing and probe_database_key(
+                encrypted / label, existing, sqlcipher
+            ):
+                configured.append((label, existing))
+            else:
+                missing.append((label, encrypted / label))
+
+        if missing:
+            key = validate_key(
+                getpass("CipherTalk 数据库连接密钥（不会显示）：")
+            )
+            matched = [
+                (label, key)
+                for label, source in missing
+                if probe_database_key(source, key, sqlcipher)
+            ]
+            total_matched = len(configured) + len(matched)
+            total = len(dataset.databases)
+            print(f"只读校验结果：已匹配 {total_matched}/{total} 个数据库。")
+            if total_matched != total:
+                raise RuntimeError(
+                    f"CipherTalk 连接密钥只匹配 {total_matched}/{total} 个数据库。"
+                    "这不代表输入错误；该密钥已按微信 4.x 的逐库派生方式校验，"
+                    "当前微信版本或部分数据库的加密参数可能仍不兼容。"
+                    "工作台未启用个人微信直读，现有 CipherTalk 读取方式保持不变。"
+                )
+            configured.extend(matched)
+
+        store_keys(dataset.account, configured)
+    return len(configured)
 
 
 def main() -> None:

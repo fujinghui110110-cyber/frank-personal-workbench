@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import subprocess
 from contextlib import contextmanager
@@ -13,6 +14,8 @@ from scripts.personal_wechat_crypto import (
     PersonalWechatUnsupportedError,
     WechatDataset,
     decrypt_database,
+    derive_database_key,
+    probe_database_key,
     snapshot_dataset,
 )
 import scripts.personal_wechat_sync as personal_wechat_sync
@@ -38,6 +41,30 @@ def _database(path: Path, sql: str, rows: list[tuple] = []) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _wechat_encrypted_database(path: Path, account_key: str, sqlcipher: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    salt = hashlib.sha256(path.name.encode()).digest()[:16]
+    database_key = hashlib.pbkdf2_hmac(
+        "sha512", bytes.fromhex(account_key), salt, 256_000, dklen=32
+    ).hex()
+    created = subprocess.run(
+        [str(sqlcipher), str(path)],
+        input=(
+            f"PRAGMA key = \"x'{database_key}{salt.hex()}'\";\n"
+            "PRAGMA kdf_iter = 1;\n"
+            "PRAGMA cipher_compatibility = 4;\n"
+            "PRAGMA cipher_page_size = 4096;\n"
+            "CREATE TABLE messages(id INTEGER, content TEXT);\n"
+            "INSERT INTO messages VALUES (1, 'synthetic');\n.quit\n"
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert created.returncode == 0
+    assert path.read_bytes()[:16] == salt
 
 
 def test_snapshot_keeps_database_wal_and_shm(tmp_path: Path) -> None:
@@ -239,18 +266,16 @@ def test_sqlcipher_decryption_rejects_wrong_key(tmp_path: Path) -> None:
         pytest.skip("本机没有 SQLCipher")
     encrypted = tmp_path / "encrypted.db"
     key = "12" * 32
-    created = subprocess.run(
-        [str(sqlcipher), str(encrypted)],
-        input=(
-            f"PRAGMA key = \"x'{key}'\";\n"
-            "CREATE TABLE messages(id INTEGER, content TEXT);\n"
-            "INSERT INTO messages VALUES (1, 'synthetic');\n.quit\n"
-        ),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert created.returncode == 0
+    _wechat_encrypted_database(encrypted, key, sqlcipher)
+    assert derive_database_key(encrypted, key) == hashlib.pbkdf2_hmac(
+        "sha512", bytes.fromhex(key), encrypted.read_bytes()[:16], 256_000, dklen=32
+    ).hex()
+    assert probe_database_key(encrypted, key, sqlcipher) is True
+    second = tmp_path / "second.db"
+    _wechat_encrypted_database(second, key, sqlcipher)
+    assert derive_database_key(second, key) != derive_database_key(encrypted, key)
+    assert probe_database_key(second, key, sqlcipher) is True
+    assert probe_database_key(encrypted, "34" * 32, sqlcipher) is False
     clear = tmp_path / "clear.db"
     decrypt_database(encrypted, clear, key, sqlcipher)
     connection = sqlite3.connect(clear)

@@ -128,23 +128,70 @@ def _sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def derive_database_key(source: Path, account_key_hex: str) -> str:
+    if len(account_key_hex) != 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in account_key_hex
+    ):
+        raise PersonalWechatKeyError("个人微信数据库密钥格式无效")
+    with source.open("rb") as database:
+        salt = database.read(16)
+    if len(salt) != 16:
+        raise PersonalWechatUnsupportedError("个人微信数据库文件不完整")
+    return hashlib.pbkdf2_hmac(
+        "sha512",
+        bytes.fromhex(account_key_hex),
+        salt,
+        256_000,
+        dklen=32,
+    ).hex()
+
+
+def probe_database_key(
+    source: Path,
+    key_hex: str,
+    sqlcipher: Path = SQLCIPHER,
+) -> bool:
+    if not sqlcipher.is_file():
+        raise PersonalWechatUnsupportedError("本机尚未安装个人微信只读组件")
+    database_key = derive_database_key(source, key_hex)
+    commands = "\n".join(
+        (
+            ".bail on",
+            f"PRAGMA key = \"x'{database_key}'\";",
+            "PRAGMA kdf_iter = 1;",
+            "PRAGMA cipher_compatibility = 4;",
+            "PRAGMA cipher_page_size = 4096;",
+            "SELECT 'WORKBENCH_KEY_OK:' || count(*) FROM sqlite_master;",
+            ".quit",
+        )
+    )
+    completed = subprocess.run(
+        [str(sqlcipher), str(source)],
+        input=commands,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    return completed.returncode == 0 and "WORKBENCH_KEY_OK:" in completed.stdout
+
+
 def decrypt_database(
     source: Path,
     destination: Path,
     key_hex: str,
     sqlcipher: Path = SQLCIPHER,
 ) -> None:
-    if len(key_hex) != 64 or any(
-        character not in "0123456789abcdefABCDEF" for character in key_hex
-    ):
-        raise PersonalWechatKeyError("个人微信数据库密钥格式无效")
     if not sqlcipher.is_file():
         raise PersonalWechatUnsupportedError("本机尚未安装个人微信只读组件")
+    database_key = derive_database_key(source, key_hex)
     destination.parent.mkdir(parents=True, exist_ok=True)
     commands = "\n".join(
         (
-            f"PRAGMA key = \"x'{key_hex.lower()}'\";",
+            f"PRAGMA key = \"x'{database_key}'\";",
+            "PRAGMA kdf_iter = 1;",
             "PRAGMA cipher_compatibility = 4;",
+            "PRAGMA cipher_page_size = 4096;",
             "SELECT count(*) FROM sqlite_master;",
             f"ATTACH DATABASE '{_sql_literal(str(destination))}' AS plaintext KEY '';",
             "SELECT sqlcipher_export('plaintext');",

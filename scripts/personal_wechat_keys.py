@@ -201,6 +201,29 @@ def store_key(account: str, database: str, key: str) -> None:
         )
 
 
+def store_keys(account: str, database_keys: Sequence[tuple[str, str]]) -> None:
+    account = _label(account, "微信账号")
+    items = sorted(
+        {
+            _label(database, "数据库标签"): validate_key(key)
+            for database, key in database_keys
+        }.items()
+    )
+    if not items:
+        return
+    for database, key in items:
+        _store_item(KEYCHAIN_SERVICE, _item_account(account, database), key)
+    _store_item(
+        _INDEX_SERVICE,
+        account,
+        json.dumps(
+            [database for database, _ in items],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def delete_key(account: str, database: str) -> None:
     account = _label(account, "微信账号")
     database = _label(database, "数据库标签")
