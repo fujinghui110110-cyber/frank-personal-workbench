@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -18,7 +20,7 @@ from scripts.personal_wechat_crypto import (
     decrypted_dataset,
     discover_dataset,
 )
-from scripts.personal_wechat_keys import load_key
+from scripts.personal_wechat_keys import load_image_keys, load_key
 from scripts.transcription import transcribe_material
 from scripts.wechat_sync import _ocr_image, group_messages
 
@@ -31,10 +33,29 @@ FIELD_ALIASES = {
     "talker": ("talker", "username", "session_id", "sessionId", "chatName"),
     "sender": ("sender", "sender_username", "senderUsername", "fromUser"),
     "is_send": ("is_send", "issend", "isSend"),
-    "kind": ("type", "msg_type", "msgType", "messageType", "localType"),
-    "content": ("content", "message", "msgContent", "compressContent"),
+    "kind": (
+        "local_type",
+        "type",
+        "msg_type",
+        "msgType",
+        "messageType",
+        "localType",
+    ),
+    "content": (
+        "message_content",
+        "messageContent",
+        "content",
+        "message",
+        "msgContent",
+        "compress_content",
+        "compressContent",
+    ),
     "path": ("path", "local_path", "localPath", "filePath", "mediaPath"),
+    "packed_info": ("packed_info_data", "packedInfoData"),
 }
+
+_IMAGE_SIGNATURES = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF")
+_WECHAT_IMAGE_HEADERS = (b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07")
 
 
 def _tables(connection: sqlite3.Connection) -> list[str]:
@@ -64,6 +85,38 @@ def _column(columns: dict[str, str], name: str) -> str | None:
     )
 
 
+def _matching_columns(columns: dict[str, str], name: str) -> list[str]:
+    return [
+        columns[alias.lower()]
+        for alias in FIELD_ALIASES[name]
+        if alias.lower() in columns
+    ]
+
+
+def _clean_account_name(value: str) -> str:
+    value = value.strip()
+    if value.lower().startswith("wxid_"):
+        match = re.match(r"^(wxid_[a-zA-Z0-9]+)", value, re.I)
+        return match.group(1) if match else value
+    match = re.match(r"^(.+)_([a-zA-Z0-9]{4})$", value)
+    return match.group(1) if match else value
+
+
+def _message_table_sessions(connection: sqlite3.Connection) -> dict[str, str]:
+    tables = set(_tables(connection))
+    if "Name2Id" not in tables:
+        return {}
+    return {
+        table: username
+        for (username,) in connection.execute("SELECT user_name FROM Name2Id")
+        if isinstance(username, str)
+        and (
+            table := f"Msg_{hashlib.md5(username.encode('utf-8')).hexdigest()}"
+        )
+        in tables
+    }
+
+
 def _decode(value: Any) -> str:
     if value is None:
         return ""
@@ -78,6 +131,184 @@ def _decode(value: Any) -> str:
         except UnicodeDecodeError:
             continue
     return ""
+
+
+def _row_content(row: dict[str, Any], columns: dict[str, str]) -> str:
+    for column in _matching_columns(columns, "content"):
+        content = _decode(row.get(column))
+        if content:
+            return content
+    return ""
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, offset
+    raise ValueError
+
+
+def _protobuf_strings(data: bytes, depth: int = 0) -> list[str]:
+    if depth > 5 or not data:
+        return []
+    result: list[str] = []
+    offset = 0
+    try:
+        while offset < len(data):
+            key, offset = _read_varint(data, offset)
+            wire_type = key & 7
+            if wire_type == 0:
+                _, offset = _read_varint(data, offset)
+            elif wire_type == 1:
+                offset += 8
+            elif wire_type == 5:
+                offset += 4
+            elif wire_type == 2:
+                size, offset = _read_varint(data, offset)
+                payload = data[offset : offset + size]
+                if len(payload) != size:
+                    raise ValueError
+                offset += size
+                try:
+                    value = payload.decode("utf-8").strip("\x00\"")
+                except UnicodeDecodeError:
+                    value = ""
+                if value and all(character.isprintable() for character in value):
+                    result.append(value)
+                result.extend(_protobuf_strings(payload, depth + 1))
+            else:
+                raise ValueError
+    except (IndexError, ValueError):
+        return result
+    return result
+
+
+def _protobuf_length_fields(data: bytes) -> list[tuple[int, bytes]]:
+    result: list[tuple[int, bytes]] = []
+    offset = 0
+    try:
+        while offset < len(data):
+            key, offset = _read_varint(data, offset)
+            field, wire_type = key >> 3, key & 7
+            if wire_type == 0:
+                _, offset = _read_varint(data, offset)
+            elif wire_type == 1:
+                offset += 8
+            elif wire_type == 5:
+                offset += 4
+            elif wire_type == 2:
+                size, offset = _read_varint(data, offset)
+                payload = data[offset : offset + size]
+                if len(payload) != size:
+                    raise ValueError
+                offset += size
+                result.append((field, payload))
+            else:
+                raise ValueError
+    except (IndexError, ValueError):
+        pass
+    return result
+
+
+def _voice_transcript(packed_info: Any) -> str:
+    if isinstance(packed_info, memoryview):
+        packed_info = packed_info.tobytes()
+    if not isinstance(packed_info, (bytes, bytearray)):
+        return ""
+    for field, payload in _protobuf_length_fields(bytes(packed_info)):
+        if field != 5:
+            continue
+        for inner_field, value in _protobuf_length_fields(payload):
+            if inner_field != 2:
+                continue
+            try:
+                return value.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                return ""
+    return ""
+
+
+def _media_file_index(account_root: Path) -> dict[str, list[Path]]:
+    result: dict[str, list[Path]] = defaultdict(list)
+    for path in (account_root / "msg").rglob("*"):
+        if path.is_file():
+            for key in {
+                path.name.lower(),
+                path.stem.lower(),
+                path.stem.split("_", 1)[0].lower(),
+            }:
+                result[key].append(path)
+    return result
+
+
+def _packed_media_path(
+    packed_info: Any,
+    index: dict[str, list[Path]],
+    kind: str,
+) -> Path | None:
+    if isinstance(packed_info, memoryview):
+        packed_info = packed_info.tobytes()
+    if not isinstance(packed_info, (bytes, bytearray)):
+        return None
+    candidates: list[Path] = []
+    for value in _protobuf_strings(bytes(packed_info)):
+        name = Path(value).name.lower()
+        keys = {value.lower(), name, Path(name).stem}
+        candidates.extend(path for key in keys for path in index.get(key, ()))
+    if not candidates:
+        return None
+
+    if kind == "image":
+        candidates = [path for path in candidates if path.suffix.lower() == ".dat"]
+    elif kind == "video":
+        candidates = [path for path in candidates if path.suffix.lower() == ".mp4"]
+    elif kind == "file":
+        candidates = [
+            path
+            for path in candidates
+            if path.suffix.lower() not in {"", ".dat", ".mp4"}
+        ]
+    if not candidates:
+        return None
+
+    def rank(path: Path) -> tuple[int, int]:
+        suffix = path.stem[32:] if kind == "image" else ""
+        priority = {"": 0, "_h": 1, "_t": 2}.get(suffix, 3)
+        return priority, -path.stat().st_mtime_ns
+
+    return min(set(candidates), key=rank)
+
+
+def _voice_data(databases: Iterable[Path], start_ms: int) -> dict[tuple[str, int], bytes]:
+    candidates: dict[tuple[str, int], set[bytes]] = defaultdict(set)
+    for path in databases:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            if not {"Name2Id", "VoiceInfo"}.issubset(_tables(connection)):
+                continue
+            for session_id, local_id, raw in connection.execute(
+                "SELECT n.user_name, v.local_id, v.voice_data FROM VoiceInfo v "
+                "LEFT JOIN Name2Id n ON v.chat_name_id = n.rowid "
+                "WHERE v.create_time >= ?",
+                (start_ms // 1000,),
+            ):
+                if isinstance(session_id, str) and isinstance(
+                    raw, (bytes, bytearray, memoryview)
+                ):
+                    candidates[(session_id, int(local_id or 0))].add(bytes(raw))
+        finally:
+            connection.close()
+    return {
+        key: next(iter(values))
+        for key, values in candidates.items()
+        if key[1] and len(values) == 1
+    }
 
 
 def _zstd(raw: bytes) -> bytes:
@@ -110,6 +341,7 @@ def _message_kind(raw_type: Any, content: str, path: str) -> str:
         value = int(raw_type or 0)
     except (TypeError, ValueError):
         value = 0
+    value &= 0xFFFFFFFF
     if value == 1:
         return "text"
     if value == 3:
@@ -141,6 +373,37 @@ def _rows(connection: sqlite3.Connection, table: str) -> Iterable[dict[str, Any]
     yield from (dict(row) for row in connection.execute(f'SELECT * FROM "{table}"'))
 
 
+def _message_rows(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: dict[str, str],
+    start_ms: int,
+) -> Iterable[dict[str, Any]]:
+    create_time = _column(columns, "create_time")
+    if not create_time:
+        return
+    threshold = start_ms // 1000
+    connection.row_factory = sqlite3.Row
+    if "real_sender_id" not in columns or "Name2Id" not in _tables(connection):
+        yield from (
+            dict(row)
+            for row in connection.execute(
+                f'SELECT * FROM "{table}" WHERE "{create_time}" >= ?',
+                (threshold,),
+            )
+        )
+        return
+    yield from (
+        dict(row)
+        for row in connection.execute(
+            f'SELECT m.*, n.user_name AS __sender_username FROM "{table}" m '
+            "LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid "
+            f'WHERE m."{create_time}" >= ?',
+            (threshold,),
+        )
+    )
+
+
 def _contacts(databases: Iterable[Path]) -> dict[str, str]:
     result: dict[str, str] = {}
     for path in databases:
@@ -156,18 +419,29 @@ def _contacts(databases: Iterable[Path]) -> dict[str, str]:
                     ),
                     None,
                 )
-                display = next(
-                    (
-                        columns.get(name)
-                        for name in ("remark", "nickname", "display_name", "name")
-                        if name in columns
-                    ),
-                    None,
-                )
-                if not username or not display:
+                displays = [
+                    columns[name]
+                    for name in (
+                        "remark",
+                        "nickname",
+                        "nick_name",
+                        "display_name",
+                        "name",
+                    )
+                    if name in columns
+                ]
+                if not username or not displays:
                     continue
                 for row in _rows(connection, table):
-                    key, value = _decode(row.get(username)), _decode(row.get(display))
+                    key = _decode(row.get(username))
+                    value = next(
+                        (
+                            decoded
+                            for display in displays
+                            if (decoded := _decode(row.get(display)))
+                        ),
+                        "",
+                    )
                     if key and value:
                         result[key] = value
         finally:
@@ -215,31 +489,41 @@ def read_messages(
         for path in databases
         if path.name.startswith("media_") or path.name == "message_resource.db"
     )
+    media_files = _media_file_index(dataset.root.parent)
+    voice_data = _voice_data(
+        (path for path in databases if path.name.startswith("media_")), start_ms
+    )
     conversations: dict[str, dict[str, Any]] = {}
     recognized = 0
-    for path in (path for path in databases if path.name.startswith("message_")):
+    my_username = _clean_account_name(dataset.account)
+    for path in clear.glob("message/message_[0-9]*.db"):
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
+            table_sessions = _message_table_sessions(connection)
             for table in _tables(connection):
                 columns = _columns(connection, table)
                 selected = {name: _column(columns, name) for name in FIELD_ALIASES}
                 if (
                     not selected["local_id"]
                     or not selected["create_time"]
-                    or not selected["content"]
+                    or not _matching_columns(columns, "content")
                 ):
                     continue
-                if not selected["talker"] and not selected["sender"]:
+                if (
+                    not selected["talker"]
+                    and not selected["sender"]
+                    and table not in table_sessions
+                ):
                     continue
                 recognized += 1
-                for row in _rows(connection, table):
+                for row in _message_rows(connection, table, columns, start_ms):
                     timestamp = int(row.get(selected["create_time"]) or 0)
                     timestamp_ms = (
                         timestamp if timestamp > 10_000_000_000 else timestamp * 1000
                     )
                     if timestamp_ms < start_ms:
                         continue
-                    content = _decode(row.get(selected["content"]))
+                    content = _row_content(row, columns)
                     talker = (
                         _decode(row.get(selected["talker"]))
                         if selected["talker"]
@@ -248,7 +532,7 @@ def read_messages(
                     sender = (
                         _decode(row.get(selected["sender"]))
                         if selected["sender"]
-                        else ""
+                        else _decode(row.get("__sender_username"))
                     )
                     sender, content = _split_group_sender(sender, content)
                     local_id = int(row.get(selected["local_id"]) or 0)
@@ -268,29 +552,50 @@ def read_messages(
                         content,
                         raw_path,
                     )
+                    packed_info = (
+                        row.get(selected["packed_info"])
+                        if selected["packed_info"]
+                        else None
+                    )
+                    if kind in {"image", "video", "file"} and not local_path:
+                        local_path = _packed_media_path(
+                            packed_info, media_files, kind
+                        )
                     is_send = (
                         int(row.get(selected["is_send"]) or 0)
                         if selected["is_send"]
-                        else 0
+                        else int(sender == my_username)
                     )
-                    session_id = talker or sender
+                    session_id = talker or table_sessions.get(table, "") or sender
                     if not session_id:
                         continue
                     message_id = (
                         server_id or f"{path.stem}:{table}:{local_id}:{timestamp}"
                     )
+                    transcript = _voice_transcript(packed_info) if kind == "voice" else ""
                     media = {"type": kind}
                     if local_path:
                         media["localPath"] = str(local_path)
+                    if transcript:
+                        media["transcript"] = transcript
+                        media["extractionStatus"] = "completed"
+                    elif kind == "voice" and (
+                        raw_voice := voice_data.get((session_id, local_id))
+                    ):
+                        media["_voiceData"] = raw_voice
                     item = {
                         "messageId": message_id,
                         "timestamp": timestamp_ms // 1000,
                         "timestampMs": timestamp_ms,
                         "direction": "out" if is_send else "in",
                         "kind": kind,
-                        "text": _xml_text(content)
-                        if kind in {"text", "link", "quote"}
-                        else "",
+                        "text": (
+                            f"[语音转写] {transcript}"
+                            if transcript
+                            else _xml_text(content)
+                            if kind in {"text", "link", "quote"}
+                            else ""
+                        ),
                         "cursor": {
                             "sortSeq": int(row.get(selected["sort_seq"]) or 0)
                             if selected["sort_seq"]
@@ -329,10 +634,11 @@ def compatibility_summary(clear: Path) -> dict[str, Any]:
     message_count = 0
     recognized = 0
     latest_timestamp = 0
-    shards = sorted(clear.glob("message/message_*.db"))
+    shards = sorted(clear.glob("message/message_[0-9]*.db"))
     for path in shards:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
+            table_sessions = _message_table_sessions(connection)
             for table in _tables(connection):
                 columns = _columns(connection, table)
                 local_id = _column(columns, "local_id")
@@ -345,7 +651,7 @@ def compatibility_summary(clear: Path) -> dict[str, Any]:
                     not local_id
                     or not create_time
                     or not content
-                    or not (talker or sender)
+                    or not (talker or sender or table in table_sessions)
                 ):
                     continue
                 recognized += 1
@@ -376,9 +682,10 @@ def compatibility_summary(clear: Path) -> dict[str, Any]:
 def read_message_metadata(clear: Path, start_ms: int) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     recognized = 0
-    for path in sorted(clear.glob("message/message_*.db")):
+    for path in sorted(clear.glob("message/message_[0-9]*.db")):
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
+            table_sessions = _message_table_sessions(connection)
             for table in _tables(connection):
                 columns = _columns(connection, table)
                 local_id = _column(columns, "local_id")
@@ -387,18 +694,19 @@ def read_message_metadata(clear: Path, start_ms: int) -> list[dict[str, Any]]:
                 kind = _column(columns, "kind")
                 talker = _column(columns, "talker")
                 sender = _column(columns, "sender")
-                content = _column(columns, "content")
+                sort_seq = _column(columns, "sort_seq")
                 if (
                     not local_id
                     or not create_time
-                    or not content
-                    or not (talker or sender)
+                    or not (talker or sender or table in table_sessions)
                 ):
                     continue
                 recognized += 1
                 selected = [local_id, create_time]
                 selected.extend(
-                    column for column in (server_id, kind, talker, sender) if column
+                    column
+                    for column in (server_id, kind, talker, sender, sort_seq)
+                    if column
                 )
                 quoted = ", ".join(f'"{column}"' for column in selected)
                 connection.row_factory = sqlite3.Row
@@ -420,9 +728,14 @@ def read_message_metadata(clear: Path, start_ms: int) -> list[dict[str, Any]]:
                             or f"{path.stem}:{table}:{row.get(local_id)}:{timestamp}",
                             "timestamp_ms": timestamp_ms,
                             "kind": _message_kind(row.get(kind) if kind else 0, "", ""),
-                            "session_id": _decode(row.get(talker))
-                            if talker
-                            else _decode(row.get(sender)),
+                            "local_id": int(row.get(local_id) or 0),
+                            "sort_seq": int(row.get(sort_seq) or 0) if sort_seq else 0,
+                            "session_id": (
+                                _decode(row.get(talker))
+                                if talker
+                                else table_sessions.get(table, "")
+                                or _decode(row.get(sender))
+                            ),
                         }
                     )
         finally:
@@ -446,19 +759,125 @@ def _resolve_media_path(account_root: Path, value: str) -> Path | None:
     return resolved if resolved.is_file() else None
 
 
-def _decode_dat(source: Path, destination: Path) -> bool:
+def _decode_wxgf(data: bytes) -> bytes | None:
+    if not data.startswith(b"wxgf"):
+        return data
+    starts = [position for marker in (b"\x00\x00\x00\x01", b"\x00\x00\x01") if (position := data.find(marker)) >= 0]
+    if not starts:
+        return None
+    completed = subprocess.run(
+        [
+            "/opt/homebrew/bin/ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "hevc",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ],
+        input=data[min(starts) :],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def _decrypt_image_dat(data: bytes, image_keys: tuple[int, bytes]) -> bytes | None:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+
+    if len(data) < 15 or data[:6] not in _WECHAT_IMAGE_HEADERS:
+        return None
+    _, aes_size, xor_size = struct.unpack("<6sLLx", data[:15])
+    encrypted_size = aes_size + AES.block_size - aes_size % AES.block_size
+    if encrypted_size > len(data) - 15 or xor_size > len(data) - 15 - encrypted_size:
+        return None
+    rest = data[15:]
+    try:
+        prefix = unpad(
+            AES.new(image_keys[1], AES.MODE_ECB).decrypt(rest[:encrypted_size]),
+            AES.block_size,
+        )
+    except ValueError:
+        return None
+    middle_end = len(rest) - xor_size if xor_size else len(rest)
+    middle = rest[encrypted_size:middle_end]
+    tail = bytes(value ^ image_keys[0] for value in rest[middle_end:])
+    return prefix + middle + tail
+
+
+def _decode_dat(
+    source: Path,
+    destination: Path,
+    image_keys: tuple[int, bytes] | None = None,
+) -> bool:
     raw = source.read_bytes()
-    signatures = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF")
-    if any(raw.startswith(signature) for signature in signatures):
+    if raw[:6] in _WECHAT_IMAGE_HEADERS:
+        if not image_keys or not (raw := _decrypt_image_dat(raw, image_keys)):
+            return False
+        if raw.startswith(b"wxgf"):
+            raw = _decode_wxgf(raw) or b""
+    if any(raw.startswith(signature) for signature in _IMAGE_SIGNATURES):
         destination.write_bytes(raw)
         return True
-    for signature in signatures:
+    for signature in _IMAGE_SIGNATURES:
         key = raw[0] ^ signature[0] if raw else 0
         decoded = bytes(value ^ key for value in raw)
         if decoded.startswith(signature):
             destination.write_bytes(decoded)
             return True
     return False
+
+
+def probe_image_keys(
+    candidates: Iterable[Path], image_keys: tuple[int, bytes]
+) -> bool:
+    checked = 0
+    with tempfile.TemporaryDirectory(prefix="finance-workbench-image-check-") as temporary:
+        destination = Path(temporary) / "image.png"
+        for source in candidates:
+            try:
+                if source.read_bytes()[:6] not in _WECHAT_IMAGE_HEADERS:
+                    continue
+                checked += 1
+                if _decode_dat(source, destination, image_keys) and _image_decodes(
+                    destination
+                ):
+                    return True
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                pass
+            if checked >= 30:
+                break
+    return False
+
+
+def _image_decodes(path: Path) -> bool:
+    completed = subprocess.run(
+        [
+            "/opt/homebrew/bin/ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
 def _transcribe_voice(path: Path) -> str:
@@ -491,12 +910,19 @@ def _transcribe_voice(path: Path) -> str:
         return str(result.get("text") or "").strip()
 
 
-def enrich_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def enrich_media(
+    messages: list[dict[str, Any]],
+    image_keys: tuple[int, bytes] | None = None,
+) -> list[dict[str, Any]]:
     for message in messages:
         media = message.get("media") if isinstance(message.get("media"), dict) else {}
         kind = str(message.get("kind") or "")
         path_value = str(media.get("localPath") or "")
-        if not path_value:
+        inline_voice = media.pop("_voiceData", None)
+        if kind == "voice" and media.get("extractionStatus") == "completed":
+            message["media"] = media
+            continue
+        if not path_value and not inline_voice:
             if kind in {"image", "voice"}:
                 media["extractionStatus"] = "failed"
                 message["media"] = media
@@ -508,7 +934,7 @@ def enrich_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     image = path
                     if path.suffix.lower() == ".dat":
                         image = Path(decoded.name)
-                        if not _decode_dat(path, image):
+                        if not _decode_dat(path, image, image_keys):
                             media["extractionStatus"] = "failed"
                             continue
                     text = _ocr_image(str(image))
@@ -519,7 +945,13 @@ def enrich_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 else:
                     media["extractionStatus"] = "failed"
             elif kind == "voice":
-                text = _transcribe_voice(path)
+                if inline_voice:
+                    with tempfile.NamedTemporaryFile(suffix=".silk") as voice:
+                        voice.write(bytes(inline_voice))
+                        voice.flush()
+                        text = _transcribe_voice(Path(voice.name))
+                else:
+                    text = _transcribe_voice(path)
                 if text:
                     media["transcript"] = text
                     media["extractionStatus"] = "completed"
@@ -558,13 +990,14 @@ def run_direct_wechat_sync(
     }
     with decrypted_dataset(dataset, load_key) as clear:
         conversations = read_messages(clear, dataset, start_ms)
+    image_keys = load_image_keys(dataset.account)
     scanned = created = skipped = 0
     prepared: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
     for session_id, conversation in conversations.items():
         current = existing.get(session_id)
         if current and current.get("listen_status") == "blocked":
             continue
-        messages = enrich_media(conversation["messages"])
+        messages = enrich_media(conversation["messages"], image_keys)
         if current and current.get("create_time") and mode != "rescan":
             floor = int(current["create_time"]) * 1000 - 5 * 60 * 1000
             messages = [item for item in messages if int(item["timestampMs"]) >= floor]

@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import sqlite3
+import struct
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import zstandard
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 from scripts.personal_wechat_crypto import (
     PersonalWechatKeyError,
     PersonalWechatUnsupportedError,
     WechatDataset,
+    discover_dataset,
     decrypt_database,
     derive_database_key,
     probe_database_key,
@@ -22,8 +27,11 @@ import scripts.personal_wechat_sync as personal_wechat_sync
 from scripts.compare_personal_wechat_readers import comparison_summary
 from scripts.personal_wechat_sync import (
     _decode_dat,
+    _decode_wxgf,
     compatibility_summary,
     enrich_media,
+    probe_image_keys,
+    read_message_metadata,
     read_messages,
 )
 
@@ -67,6 +75,17 @@ def _wechat_encrypted_database(path: Path, account_key: str, sqlcipher: Path) ->
     assert path.read_bytes()[:16] == salt
 
 
+def _wechat_image_dat(
+    payload: bytes, aes_key: bytes, xor_key: int, signature: bytes = b"\x07\x08V2\x08\x07"
+) -> bytes:
+    aes_size = min(19, len(payload) - 4)
+    xor_size = min(4, len(payload) - aes_size)
+    encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(pad(payload[:aes_size], 16))
+    middle = payload[aes_size : len(payload) - xor_size]
+    tail = bytes(value ^ xor_key for value in payload[len(payload) - xor_size :])
+    return struct.pack("<6sLLx", signature, aes_size, xor_size) + encrypted + middle + tail
+
+
 def test_snapshot_keeps_database_wal_and_shm(tmp_path: Path) -> None:
     root = tmp_path / "account" / "db_storage"
     message = root / "message" / "message_0.db"
@@ -83,6 +102,175 @@ def test_snapshot_keeps_database_wal_and_shm(tmp_path: Path) -> None:
     snapshot = snapshot_dataset(dataset, tmp_path / "snapshot")
     assert (snapshot / "message/message_0.db-wal").read_bytes() == b"-wal"
     assert (snapshot / "message/message_0.db-shm").read_bytes() == b"-shm"
+
+
+def test_discovery_excludes_full_text_search_database(tmp_path: Path) -> None:
+    root = tmp_path / "account/db_storage"
+    for relative in (
+        "message/message_0.db",
+        "message/message_fts.db",
+        "message/message_resource.db",
+        "contact/contact.db",
+        "session/session.db",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+
+    dataset = discover_dataset(tmp_path)
+
+    assert [path.name for path in dataset.databases] == [
+        "contact.db",
+        "message_0.db",
+        "message_resource.db",
+        "session.db",
+    ]
+
+
+def test_reads_wechat_4_hashed_message_tables(tmp_path: Path) -> None:
+    account = tmp_path / "wxid_self_abcd"
+    clear = account / "db_storage"
+    session_id = "group@chatroom"
+    table = f"Msg_{hashlib.md5(session_id.encode()).hexdigest()}"
+    _database(
+        clear / "message/message_0.db",
+        f'''CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
+            INSERT INTO Name2Id(rowid, user_name, is_session) VALUES
+                (1, '{session_id}', 1), (2, 'wxid_self', 0),
+                (3, 'wxid_colleague', 0);
+            CREATE TABLE "{table}"(
+                local_id INTEGER, server_id INTEGER, local_type INTEGER,
+                sort_seq INTEGER, real_sender_id INTEGER, create_time INTEGER,
+                message_content BLOB, compress_content BLOB
+            );
+            INSERT INTO "{table}" VALUES
+                (1, 101, 1, 1, 3, 1800000000, '请跟进合同', NULL),
+                (2, 102, 1, 2, 2, 1800000100, '收到', NULL);''',
+    )
+    _database(
+        clear / "contact/contact.db",
+        "CREATE TABLE contact(username TEXT, remark TEXT, nick_name TEXT); "
+        "INSERT INTO contact VALUES ('wxid_colleague', '', '同事');",
+    )
+    _database(
+        clear / "session/session.db", "CREATE TABLE SessionTable(username TEXT)"
+    )
+    dataset = WechatDataset(account.name, clear, tuple(sorted(clear.rglob("*.db"))))
+
+    conversations = read_messages(clear, dataset, 0)
+    metadata = read_message_metadata(clear, 0)
+
+    assert conversations[session_id]["messages"][0]["text"] == "请跟进合同"
+    assert conversations[session_id]["messages"][0]["sender"]["name"] == "同事"
+    assert conversations[session_id]["messages"][0]["direction"] == "in"
+    assert conversations[session_id]["messages"][1]["direction"] == "out"
+    assert [item["session_id"] for item in metadata] == [session_id, session_id]
+
+
+def test_reads_wechat_4_packed_image_filename(tmp_path: Path) -> None:
+    account = tmp_path / "wxid_self_abcd"
+    clear = account / "db_storage"
+    session_id = "group@chatroom"
+    table = f"Msg_{hashlib.md5(session_id.encode()).hexdigest()}"
+    file_id = "ab" * 16
+    image = account / "msg/image/2026-09" / f"{file_id}_t.dat"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"synthetic")
+    filename_field = bytes([4 << 3 | 2, len(file_id)]) + file_id.encode()
+    packed = bytes([3 << 3 | 2, len(filename_field)]) + filename_field
+    _database(
+        clear / "message/message_0.db",
+        f'''CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
+            INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (1, '{session_id}', 1);
+            CREATE TABLE "{table}"(
+                local_id INTEGER, local_type INTEGER, create_time INTEGER,
+                message_content BLOB, packed_info_data BLOB
+            );''',
+    )
+    connection = sqlite3.connect(clear / "message/message_0.db")
+    try:
+        connection.execute(
+            f'INSERT INTO "{table}" VALUES (?, ?, ?, ?, ?)',
+            (1, 3, 1_800_000_000, b"", packed),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _database(clear / "contact/contact.db", "CREATE TABLE contact(id INTEGER)")
+    _database(clear / "session/session.db", "CREATE TABLE session(id INTEGER)")
+    dataset = WechatDataset(account.name, clear, tuple(sorted(clear.rglob("*.db"))))
+
+    message = read_messages(clear, dataset, 0)[session_id]["messages"][0]
+
+    assert message["media"]["localPath"] == str(image)
+
+
+def test_reads_wechat_4_voice_transcript_and_media_blob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    account = tmp_path / "wxid_self_abcd"
+    clear = account / "db_storage"
+    session_id = "group@chatroom"
+    table = f"Msg_{hashlib.md5(session_id.encode()).hexdigest()}"
+    transcript = "请复核本月报表"
+    transcript_bytes = transcript.encode()
+    inner = bytes([2 << 3 | 2, len(transcript_bytes)]) + transcript_bytes
+    packed = bytes([5 << 3 | 2, len(inner)]) + inner
+    _database(
+        clear / "message/message_0.db",
+        f'''CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY, is_session INTEGER);
+            INSERT INTO Name2Id(rowid, user_name, is_session) VALUES (1, '{session_id}', 1);
+            CREATE TABLE "{table}"(
+                local_id INTEGER, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, message_content BLOB, packed_info_data BLOB
+            );''',
+    )
+    connection = sqlite3.connect(clear / "message/message_0.db")
+    try:
+        connection.executemany(
+            f'INSERT INTO "{table}" VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                (1, 101, 34, 1_800_000_000, b"voice", packed),
+                (2, 102, 34, 1_800_000_001, b"voice", b""),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _database(clear / "contact/contact.db", "CREATE TABLE contact(id INTEGER)")
+    _database(clear / "session/session.db", "CREATE TABLE session(id INTEGER)")
+    _database(
+        clear / "message/media_0.db",
+        "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY); "
+        "INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'group@chatroom'); "
+        "CREATE TABLE VoiceInfo("
+        "chat_name_id INTEGER, create_time INTEGER, local_id INTEGER, "
+        "svr_id INTEGER, voice_data BLOB, data_index INTEGER);",
+    )
+    connection = sqlite3.connect(clear / "message/media_0.db")
+    try:
+        connection.executemany(
+            "INSERT INTO VoiceInfo VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, 1_800_000_000, 1, 101, b"silk-one", 0),
+                (1, 1_800_000_001, 2, 102, b"silk-two", 0),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    dataset = WechatDataset(account.name, clear, tuple(sorted(clear.rglob("*.db"))))
+
+    messages = read_messages(clear, dataset, 0)[session_id]["messages"]
+
+    assert messages[0]["text"] == f"[语音转写] {transcript}"
+    assert messages[0]["media"]["extractionStatus"] == "completed"
+    assert "_voiceData" not in messages[0]["media"]
+    assert messages[1]["media"]["_voiceData"] == b"silk-two"
+    monkeypatch.setattr(personal_wechat_sync, "_transcribe_voice", lambda _path: "补充转写")
+    enriched = enrich_media([messages[1]])[0]
+    assert enriched["text"] == "[语音转写] 补充转写"
+    assert "_voiceData" not in enriched["media"]
 
 
 def test_reads_split_messages_contacts_group_sender_and_media(tmp_path: Path) -> None:
@@ -305,6 +493,39 @@ def test_failed_media_decode_never_creates_placeholder_task_text(
     result = enrich_media(messages)[0]
     assert result["text"] == ""
     assert result["media"]["extractionStatus"] == "failed"
+
+
+@pytest.mark.parametrize("signature", [b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"])
+def test_decrypts_wechat_4_image_with_manual_keys(
+    tmp_path: Path, signature: bytes
+) -> None:
+    aes_key = b"0123456789abcdef"
+    xor_key = 0x53
+    payload = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    source = tmp_path / "image.dat"
+    destination = tmp_path / "image.jpg"
+    source.write_bytes(_wechat_image_dat(payload, aes_key, xor_key, signature))
+
+    assert _decode_dat(source, destination, (xor_key, aes_key))
+    assert destination.read_bytes() == payload
+    assert probe_image_keys([source], (xor_key, aes_key))
+    assert not _decode_dat(source, destination, (xor_key, b"fedcba9876543210"))
+
+
+def test_wxgf_conversion_passes_only_hevc_bitstream_to_ffmpeg(monkeypatch) -> None:
+    seen: dict[str, bytes] = {}
+
+    def run(_command, **kwargs):
+        seen["input"] = kwargs["input"]
+        return subprocess.CompletedProcess([], 0, b"\x89PNGsynthetic", b"")
+
+    monkeypatch.setattr(personal_wechat_sync.subprocess, "run", run)
+    result = _decode_wxgf(b"wxgf-container\x00\x00\x00\x01hevc")
+
+    assert result == b"\x89PNGsynthetic"
+    assert seen["input"] == b"\x00\x00\x00\x01hevc"
 
 
 def test_failed_media_stops_before_any_message_write(

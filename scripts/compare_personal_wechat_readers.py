@@ -19,12 +19,24 @@ from scripts.wechat_sync import _epoch_ms, _messages, _sessions
 def comparison_summary(
     direct: list[dict[str, Any]], legacy: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    def kind_group(value: Any) -> str:
+        kind = str(value or "0")
+        if kind.startswith("app_") or kind in {"file", "link", "quote"}:
+            return "app"
+        return kind
+
+    def identity(item: dict[str, Any]) -> str:
+        if item.get("local_id") is None or item.get("sort_seq") is None:
+            return str(item.get("id"))
+        return f"{item.get('sort_seq')}|{item.get('local_id')}"
+
     def signatures(items: list[dict[str, Any]]) -> set[str]:
         return {
             hashlib.sha256(
                 (
-                    f"{item.get('session_id')}|{item.get('id')}|"
-                    f"{item.get('timestamp_ms')}|{item.get('kind')}"
+                    f"{item.get('session_id')}|{item.get('sort_seq')}|"
+                    f"{item.get('timestamp_ms')}|{identity(item)}|"
+                    f"{kind_group(item.get('kind'))}"
                 ).encode()
             ).hexdigest()
             for item in items
@@ -51,6 +63,11 @@ async def _legacy_metadata(
             if session_id not in session_ids:
                 continue
             for message in await _messages(ciphertalk, session_id, start_ms):
+                cursor = (
+                    message.get("cursor")
+                    if isinstance(message.get("cursor"), dict)
+                    else {}
+                )
                 result.append(
                     {
                         "id": str(message.get("messageId") or ""),
@@ -59,6 +76,8 @@ async def _legacy_metadata(
                         ),
                         "kind": str(message.get("kind") or "0"),
                         "session_id": session_id,
+                        "local_id": int(cursor.get("localId") or 0),
+                        "sort_seq": int(cursor.get("sortSeq") or 0),
                     }
                 )
     return result

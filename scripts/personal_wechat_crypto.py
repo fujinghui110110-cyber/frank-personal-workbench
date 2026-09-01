@@ -63,7 +63,12 @@ def _database_paths(storage: Path) -> tuple[Path, ...]:
         "contact/contact.db",
         "session/session.db",
     )
-    paths = sorted({path for pattern in patterns for path in storage.glob(pattern)})
+    paths = sorted({
+        path
+        for pattern in patterns
+        for path in storage.glob(pattern)
+        if not path.name.startswith("message_fts")
+    })
     required = (
         any(
             path.parent.name == "message" and path.name.startswith("message_")

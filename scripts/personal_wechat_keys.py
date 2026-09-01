@@ -17,6 +17,8 @@ from typing import Any
 _SECURITY = "/usr/bin/security"
 KEYCHAIN_SERVICE = "finance-workbench-personal-wechat"
 _INDEX_SERVICE = f"{KEYCHAIN_SERVICE}-labels"
+_IMAGE_XOR_SERVICE = f"{KEYCHAIN_SERVICE}-image-xor"
+_IMAGE_AES_SERVICE = f"{KEYCHAIN_SERVICE}-image-aes"
 _ITEM_NOT_FOUND = 44
 _KEY_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _KEYCHAIN_PROMPTS = (
@@ -43,6 +45,27 @@ def validate_key(value: str) -> str:
     if not _KEY_PATTERN.fullmatch(key):
         raise ValueError("数据库密钥必须是64位十六进制字符串")
     return key.lower()
+
+
+def validate_image_xor_key(value: str | int) -> int:
+    raw = str(value).strip().lower()
+    try:
+        key = int(raw, 16) if raw.startswith("0x") else int(raw)
+    except ValueError as error:
+        raise ValueError("图片 XOR 密钥必须是 0x00 至 0xFF") from error
+    if not 0 <= key <= 0xFF:
+        raise ValueError("图片 XOR 密钥必须是 0x00 至 0xFF")
+    return key
+
+
+def validate_image_aes_key(value: str) -> bytes:
+    try:
+        key = value.rstrip("\r\n").encode("ascii")
+    except (AttributeError, UnicodeEncodeError) as error:
+        raise ValueError("图片 AES 密钥必须是 16 位 ASCII 字符") from error
+    if len(key) != 16:
+        raise ValueError("图片 AES 密钥必须是 16 位 ASCII 字符")
+    return key
 
 
 def _run_security_prompt(
@@ -186,6 +209,22 @@ def load_key(account: str, database: str) -> str | None:
         raise RuntimeError("macOS 钥匙串中的数据库密钥格式无效") from error
 
 
+def load_image_keys(account: str) -> tuple[int, bytes] | None:
+    account = _label(account, "微信账号")
+    xor_result = _find(_IMAGE_XOR_SERVICE, account)
+    aes_result = _find(_IMAGE_AES_SERVICE, account)
+    if xor_result.returncode == _ITEM_NOT_FOUND and aes_result.returncode == _ITEM_NOT_FOUND:
+        return None
+    if xor_result.returncode != 0 or aes_result.returncode != 0:
+        raise RuntimeError("个人微信图片密钥不完整，需要重新配置")
+    try:
+        xor_key = validate_image_xor_key(xor_result.stdout)
+        aes_key = validate_image_aes_key(aes_result.stdout)
+    except ValueError as error:
+        raise RuntimeError("macOS 钥匙串中的图片密钥格式无效") from error
+    return xor_key, aes_key
+
+
 def store_key(account: str, database: str, key: str) -> None:
     account = _label(account, "微信账号")
     database = _label(database, "数据库标签")
@@ -222,6 +261,14 @@ def store_keys(account: str, database_keys: Sequence[tuple[str, str]]) -> None:
             separators=(",", ":"),
         ),
     )
+
+
+def store_image_keys(account: str, xor_key: str | int, aes_key: str) -> None:
+    account = _label(account, "微信账号")
+    xor_value = validate_image_xor_key(xor_key)
+    aes_value = validate_image_aes_key(aes_key).decode("ascii")
+    _store_item(_IMAGE_XOR_SERVICE, account, f"0x{xor_value:02x}")
+    _store_item(_IMAGE_AES_SERVICE, account, aes_value)
 
 
 def delete_key(account: str, database: str) -> None:

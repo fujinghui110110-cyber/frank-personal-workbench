@@ -57,6 +57,18 @@ def test_store_load_list_and_delete_use_keychain_without_secret_arguments(
     assert any(key in str(kwargs.get("input", "")) for _, kwargs in fake.calls)
 
 
+def test_store_and_load_image_keys_without_secret_arguments(monkeypatch) -> None:
+    fake = _FakeKeychain()
+    monkeypatch.setattr(personal_wechat_keys.os, "isatty", lambda _fd: False)
+    monkeypatch.setattr(personal_wechat_keys.subprocess, "run", fake)
+    aes_key = "0123456789abcdef"
+
+    personal_wechat_keys.store_image_keys("wxid-frank", "0x53", aes_key)
+
+    assert personal_wechat_keys.load_image_keys("wxid-frank") == (0x53, aes_key.encode())
+    assert all(aes_key not in args for args, _ in fake.calls)
+
+
 def test_store_keys_replaces_invalid_legacy_label_index(monkeypatch) -> None:
     fake = _FakeKeychain()
     account = "wxid-frank"
