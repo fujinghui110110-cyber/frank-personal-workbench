@@ -502,6 +502,13 @@ class WechatService:
 
     def consolidate_pending_candidates(self) -> dict[str, int]:
         now = utc_now()
+        released = self.database.fetch_one(
+            "SELECT created_at FROM audit_events WHERE action = 'analysis.released' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        if not released:
+            return {"ignored": 0, "merged": 0, "continued": 0}
+        released_at = str(released["created_at"])
         cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat(
             timespec="seconds"
         ).replace("+00:00", "Z")
@@ -512,7 +519,9 @@ class WechatService:
             rows = connection.execute(
                 "SELECT x.*, m.text_note FROM wechat_candidates x "
                 "JOIN materials m ON m.id = x.material_id "
-                "WHERE x.status = 'pending' ORDER BY x.session_id, x.created_at, x.id"
+                "WHERE x.status = 'pending' AND x.updated_at >= ? "
+                "ORDER BY x.session_id, x.created_at, x.id",
+                (released_at,),
             ).fetchall()
             keepers: list[dict[str, Any]] = []
             for raw_row in rows:
@@ -574,7 +583,7 @@ class WechatService:
                 "SELECT * FROM wechat_candidates WHERE id = ? AND status = 'pending'",
                 (candidate_id,),
             )
-            if candidate and self._auto_continue_open_matter(candidate, "jarvis-batch"):
+            if candidate and self._auto_accept_actionable_candidate(candidate, "jarvis-batch"):
                 continued += 1
         return {"ignored": ignored, "merged": merged, "continued": continued}
 
@@ -1088,7 +1097,7 @@ class WechatService:
             (account_fingerprint, session_id, source, sort_seq, create_time, local_id, now, now),
         )
 
-    def _auto_continue_open_matter(
+    def _auto_accept_actionable_candidate(
         self, candidate: dict[str, Any], actor: str
     ) -> dict[str, Any] | None:
         if candidate.get("classification") != "relevant":
@@ -1097,15 +1106,25 @@ class WechatService:
             confidence = float(candidate.get("confidence") or 0)
         except (TypeError, ValueError):
             confidence = 0
-        if confidence < 0.9 or candidate.get("uncertainty_reason"):
+        if confidence < 0.95 or candidate.get("uncertainty_reason"):
             return None
         extracted = _json(candidate.get("extracted_json"), {})
         if extracted.get("conflict") or extracted.get("conflicts"):
             return None
-        matter_id = self._find_open_matter(candidate, require_unique=True)
-        if not matter_id:
+        actions = extracted.get("actions") or []
+        if not any(
+            isinstance(item, dict)
+            and str(item.get("kind") or "task") in _FOLLOW_UP_KINDS
+            and str(item.get("title") or "").strip()
+            for item in actions
+        ):
             return None
-        return self.resolve_candidate(candidate["id"], "accept", actor, matter_id)
+        matter_id = self._find_open_matter(candidate, require_unique=True)
+        if matter_id:
+            return self.resolve_candidate(candidate["id"], "accept", actor, matter_id)
+        if self._find_open_matter(candidate):
+            return None
+        return self.resolve_candidate(candidate["id"], "accept", actor)
 
     def complete_classification(
         self,

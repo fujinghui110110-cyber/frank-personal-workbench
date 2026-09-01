@@ -12,7 +12,7 @@
       content="Frank 的个人工作台"
     />
     <link rel="manifest" href="/manifest.webmanifest?v=24" />
-    <link rel="stylesheet" href="/static/app.css?v=55" />
+    <link rel="stylesheet" href="/static/app.css?v=59" />
     <title>Frank 的个人工作台</title>
   </head>
   <body>
@@ -98,6 +98,14 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4l8 7.2v8.3a.5.5 0 0 1-.5.5H15v-6H9v6H4.5a.5.5 0 0 1-.5-.5z" /></svg>
               <span>跟进事项</span>
             </a>
+            <a href="#/wechat" data-route="wechat">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z" /><path d="M8 9h8M8 12h5" /></svg>
+              <span>聊天监控</span><b id="wechat-count" hidden>0</b>
+            </a>
+            <a href="#/email" data-route="email">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4z" /><path d="m4 7 8 6 8-6" /></svg>
+              <span>邮件工作</span><b id="email-count" hidden>0</b>
+            </a>
             <a href="#/policies" data-route="policies">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h9l3 3V20.5H6z" /><path d="M15 3.5v3h3M9 11h6M9 15h6" /></svg>
               <span>公司规定</span>
@@ -161,8 +169,8 @@
                 <small id="attention-total">目前没有等待确认</small>
               </div>
               <nav class="work-queue-bar" aria-label="待确认与来源入口">
-                <a href="#/wechat" data-route="wechat"><span>聊天线索</span><b id="wechat-count" hidden>0</b></a>
-                <a href="#/email" data-route="email"><span>邮件工作</span><b id="email-count" hidden>0</b></a>
+                <a href="#/wechat" data-route="wechat"><span>聊天线索</span></a>
+                <a href="#/email" data-route="email"><span>邮件工作</span></a>
                 <a href="#/reviews" data-route="reviews"><span>需要拍板</span><b id="review-count" hidden>0</b></a>
                 <a href="#/policies" data-route="policies"><span>公司规定</span><b id="policy-count" hidden>0</b></a>
                 <a class="work-queue-status" href="#/nodes" data-route="nodes"><span class="status-dot" id="shortcut-node-dot"></span><span>运行状态</span></a>
@@ -409,6 +417,6 @@
         <span></span><strong>贾维斯正在整理页面</strong>
       </div>
     </template>
-    <script src="/static/app.js?v=55" defer></script>
+    <script src="/static/app.js?v=59" defer></script>
   </body>
 </html>

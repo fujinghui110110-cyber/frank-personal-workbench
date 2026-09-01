@@ -349,6 +349,7 @@ CREATE TABLE IF NOT EXISTS email_messages (
     summary TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
     evidence_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL,
     source_text TEXT NOT NULL DEFAULT '',
     material_id TEXT REFERENCES materials(id),
     status TEXT NOT NULL,
@@ -783,6 +784,8 @@ class Database:
                 connection.execute(
                     "ALTER TABLE email_messages ADD COLUMN ignored_action_ids_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "confidence" not in email_columns:
+                connection.execute("ALTER TABLE email_messages ADD COLUMN confidence REAL")
             connection.executescript(SEARCH_TRIGGERS)
             connection.execute(
                 "UPDATE actions SET flow_state = CASE kind "

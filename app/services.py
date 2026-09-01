@@ -1513,6 +1513,8 @@ class WorkbenchService:
         matters = self.database.fetch_all(
             "SELECT m.*, "
             "(SELECT COUNT(*) FROM materials x WHERE x.matter_id = m.id) AS material_count, "
+            "(SELECT GROUP_CONCAT(DISTINCT x.source_type) FROM materials x "
+            "WHERE x.matter_id = m.id) AS source_types_csv, "
             "(SELECT COUNT(*) FROM actions a WHERE a.matter_id = m.id AND a.status = 'open') "
             "AS open_action_count, "
             "((SELECT COUNT(*) FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') + "
@@ -1525,10 +1527,16 @@ class WorkbenchService:
             "WHERE x.matter_id = m.id AND j.status IN "
             "('queued', 'claimed', 'processing', 'retryable_failed', 'needs_review')) "
             "AS active_job_count "
-            "FROM matters m ORDER BY m.updated_at DESC LIMIT ?",
+            "FROM matters m WHERE m.status <> 'dismissed' "
+            "ORDER BY m.updated_at DESC LIMIT ?",
             (limit,),
         )
         for matter in matters:
+            matter["source_types"] = [
+                value
+                for value in str(matter.pop("source_types_csv") or "").split(",")
+                if value
+            ]
             self._attach_matter_contact(matter)
             status_override = bool(matter.pop("status_override", 0))
             computed_complete = not any(
@@ -1541,7 +1549,9 @@ class WorkbenchService:
                 )
             )
             matter["is_completed"] = (
-                matter["status"] == "completed" if status_override else computed_complete
+                matter["status"] in {"completed", "dismissed"}
+                if status_override
+                else computed_complete
             )
             if not status_override:
                 matter["status"] = "completed" if computed_complete else "active"
@@ -1807,7 +1817,9 @@ class WorkbenchService:
             )
         )
         matter["is_completed"] = (
-            matter["status"] == "completed" if status_override else computed_complete
+            matter["status"] in {"completed", "dismissed"}
+            if status_override
+            else computed_complete
         )
         if not status_override:
             matter["status"] = "completed" if computed_complete else "active"
@@ -1925,17 +1937,24 @@ class WorkbenchService:
             return updated
         if "status" in changes:
             status = changes.get("status")
-            if status not in {"active", "completed"}:
-                raise ValueError("事项状态只能是 active 或 completed")
+            if status not in {"active", "completed", "dismissed"}:
+                raise ValueError("事项状态不受支持")
             now = utc_now()
             with self.database.connect() as connection:
-                if status == "completed":
+                if status in {"completed", "dismissed"}:
                     connection.execute(
-                        "UPDATE actions SET status = 'done', flow_state = 'completed', "
+                        "UPDATE actions SET status = ?, flow_state = 'completed', "
                         "completion_evidence = CASE WHEN TRIM(COALESCE(completion_evidence, '')) = '' "
-                        "THEN '事项由用户直接标记完成' ELSE completion_evidence END, updated_at = ? "
+                        "THEN ? ELSE completion_evidence END, updated_at = ? "
                         "WHERE matter_id = ? AND status = 'open'",
-                        (now, matter_id),
+                        (
+                            "done" if status == "completed" else "dismissed",
+                            "事项由用户直接标记完成"
+                            if status == "completed"
+                            else "人工判断为非工作任务",
+                            now,
+                            matter_id,
+                        ),
                     )
                     connection.execute(
                         "UPDATE reminders SET status = 'done', updated_at = ? "
@@ -1973,7 +1992,13 @@ class WorkbenchService:
                 actor,
                 "matter",
                 matter_id,
-                "事项已标记为已完成" if status == "completed" else "事项已重新打开",
+                (
+                    "事项已标记为已完成"
+                    if status == "completed"
+                    else "事项已移出工作任务"
+                    if status == "dismissed"
+                    else "事项已重新打开"
+                ),
                 payload,
             )
         if "target_date" not in changes:

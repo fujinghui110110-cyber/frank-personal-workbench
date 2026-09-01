@@ -1,9 +1,9 @@
-const SHELL_CACHE = "frank-personal-workbench-shell-v55";
+const SHELL_CACHE = "frank-personal-workbench-shell-v59";
 const SHELL = [
   "/",
   "/static/index.html",
-  "/static/app.css?v=55",
-  "/static/app.js?v=55",
+  "/static/app.css?v=59",
+  "/static/app.js?v=59",
   "/manifest.webmanifest?v=29",
 ];
 

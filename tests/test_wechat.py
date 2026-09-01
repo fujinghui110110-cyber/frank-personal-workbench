@@ -160,7 +160,7 @@ def _complete_next_wechat_job(client: TestClient, result: dict) -> dict:
     return response.json()
 
 
-def test_same_conversation_keeps_one_pending_card_and_all_evidence(
+def test_same_conversation_keeps_one_pending_confirmation_and_all_evidence(
     client: TestClient,
 ) -> None:
     login(client)
@@ -481,6 +481,59 @@ def test_existing_low_value_pending_candidate_is_auto_ignored(client: TestClient
     assert candidate == {"classification": "irrelevant", "status": "ignored"}
 
 
+def test_new_high_confidence_wechat_task_enters_open_matters_after_reconcile(
+    client: TestClient,
+) -> None:
+    login(client)
+    now = int(datetime.now(UTC).timestamp())
+    created = client.post(
+        "/api/wechat/windows",
+        json=window_payload(
+            [message(301, now, "请赵楠完成月度预算差异复核并反馈")],
+            session_id="new-actionable-task",
+        ),
+        headers=worker_headers(),
+    ).json()
+    _complete_next_wechat_job(
+        client,
+        {
+            "classification": "relevant",
+            "summary": "月度预算差异需要复核并反馈",
+            "confidence": 0.96,
+            "evidence": ["请赵楠完成月度预算差异复核并反馈"],
+            "extracted": {
+                "matter_title": "月度预算差异复核",
+                "actions": [
+                    {
+                        "kind": "task",
+                        "title": "复核月度预算差异并反馈",
+                        "owner": "赵楠",
+                    }
+                ],
+            },
+        },
+    )
+
+    reconciled = client.post("/api/analysis/reconcile")
+
+    assert reconciled.status_code == 200, reconciled.text
+    candidate = next(
+        item
+        for item in client.get(
+            "/api/wechat/candidates?candidate_status=accepted&limit=20"
+        ).json()
+        if item["id"] == created["candidate_id"]
+    )
+    matter = next(
+        item
+        for item in client.get("/api/matters?limit=500").json()
+        if item["id"] == candidate["matter_id"]
+    )
+    assert matter["title"] == "月度预算差异复核"
+    assert matter["is_completed"] is False
+    assert matter["open_action_count"] == 1
+
+
 def test_initial_sync_reads_only_the_last_week(monkeypatch) -> None:
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
 
@@ -779,10 +832,11 @@ def test_same_matter_is_merged_across_conversations(client: TestClient) -> None:
 
     reconciled = client.post("/api/analysis/reconcile")
     assert reconciled.status_code == 200, reconciled.text
-    pending = client.get("/api/wechat/candidates?candidate_status=pending").json()
-    assert len(pending) == 1
-    assert len(pending[0]["evidence"]) == 2
-    assert len(pending[0]["extracted"]["actions"]) == 2
+    accepted = client.get("/api/wechat/candidates?candidate_status=accepted").json()
+    assert len(accepted) == 1
+    assert len(accepted[0]["evidence"]) == 2
+    assert len(accepted[0]["extracted"]["actions"]) == 2
+    assert len(client.get("/api/matters?limit=500").json()) == 1
 
 
 def test_accepted_follow_up_reuses_only_open_same_topic_matter(client: TestClient) -> None:

@@ -34,6 +34,7 @@ searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
     sourceReceiptDismissed: false,
     followUpMatterId: null,
     followUpContact: "all",
+    followUpSource: "all",
     followUpQuery: "",
     followUpView: "open",
     followUpMatter: null,
@@ -301,9 +302,9 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
       assistant_channel: "贾维斯",
         wechat_markdown: "微信记录",
     wecom_approval: "企微审批",
-    wechat_auto: "微信自动发现",
-    wecom_auto: "企业微信自动发现",
-    email_auto: "邮箱自动收件",
+      wechat_auto: "个人微信",
+      wecom_auto: "企业微信",
+      email_auto: "邮件",
       }[source] || "材料"
     );
   }
@@ -1348,10 +1349,10 @@ function renderEmail(status, messages, matters) {
     ? messages
         .map(
           (item) => `<article class="email-work-card" data-email-message="${escapeHtml(item.id)}">
-            <header><div><small>${fmtDate(item.sent_at)}</small><h3>${escapeHtml(emailSubject(item.subject || item.matter_title))}</h3></div><span>需要推进</span></header>
+              <header><div><small>${fmtDate(item.sent_at)}</small><h3>${escapeHtml(emailSubject(item.subject || item.matter_title))}</h3></div><span>${item.matter_id ? "需要推进" : "待确认"}</span></header>
             <p>${escapeHtml(emailSummary(item.summary, "已识别出需要继续推进的工作邮件", 320))}</p>
             ${item.evidence?.length ? `<div class="email-evidence"><strong>邮件中的明确要求</strong><ul>${item.evidence.map((value) => `<li>${escapeHtml(humanText(value, "", 360))}</li>`).join("")}</ul></div>` : ""}
-            <footer>${item.matter_id ? `<a class="button button-secondary" href="#/matter/${encodeURIComponent(item.matter_id)}">查看事项推进</a>` : ""}<button class="button button-quiet" type="button" data-email-ignore>不是工作</button></footer>
+              <footer>${item.matter_id ? `<a class="button button-secondary" href="#/matter/${encodeURIComponent(item.matter_id)}">查看事项推进</a>` : `<button class="button button-primary" type="button" data-email-confirm>确认纳入</button>`}<button class="button button-quiet" type="button" data-email-ignore>不是工作</button></footer>
           </article>`,
         )
         .join("")
@@ -1422,6 +1423,22 @@ function renderEmail(status, messages, matters) {
             toast(friendlyError(error), "error");
           }
         });
+      } catch (error) {
+        button.disabled = false;
+        toast(friendlyError(error), "error");
+      }
+    }),
+  );
+  $$("[data-email-confirm]").forEach((button) =>
+    button.addEventListener("click", async () => {
+      const card = button.closest("[data-email-message]");
+      button.disabled = true;
+      try {
+        await api(`/api/email/messages/${encodeURIComponent(card.dataset.emailMessage)}/confirm`, {
+          method: "POST",
+        });
+        toast("已纳入待完成事项", "success");
+        await refreshRouteWithoutJump();
       } catch (error) {
         button.disabled = false;
         toast(friendlyError(error), "error");
@@ -1645,6 +1662,26 @@ function renderEmail(status, messages, matters) {
     return name ? humanText(name, fallback, 80) : fallback;
   }
 
+  function matterSourceTypes(item) {
+    return [
+      ...new Set([
+        ...(Array.isArray(item?.source_types) ? item.source_types : []),
+        ...(item?.materials || []).map((material) => material.source_type),
+      ].filter(Boolean)),
+    ];
+  }
+
+  function matterMatchesSource(item, source) {
+    if (source === "all") return true;
+    const types = matterSourceTypes(item);
+    if (source === "personal_wechat")
+      return types.some((type) => ["personal_wechat", "wechat_auto"].includes(type));
+    if (source === "wecom")
+      return types.some((type) => ["wecom", "wecom_auto"].includes(type));
+    if (source === "email") return types.some((type) => ["email", "email_auto"].includes(type));
+    return types.includes(source);
+  }
+
   function followUpVisibleMatters() {
     const query = state.followUpQuery.trim().toLowerCase();
     return state.matters.filter((item) => {
@@ -1653,12 +1690,13 @@ function renderEmail(status, messages, matters) {
       const contact = matterContactName(item);
       const contactMatches =
         state.followUpContact === "all" || contact === state.followUpContact;
+      const sourceMatches = matterMatchesSource(item, state.followUpSource);
       const searchMatches =
         !query ||
         `${matterTitle(item.title)} ${contact} ${humanText(item.summary, "", 500)}`
           .toLowerCase()
           .includes(query);
-      return statusMatches && contactMatches && searchMatches;
+      return statusMatches && contactMatches && sourceMatches && searchMatches;
     });
   }
 
@@ -1701,9 +1739,7 @@ function renderEmail(status, messages, matters) {
     list.innerHTML = visible.length
       ? visible
           .map((item) => {
-            const sources = [
-              ...new Set((item.materials || []).map((source) => sourceLabel(source.source_type))),
-            ];
+          const sources = matterSourceTypes(item).map(sourceLabel);
             const sourceText = sources.length ? sources.join("、") : "工作信息";
             return `<button class="follow-up-row ${item.id === state.followUpMatterId ? "active" : ""}" type="button" data-follow-up-id="${escapeHtml(item.id)}">
               <strong>${escapeHtml(matterTitle(item.title))}</strong>
@@ -1856,7 +1892,7 @@ function renderEmail(status, messages, matters) {
       : `<section class="follow-up-review">
           <h2>本次复盘</h2>
           <div class="follow-up-question"><strong>今天与 ${escapeHtml(contact)} 复盘后，这项工作是否已经完成？</strong><span>完成后直接归档；尚未完成，只需记录本次进展和下次复盘日期。</span></div>
-          <div class="follow-up-actions"><button class="button button-secondary" type="button" data-follow-up-progress-open>记录工作进展</button><button class="button button-primary" type="button" data-follow-up-complete>事项已完成</button></div>
+        <div class="follow-up-actions"><button class="button button-secondary" type="button" data-follow-up-progress-open>记录工作进展</button><button class="button button-primary" type="button" data-follow-up-complete>事项已完成</button><button class="button button-quiet" type="button" data-follow-up-dismiss>不是工作任务</button></div>
           <form class="follow-up-progress-form" data-follow-up-progress hidden>
             <label>本次工作进展<textarea name="detail" rows="4" maxlength="2000" required placeholder="例如：已与对接人复盘，资料还差一项，预计明天下午补齐。"></textarea></label>
             <label>下次复盘日期<input name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"></label>
@@ -2031,13 +2067,34 @@ function renderEmail(status, messages, matters) {
           body: JSON.stringify({ status: "completed" }),
         });
         updateFollowUpMatter(updated);
-        state.followUpView = "completed";
+        state.followUpView = "open";
         renderFollowUpList({ chooseMatter: false });
         await refreshFollowUpMatter();
         toast("事项已完成并归档");
       } catch (error) {
         button.disabled = false;
         toast(friendlyError(error, "事项完成失败"));
+      }
+    });
+    $("[data-follow-up-dismiss]", detail)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "dismissed" }),
+        });
+        state.matters = state.matters.filter((item) => item.id !== state.followUpMatterId);
+        state.followUpMatterId = null;
+        renderFollowUpList({ chooseMatter: false });
+        const next = followUpVisibleMatters()[0];
+        if (next) await selectFollowUpMatter(next.id);
+        else renderFollowUpMatter(null, []);
+        toast("已移出工作任务");
+      } catch (error) {
+        button.disabled = false;
+        toast(friendlyError(error, "移出工作任务失败"));
       }
     });
     $("[data-follow-up-reopen]", detail)?.addEventListener("click", async (event) => {
@@ -2082,7 +2139,7 @@ function renderEmail(status, messages, matters) {
     const contacts = new Set(openItems.map((item) => matterContactName(item)));
     page().innerHTML = `<section class="follow-up-desk">
       <aside class="follow-up-sidebar">
-        <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待复盘 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
+        <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><label>按来源查看<select id="follow-up-source"><option value="all">全部来源</option><option value="personal_wechat">个人微信</option><option value="wecom">企业微信</option><option value="email">邮件</option></select></label><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待完成 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
         <div id="follow-up-list" class="follow-up-list"></div>
       </aside>
       <section class="follow-up-workspace"><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。新信息会先与未完成事项比对，同一事项会自动归并。</span></div><div id="follow-up-detail"></div></section>
@@ -2093,6 +2150,11 @@ function renderEmail(status, messages, matters) {
     });
     $("#follow-up-contact")?.addEventListener("change", (event) => {
       state.followUpContact = event.target.value;
+      renderFollowUpList();
+    });
+    $("#follow-up-source").value = state.followUpSource;
+    $("#follow-up-source")?.addEventListener("change", (event) => {
+      state.followUpSource = event.target.value;
       renderFollowUpList();
     });
     $$('[data-follow-up-view]', page()).forEach((button) =>
@@ -2498,10 +2560,7 @@ function renderMatter(matter, people = [], timeline = []) {
   }
 }
 
-function bindDynamic() {
-    $$("[data-open-intake]").forEach((button) =>
-      button.addEventListener("click", openIntake),
-    );
+  function bindDynamic() {
     $$("[data-analysis-retry]").forEach((button) =>
       button.addEventListener("click", async () => {
         const original = button.textContent;
@@ -3016,6 +3075,17 @@ function updateWechatCount(count) {
     showLogin();
   }
 
+  async function waitForAnalysisCompletion() {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const status = await api("/api/analysis/status");
+      if (!Number(status.pending || 0) && !Number(status.running || 0)) {
+        return status;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    }
+    throw new Error("整理仍在后台继续，完成后刷新页面即可看到最新待完成事项");
+  }
+
   async function runPendingAnalysis() {
     const button = $("#run-analysis-global");
     if (!button) return;
@@ -3027,14 +3097,16 @@ function updateWechatCount(count) {
       const needsReview = Number(result.needs_review || 0);
       toast(
         released
-          ? `已交给贾维斯整理 ${released} 份新内容`
+          ? `贾维斯正在整理 ${released} 份新内容`
           : needsReview
           ? `有 ${needsReview} 份内容需要检查`
           : "现在没有等待整理的新内容",
         released ? "success" : needsReview ? "error" : "info",
       );
       if (!released && needsReview) window.location.hash = "#/intake";
+      if (released) await waitForAnalysisCompletion();
       await refreshRouteWithoutJump();
+      if (released) toast("整理完成，待完成事项已更新", "success");
       await refreshAnalysisButton();
     } catch (error) {
       toast(friendlyError(error), "error");
@@ -3276,6 +3348,9 @@ function updateWechatCount(count) {
   }
 
   function setupIntake() {
+    document.addEventListener("click", (event) => {
+      if (event.target.closest("[data-open-intake]")) openIntake();
+    });
     $("#intake-form").addEventListener("submit", submitIntake);
     $("[data-close-dialog]").addEventListener("click", closeIntake);
     $("#choose-file").addEventListener("click", () =>
@@ -3350,7 +3425,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-      navigator.serviceWorker.register("/sw.js?v=55").catch(() => {});
+      navigator.serviceWorker.register("/sw.js?v=59").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;

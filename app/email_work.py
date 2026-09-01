@@ -416,6 +416,10 @@ class EmailWorkService:
         if classification not in {"work", "irrelevant"}:
             classification = "irrelevant"
         needs_follow_up = classification == "work" and bool(result.get("needs_follow_up"))
+        try:
+            confidence = float(result.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0
         policy_relevant = bool(result.get("_policy_relevant"))
         summary = _clean_email_routing(result.get("summary"))[:1000]
         reason = _clean_email_routing(result.get("reason"))[:500]
@@ -426,7 +430,10 @@ class EmailWorkService:
         ]
         actions = [item for item in (result.get("actions") or [])[:12] if isinstance(item, dict)]
         work = classification == "work" and needs_follow_up
+        accepted_work = work and confidence >= 0.95
         matter_id = result.get("matter_id") if work else None
+        if not accepted_work:
+            matter_id = None
         if matter_id and not self._matter_is_open(str(matter_id)):
             matter_id = None
         if work and not matter_id:
@@ -448,7 +455,7 @@ class EmailWorkService:
             )
         now = utc_now()
         with self.database.connect() as connection:
-            if work and not matter_id:
+            if accepted_work and not matter_id:
                 matter_id = _id("matter")
                 title = (
                     _clean_email_subject(result.get("matter_title"))
@@ -460,7 +467,7 @@ class EmailWorkService:
                     "VALUES (?, ?, ?, ?, ?)",
                     (matter_id, title, summary, now, now),
                 )
-            elif work and matter_id:
+            elif accepted_work and matter_id:
                 connection.execute(
                     "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
                     (summary, now, matter_id),
@@ -469,7 +476,7 @@ class EmailWorkService:
             status = "active" if work or policy_relevant else "ignored"
             connection.execute(
                 "UPDATE email_messages SET classification = ?, needs_follow_up = ?, "
-                "summary = ?, reason = ?, evidence_json = ?, status = ?, matter_id = ?, "
+                "summary = ?, reason = ?, evidence_json = ?, confidence = ?, status = ?, matter_id = ?, "
                 "source_text = '', updated_at = ? WHERE id = ?",
                 (
                     classification,
@@ -477,13 +484,14 @@ class EmailWorkService:
                     summary,
                     reason,
                     json.dumps(evidence, ensure_ascii=False),
+                    confidence,
                     status,
                     matter_id,
                     now,
                     message_id,
                 ),
             )
-            if work and matter_id:
+            if accepted_work and matter_id:
                 for item in actions:
                     title = _clean_email_routing(item.get("title"))
                     if not title:
@@ -508,7 +516,7 @@ class EmailWorkService:
                             now,
                         ),
                     )
-            if work and matter_id:
+            if accepted_work and matter_id:
                 prefill_matter_contact(connection, matter_id, actions, now)
 
             if message.get("material_id"):
@@ -532,6 +540,53 @@ class EmailWorkService:
                     path.unlink(missing_ok=True)
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
         return self._public_message(row or {})
+
+    def confirm_message(self, message_id: str, actor: str) -> dict[str, Any]:
+        row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
+        if not row:
+            raise KeyError("邮件不存在")
+        if row.get("matter_id"):
+            return self._public_message(row)
+        if row.get("classification") != "work" or not row.get("needs_follow_up"):
+            raise ValueError("这封邮件不是待确认工作")
+        now = utc_now()
+        matter_id = _id("matter")
+        action_id = _id("action")
+        title = (row.get("subject") or row.get("summary") or "邮件工作事项")[:120]
+        action_title = (row.get("summary") or row.get("subject") or "跟进邮件要求")[:160]
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO matters (id, title, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (matter_id, title, row.get("summary") or "", now, now),
+            )
+            connection.execute(
+                "INSERT INTO actions (id, matter_id, material_id, kind, title, detail, status, "
+                "created_by, created_at, updated_at) VALUES (?, ?, ?, 'task', ?, ?, 'open', ?, ?, ?)",
+                (
+                    action_id,
+                    matter_id,
+                    row.get("material_id"),
+                    action_title,
+                    row.get("reason") or "",
+                    f"email:{message_id}",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE email_messages SET matter_id = ?, updated_at = ? WHERE id = ?",
+                (matter_id, now, message_id),
+            )
+            if row.get("material_id"):
+                connection.execute(
+                    "UPDATE materials SET matter_id = ?, status = 'processed', updated_at = ? WHERE id = ?",
+                    (matter_id, now, row["material_id"]),
+                )
+        self.database.audit(
+            _id("audit"), actor, "email.confirmed", "email_message", message_id, matter_id
+        )
+        confirmed = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
+        return self._public_message(confirmed or {})
 
     def ignore_message(self, message_id: str, actor: str) -> dict[str, Any]:
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
@@ -598,6 +653,7 @@ class EmailWorkService:
             "SELECT e.*, m.title AS matter_title FROM email_messages e "
             "LEFT JOIN matters m ON m.id = e.matter_id WHERE e.status = ? "
             "AND (? <> 'active' OR "
+            "e.matter_id IS NULL OR "
             "EXISTS (SELECT 1 FROM actions a WHERE a.matter_id = e.matter_id AND a.status = 'open') OR "
             "EXISTS (SELECT 1 FROM review_items r WHERE r.matter_id = e.matter_id AND r.status = 'pending') OR "
             "EXISTS (SELECT 1 FROM reminders x WHERE x.matter_id = e.matter_id "

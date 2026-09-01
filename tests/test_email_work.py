@@ -203,6 +203,7 @@ def test_pending_email_waits_for_manual_analysis_and_creates_work(client: TestCl
             "message_id": pending.json()["id"],
             "result": {
                 "classification": "work",
+                "confidence": 0.98,
                 "needs_follow_up": True,
                 "summary": "需要在本周内复核预算差异并反馈。",
                 "reason": "存在明确期限和反馈要求",
@@ -217,6 +218,50 @@ def test_pending_email_waits_for_manual_analysis_and_creates_work(client: TestCl
     assert completed.json()["status"] == "active"
     assert completed.json()["matter_id"]
     assert client.get("/api/analysis/status").json()["pending"] == 0
+
+
+def test_lower_confidence_email_waits_for_confirmation(client: TestClient) -> None:
+    owner_login(client)
+    client.post("/api/email/accounts/register", json=ACCOUNT, headers=worker_headers())
+    saved = client.post(
+        "/api/email/messages", json=pending_message(21), headers=worker_headers()
+    ).json()
+    client.post("/api/analysis/run")
+    job = claim_email_analysis(client)
+    lease = {"worker_id": "mac-air", "lease_token": job["lease_token"]}
+    client.post(f"/api/jobs/{job['id']}/start", json=lease, headers=worker_headers())
+
+    completed = client.post(
+        f"/api/email/jobs/{job['id']}/complete",
+        json={
+            **lease,
+            "message_id": saved["id"],
+            "result": {
+                "classification": "work",
+                "confidence": 0.8,
+                "needs_follow_up": True,
+                "summary": "可能需要复核预算差异",
+                "reason": "要求不够明确",
+                "evidence": ["请关注预算差异"],
+            },
+        },
+        headers=worker_headers(),
+    )
+
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["matter_id"] is None
+    assert client.get("/api/matters").json() == []
+
+    confirmed = client.post(f"/api/email/messages/{saved['id']}/confirm")
+    assert confirmed.status_code == 200, confirmed.text
+    matter_id = confirmed.json()["matter_id"]
+    assert matter_id
+    assert len(client.get("/api/matters").json()) == 1
+
+    dismissed = client.patch(f"/api/matters/{matter_id}", json={"status": "dismissed"})
+    assert dismissed.status_code == 200, dismissed.text
+    assert dismissed.json()["status"] == "dismissed"
+    assert client.get("/api/matters").json() == []
 
 
 def test_email_ai_prefills_dynamic_contact(client: TestClient) -> None:
@@ -242,6 +287,7 @@ def test_email_ai_prefills_dynamic_contact(client: TestClient) -> None:
             "message_id": pending["id"],
             "result": {
                 "classification": "work",
+                "confidence": 0.98,
                 "needs_follow_up": True,
                 "summary": "预算差异需要复核并反馈",
                 "reason": "邮件明确安排了跟进人",
@@ -425,6 +471,7 @@ def test_bad_email_job_lease_has_no_business_side_effects(client: TestClient) ->
             "message_id": email["id"],
             "result": {
                 "classification": "work",
+                "confidence": 0.98,
                 "needs_follow_up": True,
                 "summary": "不应写入",
                 "matter_title": "不应创建事项",

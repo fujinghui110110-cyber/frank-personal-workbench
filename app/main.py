@@ -95,7 +95,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         database.initialize()
         service.ensure_search_index()
-        await asyncio.to_thread(wechat.consolidate_pending_candidates)
         reminder_task = asyncio.create_task(refresh_loop())
         try:
             yield
@@ -689,6 +688,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         context: AuthContext = Depends(require_scope("wechat:write")),
     ) -> dict[str, Any]:
         return email_work.ignore_message(message_id, context.actor)
+
+    @app.post("/api/email/messages/{message_id}/confirm")
+    def confirm_email_message(
+        message_id: str,
+        context: AuthContext = Depends(require_scope("wechat:write")),
+    ) -> dict[str, Any]:
+        return email_work.confirm_message(message_id, context.actor)
 
     @app.post("/api/email/messages/{message_id}/restore")
     def restore_email_message(

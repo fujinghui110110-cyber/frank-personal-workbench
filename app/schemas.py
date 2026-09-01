@@ -25,7 +25,7 @@ class MatterUpdateRequest(BaseModel):
     summary: str | None = Field(default=None, max_length=4000)
     contact_name: str | None = Field(default=None, max_length=80)
     target_date: str | None = Field(default=None, max_length=10)
-    status: Literal["active", "completed"] | None = None
+    status: Literal["active", "completed", "dismissed"] | None = None
 
 
 class MatterProgressRequest(BaseModel):
