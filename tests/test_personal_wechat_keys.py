@@ -270,7 +270,7 @@ def test_configuration_probes_one_ciphertalk_key_for_all_databases(
 
     assert configured == 3
     assert len(prompts) == 1
-    assert "CipherTalk" in prompts[0]
+    assert "个人微信数据库" in prompts[0]
     assert [database for _, database, _ in saved] == [
         "contact/contact.db",
         "session/session.db",

@@ -312,6 +312,26 @@ def test_reads_split_messages_contacts_group_sender_and_media(tmp_path: Path) ->
     assert decoded.read_bytes() == jpeg
 
 
+def test_direct_reader_ignores_wecom_bridge_notice(tmp_path: Path) -> None:
+    account = tmp_path / "account"
+    root = account / "db_storage"
+    _database(
+        root / "message/message_0.db",
+        "CREATE TABLE messages(localId INTEGER, createTime INTEGER, talker TEXT, sender TEXT, isSend INTEGER, type INTEGER, content BLOB, localPath TEXT);",
+        [
+            (1, 1_800_000_000, "alice", "", 0, 1, "你收到一条消息，请在企业微信中查看", ""),
+            (2, 1_800_000_001, "alice", "", 0, 1, "请跟进合同付款", ""),
+        ],
+    )
+    _database(root / "contact/contact.db", "CREATE TABLE contacts(id INTEGER)")
+    _database(root / "session/session.db", "CREATE TABLE sessions(id INTEGER)")
+    dataset = WechatDataset("account", root, tuple(sorted(root.rglob("*.db"))))
+
+    messages = read_messages(root, dataset, 0)["alice"]["messages"]
+
+    assert [item["text"] for item in messages] == ["请跟进合同付款"]
+
+
 def test_reads_compressed_text_voice_video_file_link_and_quote(tmp_path: Path) -> None:
     account = tmp_path / "account"
     root = account / "db_storage"

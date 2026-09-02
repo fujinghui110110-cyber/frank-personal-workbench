@@ -50,15 +50,15 @@ def test_only_missing_ciphertalk_sessions_are_skipped() -> None:
     assert not _is_missing_session(RuntimeError("CipherTalk 尚未准备好"))
 
 
-def test_personal_wechat_reader_switch_keeps_ciphertalk_as_default(monkeypatch) -> None:
+def test_personal_wechat_reader_switch_uses_direct_as_default(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
     monkeypatch.delenv("PERSONAL_WECHAT_READER", raising=False)
     monkeypatch.setattr(
-        "scripts.wechat_sync.run_ciphertalk_sync",
-        lambda _client, mode: calls.append(("ciphertalk", mode)) or {"messages": 0},
+        "scripts.personal_wechat_sync.run_direct_wechat_sync",
+        lambda _client, mode: calls.append(("direct", mode)) or {"messages": 0},
     )
     assert run_personal_wechat_sync(object(), "incremental") == {"messages": 0}
-    assert calls == [("ciphertalk", "incremental")]
+    assert calls == [("direct", "incremental")]
 
 
 def test_personal_wechat_reader_switch_uses_direct_only_when_enabled(
@@ -73,6 +73,31 @@ def test_personal_wechat_reader_switch_uses_direct_only_when_enabled(
         "messages": 2,
         "mode": "rescan",
     }
+
+
+def test_wecom_bridge_notice_is_filtered_without_breaking_pagination() -> None:
+    class CipherTalk:
+        async def call(self, method, payload=None):
+            assert method == "get_messages"
+            if payload["offset"] == 0:
+                return {
+                    "items": [
+                        message(
+                            1,
+                            1_800_000_000,
+                            "你收到一条消息，请在企业微信中查看",
+                        )
+                    ],
+                    "hasMore": True,
+                }
+            return {
+                "items": [message(2, 1_800_000_001, "请跟进合同付款")],
+                "hasMore": False,
+            }
+
+    result = asyncio.run(wechat_sync._messages(CipherTalk(), "session", 1))
+
+    assert [item["messageId"] for item in result] == [2]
 
 
 def message(local_id: int, timestamp: int, text: str = "请跟进合同付款") -> dict:

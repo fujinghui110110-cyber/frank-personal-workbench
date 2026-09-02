@@ -23,7 +23,9 @@
     <key>WORKBENCH_SYNC_INBOX</key>
     <string>__WORKBENCH_SYNC_INBOX__</string>
     <key>PERSONAL_WECHAT_READER</key>
-    <string>ciphertalk</string>
+    <string>direct</string>
+    <key>PERSONAL_WECHAT_DIRECT_ENABLED_AT</key>
+    <string>__PERSONAL_WECHAT_DIRECT_ENABLED_AT__</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

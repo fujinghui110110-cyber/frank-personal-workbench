@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,18 @@ from scripts.ciphertalk_client import CipherTalkClient, open_ciphertalk
 
 
 VISION_OCR_SCRIPT = Path(__file__).with_name("vision_ocr.swift")
+
+
+def is_ignored_personal_wechat_notice(value: Any) -> bool:
+    if isinstance(value, dict):
+        texts = (value.get("text"), value.get("content"))
+    else:
+        texts = (value,)
+    return any(
+        "你收到一条消息，请在企业微信中查看"
+        in re.sub(r"\s+", "", str(text or "")).replace(",", "，")
+        for text in texts
+    )
 
 
 def _epoch_ms(value: Any) -> int:
@@ -80,11 +93,15 @@ async def _messages(
                 "includeMediaPaths": True,
             },
         )
-        batch = page.get("items") if isinstance(page.get("items"), list) else []
-        items.extend(batch)
-        if not page.get("hasMore") or not batch:
+        raw_batch = page.get("items") if isinstance(page.get("items"), list) else []
+        items.extend(
+            message
+            for message in raw_batch
+            if not is_ignored_personal_wechat_notice(message)
+        )
+        if not page.get("hasMore") or not raw_batch:
             return items
-        offset += len(batch)
+        offset += len(raw_batch)
 
 
 def _ocr_image(local_path: str) -> str:
@@ -233,7 +250,7 @@ def run_ciphertalk_sync(
 def run_personal_wechat_sync(
     client: WorkbenchClient, mode: str = "incremental"
 ) -> dict[str, int]:
-    reader = os.getenv("PERSONAL_WECHAT_READER", "ciphertalk").strip().lower()
+    reader = os.getenv("PERSONAL_WECHAT_READER", "direct").strip().lower()
     if reader == "ciphertalk":
         return run_ciphertalk_sync(client, mode)
     if reader == "direct":

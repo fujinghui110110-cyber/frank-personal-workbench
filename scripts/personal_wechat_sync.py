@@ -22,7 +22,11 @@ from scripts.personal_wechat_crypto import (
 )
 from scripts.personal_wechat_keys import load_image_keys, load_key
 from scripts.transcription import transcribe_material
-from scripts.wechat_sync import _ocr_image, group_messages
+from scripts.wechat_sync import (
+    _ocr_image,
+    group_messages,
+    is_ignored_personal_wechat_notice,
+)
 
 
 FIELD_ALIASES = {
@@ -541,6 +545,8 @@ def read_messages(
                         else _decode(row.get("__sender_username"))
                     )
                     sender, content = _split_group_sender(sender, content)
+                    if is_ignored_personal_wechat_notice(content):
+                        continue
                     local_id = int(row.get(selected["local_id"]) or 0)
                     server_id = (
                         _decode(row.get(selected["server_id"]))

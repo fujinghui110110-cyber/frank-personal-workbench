@@ -49,7 +49,7 @@ def configure_dataset(
 
         if missing:
             key = validate_key(
-                prompt("CipherTalk 数据库连接密钥（不会显示）：")
+                prompt("个人微信数据库连接密钥（不会显示）：")
             )
             matched = [
                 (label, key)
@@ -61,10 +61,10 @@ def configure_dataset(
             print(f"只读校验结果：已匹配 {total_matched}/{total} 个数据库。")
             if total_matched != total:
                 raise RuntimeError(
-                    f"CipherTalk 连接密钥只匹配 {total_matched}/{total} 个数据库。"
+                    f"个人微信数据库连接密钥只匹配 {total_matched}/{total} 个数据库。"
                     "这不代表输入错误；该密钥已按微信 4.x 的逐库派生方式校验，"
                     "当前微信版本或部分数据库的加密参数可能仍不兼容。"
-                    "工作台未启用个人微信直读，现有 CipherTalk 读取方式保持不变。"
+                    "个人微信直读配置未更新，当前读取方式保持不变。"
                 )
             configured.extend(matched)
 
@@ -96,8 +96,8 @@ def configure_image_keys(
     aes_key = validate_image_aes_key(aes_text)
     if not probe_image_keys(candidates, (xor_key, aes_key)):
         raise RuntimeError(
-            "图片密钥未通过只读校验。工作台未启用个人微信直读，"
-            "现有 CipherTalk 读取方式保持不变。"
+            "图片密钥未通过只读校验。个人微信直读配置未更新，"
+            "当前读取方式保持不变。"
         )
     store_image_keys(dataset.account, xor_key, aes_text)
     return True
