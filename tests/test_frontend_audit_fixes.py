@@ -10,17 +10,17 @@ def test_simple_workbench_keeps_policy_entry_and_explains_auto_merge() -> None:
     script = (STATIC / "app.js").read_text(encoding="utf-8")
 
     assert 'href="#/policies"' in desktop_nav
-    assert "公司规定" in desktop_nav
-    assert "同一事项会自动归并" in script
+    assert "规定" in desktop_nav
+    assert "同一件事会自动汇总到一起" in script
 
 
 def test_workbench_restores_source_monitoring_and_manual_rejection() -> None:
     index = (STATIC / "index.html").read_text(encoding="utf-8")
-    desktop_nav = index.split('id="desktop-nav"', 1)[1].split("</nav>", 1)[0]
     script = (STATIC / "app.js").read_text(encoding="utf-8")
 
-    assert "聊天监控" in desktop_nav
-    assert "邮件工作" in desktop_nav
+    assert "读取新信息" in index
+    assert 'href="#/wechat"' in index
+    assert 'href="#/email"' in index
     assert "data-follow-up-dismiss" in script
     assert 'id="follow-up-source"' in script
     assert 'status: "dismissed"' in script

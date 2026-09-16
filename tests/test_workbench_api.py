@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -743,11 +744,13 @@ def test_frontend_markup_matches_javascript_and_hidden_contracts(
     assert 'id="login-submit"' in response.text
     assert stylesheet.status_code == 200
     assert "[hidden] { display: none !important; }" in stylesheet.text
-    assert '/static/app.css?v=59' in response.text
+    assert '/static/app.css?v=100' in response.text
+    assert '/static/dashboard-reference.css?v=100' in response.text
+    assert '/static/dashboard-responsive.css?v=100' in response.text
     assert '/static/app-evolution.css' not in response.text
-    assert '/static/app.js?v=59' in response.text
+    assert '/static/app.js?v=100' in response.text
     assert service_worker.status_code == 200
-    assert "frank-personal-workbench-shell-v59" in service_worker.text
+    assert "frank-personal-workbench-shell-v100" in service_worker.text
     assert "fetch(request).then" in service_worker.text
     assert ".catch(() => caches.match(request))" in service_worker.text
     assert "Mac 关机时" in response.text
@@ -863,6 +866,31 @@ def test_frontend_exposes_persistent_source_receipt_and_useful_work_rules(
     assert "同一件事持续合并" in script
     assert 'item.rule_type !== "conversation_ignore"' in script
     assert "管理监听范围" in script
+
+
+def test_dashboard_reads_remain_available_while_chat_import_holds_write_lock(
+    client: TestClient,
+) -> None:
+    owner_login(client)
+    database_path = client.app.state.database.path
+    writer = sqlite3.connect(database_path)
+    writer.execute("PRAGMA journal_mode = WAL")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO matters (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        ("matter-lock-test", "模拟正在读取聊天", "2026-09-10T00:00:00Z", "2026-09-10T00:00:00Z"),
+    )
+    try:
+        overview = client.get("/api/overview")
+        today = client.get("/api/today/brief")
+        rules = client.get("/api/learning-rules")
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert overview.status_code == 200, overview.text
+    assert today.status_code == 200, today.text
+    assert rules.status_code == 200, rules.text
 
 
 def test_duplicate_job_completion_creates_result_once(client: TestClient) -> None:

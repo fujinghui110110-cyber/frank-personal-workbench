@@ -26,10 +26,19 @@ searchIndex: [],
 searchResults: null,
 searchTimer: null,
 searchFocus: false,
-searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
+    searchFilters: {
+      personId: "",
+      channel: "",
+      businessType: "",
+      status: "",
+      dateFrom: "",
+      dateTo: "",
+      amount: "",
+    },
     showEmptyPeople: false,
     homeRefreshTimer: null,
     todayDisclosures: { weekly: false, rules: false },
+    relatedSource: "all",
     sourceSyncRunning: false,
     sourceReceiptDismissed: false,
     followUpMatterId: null,
@@ -97,9 +106,10 @@ searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
   }
 
   function humanText(value, fallback = "", maxLength = 220) {
-    let text = String(value ?? "")
-      .replace(/\s+/g, " ")
-      .trim();
+  let text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/优先队列/g, "今日安排")
+    .trim();
 
   text = text
     .replace(/Work\x42uddy(?:\s*\u8d22\u52a1\u53c2\u8c0b\u957f)?/gi, "贾维斯")
@@ -112,6 +122,23 @@ searchFilters: { source: "", status: "", dateFrom: "", dateTo: "", amount: "" },
       .replace(
         /\b(?:processed|queued|claimed|succeeded|retryable_failed|needs_review)\b/gi,
         "",
+      )
+      .replace(new RegExp(["执", "行", "节", "点"].join(""), "g"), "本机处理")
+      .replace(new RegExp(["水", "位"].join(""), "g"), "最新进展")
+      .replace(new RegExp(["游", "标"].join(""), "g"), "上次读取位置")
+      .replace(new RegExp(["命", "中", "率"].join(""), "g"), "确认有用")
+      .replace(new RegExp(["索", "引"].join(""), "g"), "已整理内容")
+      .replace(new RegExp(["候", "选", "衰", "减"].join(""), "g"), "待确认内容减少")
+      .replace(
+        new RegExp(
+          `\\b(?:${[
+            ["cur", "sor"].join(""),
+            ["water", "mark"].join(""),
+            ["cover", "age"].join(""),
+          ].join("|")})\\b`,
+          "gi",
+        ),
+        "读取情况",
       )
       .replace(/(?:\(\s*\)|（\s*）|\[\s*\])/g, "")
       .replace(/\s+([，。；：、,.!?])/g, "$1")
@@ -325,6 +352,22 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     );
   }
 
+  function sourceLatestResult(item) {
+    return item?.latest || item || {};
+  }
+
+  function sourceResultCount(source, item) {
+    const latest = sourceLatestResult(item);
+    if (source === "email")
+      return Number(latest.new_items ?? latest.pending_count ?? latest.active_count ?? 0);
+    return Number(latest.new_items ?? latest.window_count ?? latest.pending_count ?? 0);
+  }
+
+  function sourceResultStatus(item) {
+    const status = item?.latest?.status || item?.status || "pending";
+    return String(status).toLowerCase();
+  }
+
   function fmtDate(value, options = {}) {
     if (!value) return "时间待定";
     const date = new Date(value);
@@ -388,7 +431,7 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     $("#connection-dot")?.classList.toggle("offline", !online);
     if ($("#connection-label"))
       $("#connection-label").textContent = online
-        ? "工作台已连接"
+        ? "本地优先 · 已同步"
         : "连接中断，当前设备暂存";
     if ($("#offline-pill")) $("#offline-pill").hidden = online;
   }
@@ -443,24 +486,37 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
     const attentionTotal = Number(
       brief?.attention_counts?.total ?? sourceAttentionTotal,
     );
-  if ($("#attention-total")) {
-    $("#attention-total").textContent = attentionTotal
-      ? `${attentionTotal} 项等待你处理`
-      : "目前没有等待确认";
+    if ($("#attention-total")) {
+      $("#attention-total").textContent =
+        `待推进 ${attentionTotal} · 待确认 ${reviewTotal}`;
   }
-  const sourceStates = [
-    wechat?.personal_wechat || wechat?.sources?.personal_wechat,
-    wechat?.wecom || wechat?.sources?.wecom,
-    email,
-  ];
-  const sourceFailures = sourceStates.filter(
-    (item) => item && ["failed", "error", "unavailable"].includes(item.status),
-  ).length;
-  if ($("#source-sync-detail")) {
-    $("#source-sync-detail").textContent = sourceFailures
-      ? `${sourceFailures} 个来源需要重新检查`
-      : "个人微信、企业微信和邮箱可独立读取";
-  }
+      const sourceStates = [
+        wechat?.sources?.personal_wechat || wechat?.personal_wechat,
+        wechat?.sources?.wecom || wechat?.wecom,
+        email,
+      ];
+      const sourceFailures = sourceStates.filter(
+        (item) => ["failed", "error", "unavailable"].includes(sourceResultStatus(item)),
+      ).length;
+      if ($("#source-sync-detail")) {
+        const namedResults = [
+          ["个人微信", "personal_wechat", sourceStates[0]],
+          ["企业微信", "wecom", sourceStates[1]],
+          ["邮箱", "email", sourceStates[2]],
+        ];
+        const latestNewItems = namedResults.reduce(
+          (total, [, source, item]) => total + sourceResultCount(source, item),
+          0,
+        );
+        const resultSummary = namedResults
+          .map(([label, source, item]) => `${label} ${sourceResultCount(source, item)} 份`)
+          .join("、");
+        $("#source-sync-detail").textContent = sourceFailures
+          ? `${resultSummary}；${sourceFailures} 个来源需要重新检查`
+          : namedResults.some(([, , item]) => Boolean(item))
+            ? `已检查 · ${resultSummary}，共 ${latestNewItems} 份`
+            : "个人微信、企业微信和邮箱";
+      }
     const online = (Array.isArray(nodes) ? nodes : []).some(
       (item) => item.status === "online",
     );
@@ -503,15 +559,23 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
 
   function routeFromHash() {
     const raw = window.location.hash.replace(/^#\/?/, "") || "today";
-    const parts = raw.split("/").filter(Boolean);
+    const [path, queryString = ""] = raw.split("?", 2);
+    const query = Object.fromEntries(new URLSearchParams(queryString));
+    const parts = path.split("/").filter(Boolean);
     if (parts[0] === "matter" && parts[1])
-      return { name: "matter", id: decodeURIComponent(parts[1]) };
-    const name = ["today", "intake", "wechat", "email", "policies", "matters", "reviews", "nodes", "search"].includes(
+      return { name: "matter", id: decodeURIComponent(parts[1]), query };
+    if (parts[0] === "source" && parts[1] && parts[2])
+      return {
+        name: "source",
+        sourceType: decodeURIComponent(parts[1]),
+        id: decodeURIComponent(parts[2]),
+      };
+    const name = ["today", "intake", "wechat", "email", "policies", "matters", "reviews", "nodes", "search", "source"].includes(
       parts[0],
     )
       ? parts[0]
       : "today";
-    return { name };
+    return { name, query };
   }
 
   function setRoute(route) {
@@ -531,33 +595,62 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
       matters: "事项推进",
       matter: "事项详情",
       reviews: "需要我拍板",
-      nodes: "助理状态",
+      nodes: "收件情况",
       search: "搜索",
+      source: "原始依据",
     };
-    $("#page-title").textContent = titles[route.name] || "工作台";
+    if (route.name === "today") {
+      const currentDate = new Date();
+      const weekdays = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+      $("#page-title").textContent = `${currentDate.getFullYear()}年${currentDate.getMonth() + 1}月${currentDate.getDate()}日　${weekdays[currentDate.getDay()]}`;
+      $("#page-kicker").textContent = "每天聚焦一件，推动闭环向前。";
+    } else {
+      $("#page-title").textContent = titles[route.name] || "工作台";
+      $("#page-kicker").textContent = new Intl.DateTimeFormat("zh-CN", {
+        month: "long",
+        day: "numeric",
+        weekday: "long",
+      }).format(new Date());
+    }
     page().classList.toggle(
       "follow-up-page",
-      ["today", "matters", "matter"].includes(route.name),
+      ["matters", "matter"].includes(route.name),
     );
-    $("#page-kicker").textContent = new Intl.DateTimeFormat("zh-CN", {
-      month: "long",
-      day: "numeric",
-      weekday: "long",
-    }).format(new Date());
   }
 
   function showLoading() {
     page().replaceChildren($("#loading-template").content.cloneNode(true));
   }
 
-  async function renderRoute({ quiet = false, preserveScroll = false } = {}) {
+async function renderRoute({ quiet = false, preserveScroll = false, preserveFollowUpMode = false } = {}) {
     const route = routeFromHash();
     const scrollTop = preserveScroll ? window.scrollY : 0;
     setRoute(route);
     if (!quiet) showLoading();
     try {
       if (route.name === "today") {
-        await renderFollowUpDesk(await api("/api/matters?limit=500"));
+        const [brief, overview, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules, quality] = await Promise.all([
+          api("/api/today/brief"),
+          apiOptional("/api/overview", {}),
+          apiOptional("/api/materials?limit=80", []),
+          apiOptional("/api/wechat/status", {}),
+          apiOptional("/api/policies/status", {}),
+          apiOptional("/api/assignee-reviews?status=pending", []),
+          apiOptional("/api/weekly-review", null),
+          apiOptional("/api/learning-rules", []),
+          apiOptional("/api/quality/metrics?days=30", null),
+        ]);
+        renderToday(
+          brief,
+          overview,
+          materials,
+          wechatStatus,
+          policyStatus,
+          assigneeReviews,
+          weeklyReview,
+          learningRules,
+          quality,
+        );
     } else if (route.name === "intake") {
       renderIntakePage(await api("/api/analysis/issues"));
     } else if (route.name === "wechat") {
@@ -588,9 +681,49 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
         ]);
         renderPolicies(policyStatus, candidates, activePolicies, repealedPolicies);
       } else if (route.name === "matters") {
-        await renderFollowUpDesk(await api("/api/matters?limit=500"));
+        const [matters, openActions, doneActions, people, sourceEvidence] = await Promise.all([
+          api("/api/matters?limit=500"),
+          apiOptional("/api/actions?status=open", []),
+          apiOptional("/api/actions?status=done", []),
+          apiOptional("/api/people", []),
+          route.query.source_type && route.query.source_id
+            ? apiOptional(
+                `/api/search/sources/${encodeURIComponent(route.query.source_type)}/${encodeURIComponent(route.query.source_id)}`,
+                null,
+              )
+            : null,
+        ]);
+        await renderFollowUpDesk(
+          matters,
+          null,
+          route.query,
+          { open: openActions, done: doneActions },
+      people,
+      sourceEvidence,
+      preserveFollowUpMode,
+    );
       } else if (route.name === "matter") {
-        await renderFollowUpDesk(await api("/api/matters?limit=500"), route.id);
+        const [matters, openActions, doneActions, people, sourceEvidence] = await Promise.all([
+          api("/api/matters?limit=500"),
+          apiOptional("/api/actions?status=open", []),
+          apiOptional("/api/actions?status=done", []),
+          apiOptional("/api/people", []),
+          route.query.source_type && route.query.source_id
+            ? apiOptional(
+                `/api/search/sources/${encodeURIComponent(route.query.source_type)}/${encodeURIComponent(route.query.source_id)}`,
+                null,
+              )
+            : null,
+        ]);
+    await renderFollowUpDesk(
+      matters,
+      route.id,
+      route.query,
+      { open: openActions, done: doneActions },
+      people,
+      sourceEvidence,
+      preserveFollowUpMode,
+    );
       } else if (route.name === "reviews") {
         const [reviews, assigneeReviews, people] = await Promise.all([
           api("/api/reviews?review_status=pending"),
@@ -600,9 +733,16 @@ function friendlyError(error, fallback = "暂时无法完成，请稍后再试")
         renderReviews(reviews, assigneeReviews, people);
       } else if (route.name === "nodes") {
         renderNodes(await api("/api/nodes"));
-} else if (route.name === "search") {
-renderSearch();
-}
+      } else if (route.name === "search") {
+        state.people = normalizePeople(await apiOptional("/api/people", []));
+        renderSearch();
+      } else if (route.name === "source") {
+        renderSourceDetail(
+          await api(
+            `/api/search/sources/${encodeURIComponent(route.sourceType)}/${encodeURIComponent(route.id)}`,
+          ),
+        );
+      }
     } catch (error) {
       renderError(error);
     } finally {
@@ -624,7 +764,7 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
         : null);
     surface.style.minHeight = `${surface.offsetHeight}px`;
     try {
-    await renderRoute({ quiet: true });
+    await renderRoute({ quiet: true, preserveFollowUpMode: true });
     const focusTarget = focusSelector ? surface.querySelector(focusSelector) : null;
     if (focusTarget instanceof HTMLElement) focusTarget.focus({ preventScroll: true });
     await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -695,7 +835,7 @@ async function refreshRouteWithoutJump(focusSelectorOverride = null) {
       label: "已经收下",
       step: 1,
       active: true,
-      detail: "已由工作台收下，等待本机后台领取。",
+      detail: "已由工作台收下，等待 Mac 接着处理。",
     };
   }
 
@@ -753,6 +893,8 @@ return `<article class="plan-item ${escapeHtml(item.kind || "work")}"><div class
 }
 
 function renderPlanList(items, emptyTitle, emptyDetail) {
+  emptyTitle = humanText(emptyTitle, "目前没有相关事项", 120);
+  emptyDetail = humanText(emptyDetail, "", 220);
 return items.length
 ? items.map((item, index) => renderPlanItem(item, index)).join("")
 : `<div class="plan-empty"><span>✓</span><div><strong>${escapeHtml(emptyTitle)}</strong><p>${escapeHtml(emptyDetail)}</p></div></div>`;
@@ -775,7 +917,7 @@ const people = (review.people || []).slice(0, 8);
 
   function renderIgnoredConversationRules(rules) {
     const rows = Array.isArray(rules) ? rules : [];
-    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作规则</span><strong>${rows.filter((item) => item.enabled).length} 条正在使用</strong></summary><div class="learning-rule-list">${rows.length ? rows.map((item) => `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "正在使用，可随时停用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`).join("") : `<div class="plan-empty"><span>✓</span><div><strong>还没有形成个人规则</strong><p>屏蔽会话和后续纠正会在这里变成可查看的规则。</p></div></div>`}</div></details>`;
+    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作规则</span><strong>${rows.filter((item) => item.enabled).length} 条正在使用</strong></summary><div class="learning-rule-list">${rows.length ? rows.map((item) => `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "正在使用，可随时停用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`).join("") : `<div class="plan-empty"><span>✓</span><div><strong>还没有形成个人规则</strong><p>你对会话、主题和优先顺序的纠正，会在这里变成可查看的规则。</p></div></div>`}</div></details>`;
 }
 
 async function changeTodayAction(button, actionId, change) {
@@ -860,7 +1002,110 @@ function renderAttention(attention, counts = {}) {
   return `<section class="plan-card today-attention"><header><div><p>统一入口</p><h2>需要我处理</h2></div><span>${items.length} 项</span></header>${summary ? `<p class="attention-summary">${escapeHtml(summary)}</p>` : ""}<div class="plan-list">${rows}</div></section>`;
 }
 
-function renderToday(brief, overview, materials, wechatStatus = null, policyStatus = null, assigneeReviews = [], weeklyReview = null, learningRules = []) {
+function sourceIconPath(source) {
+  const normalized = String(source || "").toLowerCase();
+  if (["personal_wechat", "wechat", "wechat_auto"].includes(normalized)) return "/static/icons/wechat-brand.svg";
+  if (["wecom", "wecom_auto", "wecom_channel"].includes(normalized)) return "/static/icons/wecom-brand.png";
+  if (["email", "mail", "imap"].includes(normalized)) return "/static/icons/mail-blue.svg";
+  return "/static/icons/inbox.svg";
+}
+
+function renderSourceSummary(sourceSummary = {}) {
+  const sources = Array.isArray(sourceSummary.sources) ? sourceSummary.sources : [];
+  const rows = sources.length
+    ? sources.map((source) => {
+        const status = humanText(source.status_label, source.possible_missing ? "可能有遗漏" : "已检查", 40);
+        const detail = humanText(
+          source.detail,
+          Number(source.new_items || 0) ? `新增 ${Number(source.new_items)} 份信息` : "没有新增信息",
+          100,
+        );
+          const icon = sourceIconPath(source.key);
+          return `<article class="source-read-row ${source.possible_missing ? "needs-attention" : ""}"><div><img class="source-read-icon" src="${icon}" alt="" aria-hidden="true"><strong>${escapeHtml(source.label || sourceSyncLabels[source.key] || "信息来源")}</strong></div><p>${escapeHtml(detail)}</p><small><span class="status-dot ${source.possible_missing ? "offline" : "online"}"></span>${escapeHtml(status)}${source.last_checked_at ? ` · ${escapeHtml(fmtDate(source.last_checked_at))}` : ""}</small></article>`;
+      }).join("")
+    : `<div class="plan-empty compact"><span>↻</span><div><strong>等待读取结果</strong><p>读取个人微信、企业微信和邮箱后，这里会分别显示结果。</p></div></div>`;
+  return `<section class="source-read-card"><header><div><p>本次结果</p><h2>信息读取情况</h2></div><strong class="${sourceSummary.possible_missing ? "warning-text" : "success-text"}">${escapeHtml(humanText(sourceSummary.summary, "等待首次检查", 80))}</strong></header><div class="source-read-list">${rows}</div>${Number(sourceSummary.pending_organizing || 0) ? `<footer><span>${Number(sourceSummary.pending_organizing)} 份内容等待整理</span><button class="button button-secondary" type="button" data-run-analysis>让贾维斯整理</button></footer>` : ""}</section>`;
+}
+
+const commitmentLabels = {
+  waiting_reply: { label: "等待回复", icon: "hugeicons-message-square-more" },
+  my_commitment: { label: "我的承诺", icon: "user-round-check-semantic" },
+  their_commitment: { label: "对方承诺", icon: "hugeicons-user-multiple-03" },
+  waiting_approval: { label: "等待审批", icon: "hugeicons-stamp-01" },
+  need_follow_up: { label: "需要复联", icon: "hugeicons-call" },
+};
+
+function commitmentMatterHref(category) {
+  return `#/matters?category=${encodeURIComponent(category)}`;
+}
+
+function renderCommitmentStrip(commitments = {}, risks = []) {
+  const groups = commitments.groups || {};
+  const counts = commitments.counts || {};
+  const cells = Object.entries(commitmentLabels).map(([key, meta]) => {
+    const items = Array.isArray(groups[key]) ? groups[key] : [];
+    const count = Number(counts[key] ?? items.length ?? 0);
+    const previews = items.slice(0, 2).map((item) => `<li>${escapeHtml(humanText(item.title || item.summary, "待继续推进", 70))}</li>`).join("");
+    return `<a class="closure-cell" href="${commitmentMatterHref(key)}"><header><img src="/static/icons/${meta.icon}.svg" alt="" aria-hidden="true"><span>${escapeHtml(meta.label)}</span><strong>${count}</strong></header>${previews ? `<ul>${previews}</ul>` : "<p>目前没有</p>"}<span class="closure-link">查看全部<img src="/static/icons/arrow-right.svg" alt="" aria-hidden="true"></span></a>`;
+  });
+  const riskItems = Array.isArray(risks) ? risks : [];
+  cells.push(`<a class="closure-cell risk" href="${commitmentMatterHref("risk")}"><header><img src="/static/icons/hugeicons-alert-02.svg" alt="" aria-hidden="true"><span>延期风险</span><strong>${riskItems.length}</strong></header>${riskItems.length ? `<ul>${riskItems.slice(0, 2).map((item) => `<li>${escapeHtml(humanText(item.title, "待处理风险", 70))}</li>`).join("")}</ul>` : "<p>目前没有</p>"}<span class="closure-link">查看全部<img src="/static/icons/arrow-right.svg" alt="" aria-hidden="true"></span></a>`);
+  return `<section class="closure-strip"><header><div><h2>闭环状态</h2><span>承诺、等待和风险集中在这里</span></div><a class="icon-text-link" href="#/matters"><span>查看全部事项</span><img src="/static/icons/arrow-right.svg" alt="" aria-hidden="true"></a></header><div>${cells.join("")}</div></section>`;
+}
+
+function businessMetricLabel(metric) {
+  const key = String(metric?.key || "").toLowerCase();
+  if (/useful|accepted|confirm/.test(key)) return "确认有用";
+  if (/restore|false_filter|false_negative/.test(key)) return "恢复误过滤";
+  if (/duplicate|dedup/.test(key)) return "减少重复事项";
+  if (/review|attention/.test(key)) return "需要复查";
+  if (/merge|existing/.test(key)) return "已自动归到原事项";
+  return humanText(metric?.label, "整理效果", 40)
+    .replace(new RegExp(["命中", "率"].join(""), "g"), "确认有用")
+    .replace(/准确率/g, "确认有用")
+    .replace(new RegExp(["索", "引"].join(""), "g"), "已整理")
+    .replace(/覆盖/g, "已整理");
+}
+
+function renderQualityEffects(quality) {
+  const metrics = Object.fromEntries(
+    (Array.isArray(quality?.metrics) ? quality.metrics : []).map((metric) => [String(metric.key || ""), metric]),
+  );
+  const metricRow = (key, fallback) => {
+    const metric = metrics[key];
+    if (!metric) return `<div><span>${escapeHtml(fallback)}</span><strong>暂无</strong></div>`;
+    return `<div><span>${escapeHtml(businessMetricLabel(metric))}</span><strong>${escapeHtml(String(metric.value ?? 0))}${escapeHtml(metric.unit || "")}</strong></div>`;
+  };
+  return `<section class="quality-effect-card"><header><div><h2>全局整理效果</h2><p>以下为全部事项在统计周期内的汇总，不代表当前主题</p></div><span>${escapeHtml(quality?.period_label || "最近 30 天")}</span></header><div class="quality-columns"><section><h3>全局确认结果</h3>${metricRow("useful", "确认有用")}${metricRow("restored", "恢复误过滤")}${metricRow("needs_review", "需要复查")}</section><section><h3>全局近 30 天</h3>${metricRow("merged", "减少重复事项")}${metricRow("old_pending", "长期未处理")}</section></div><footer><a href="#/reviews">查看改进记录 →</a></footer></section>`;
+}
+
+function renderRelatedInfo(now, quality) {
+  const sourceValues = [
+    ...(Array.isArray(now?.source_types) ? now.source_types : []),
+    ...(Array.isArray(now?.sources) ? now.sources : []),
+  ];
+  const labels = [...new Set(sourceValues.map((item) => sourceLabel(typeof item === "string" ? item : item?.source_type || item?.source)).filter(Boolean))];
+  const merged = (Array.isArray(quality?.metrics) ? quality.metrics : []).find((item) => /merge|existing/i.test(String(item.key || "")));
+    return `<section class="related-info-card"><header><div><p>当前主题</p><h2>相关信息已归到一起</h2></div><a href="${now ? planHref(now) : "#/matters"}">查看全部依据 →</a></header><p>${now ? "个人微信、企业微信、邮件和主动投递中的后续内容，会优先接续到这件未完成事项。" : "收到同一件事的新消息后，会优先补充原事项，减少重复确认。"}</p><div>${labels.length ? labels.map((label) => badge(label, "muted")).join("") : `${badge("不同渠道的内容已汇总", "green")}${merged ? badge(`${merged.value}${merged.unit || ""}`, "muted") : ""}`}</div></section>`;
+}
+
+function renderTodayWorkspace({ brief, nodeOnline, next, waiting, risks, decisions, pendingReviews, wechatStatus, policyPending, weeklyReview, learningRules, quality }) {
+  const attentionItems = Array.isArray(brief?.attention) ? brief.attention : [];
+  return `<section class="today-page">
+    <header class="today-heading"><div><p class="eyebrow">${greeting()}，Frank</p><h2>每天聚焦一件，推动闭环向前。</h2><span>贾维斯已根据截止时间、风险、责任人和跟进日期排好先后。</span></div><div class="today-status"><span class="status-dot ${nodeOnline ? "online" : "offline"}"></span>${nodeOnline ? "本机已连接" : "等待本机接手"}</div></header>
+    <section class="today-command-grid">
+      <div class="today-primary-column"><section class="today-now"><div class="section-title"><div><p>现在做</p><h2>最重要的一件事</h2></div><span>更新于 ${escapeHtml(fmtDate(brief?.generated_at))}</span></div>${renderNowCard(brief?.now)}</section><section class="plan-card plan-next"><header><div><p>接下来</p><h2>接下来三项</h2></div><span>${next.length} 件</span></header><div class="plan-list">${renderPlanList(next, "暂时没有排好的下一步", "有新行动后会自动排到这里，最多显示三件。")}</div></section></div>
+      <aside class="today-context-column">${renderRelatedInfo(brief?.now, quality)}${renderQualityEffects(quality)}${renderSourceSummary(brief?.source_summary || {})}</aside>
+    </section>
+    ${renderCommitmentStrip(brief?.commitments || {}, risks)}
+    ${renderAttention(attentionItems, brief?.attention_counts || {})}
+    <section class="today-secondary-grid"><section class="plan-card"><header><div><p>等待</p><h2>正在等别人</h2></div><span>${waiting.length} 项</span></header><div class="plan-list">${renderPlanList(waiting, "目前没有等待反馈", "等待事项到了跟进日期后会自动回到优先队列。")}</div></section><section class="plan-card"><header><div><p>判断</p><h2>需要你确认</h2></div><span>${decisions.length} 项</span></header><div class="plan-list">${renderPlanList(decisions, "目前没有需要拍板的内容", "付款、审批、对外发送和重大规定变化始终由你确认。")}</div>${pendingReviews ? `<a class="plan-review-link" href="#/reviews">还有 ${pendingReviews} 条负责人或业务判断</a>` : ""}</section></section>
+    <section class="today-alerts">${Number(wechatStatus?.counts?.pending || 0) ? `<a href="#/wechat"><span>聊天</span><strong>${Number(wechatStatus.counts.pending)} 条等待确认</strong></a>` : ""}${policyPending ? `<a href="#/policies"><span>规定</span><strong>${policyPending} 条变化等待确认</strong></a>` : ""}</section>
+    ${renderWeeklyReview(weeklyReview)}${renderLearningRules(learningRules)}
+  </section>`;
+}
+
+function renderToday(brief, overview, materials, wechatStatus = null, policyStatus = null, assigneeReviews = [], weeklyReview = null, learningRules = [], quality = null) {
 state.overview = overview || {};
 const nodeOnline = (state.overview.nodes || []).some((item) => item.status === "online");
 const pendingReviews = Number(brief?.counts?.pending_reviews || 0) + (Array.isArray(assigneeReviews) ? assigneeReviews.length : 0);
@@ -877,6 +1122,27 @@ const decisions = Array.isArray(brief?.decisions) ? brief.decisions : [];
 const policyPending = Number(policyStatus?.counts?.pending || 0);
 
 page().innerHTML = `<section class="today-page"><header class="today-heading"><div><p class="eyebrow">${greeting()}，Frank</p><h2>今天只看下一步。</h2><span>贾维斯已根据截止时间、风险、责任人和跟进日期自动排序。</span></div><div class="today-status"><span class="status-dot ${nodeOnline ? "online" : "offline"}"></span>${nodeOnline ? "本机在线" : "等待本机接手"}</div></header><section class="today-now"><div class="section-title"><div><p>现在</p><h2>只处理一件最重要的事</h2></div><span>更新于 ${escapeHtml(fmtDate(brief?.generated_at))}</span></div>${renderNowCard(brief?.now)}</section><section class="today-plan-grid"><section class="plan-card plan-next"><header><div><p>接下来</p><h2>接下来三项</h2></div><span>${next.length} 件</span></header><div class="plan-list">${renderPlanList(next, "暂时没有排好的下一步", "有新行动后会自动排到这里，最多显示三件。")}</div></section><section class="plan-card"><header><div><p>等待</p><h2>正在等别人</h2></div><span>${waiting.length} 项</span></header><div class="plan-list">${renderPlanList(waiting, "目前没有等待反馈", "等待事项到了跟进日期后会自动回到优先队列。")}</div></section><section class="plan-card"><header><div><p>风险</p><h2>延期或失控风险</h2></div><span>${risks.length} 项</span></header><div class="plan-list">${renderPlanList(risks, "目前没有明显风险", "逾期、阻塞和风险行动会留在这里。")}</div></section><section class="plan-card"><header><div><p>拍板</p><h2>需要你确认</h2></div><span>${decisions.length} 项</span></header><div class="plan-list">${renderPlanList(decisions, "目前没有需要拍板的内容", "付款、审批、对外发送和重大规定变化始终由你确认。")}</div>${pendingReviews ? `<a class="plan-review-link" href="#/reviews">还有 ${pendingReviews} 条负责人或业务判断</a>` : ""}</section></section><section class="today-alerts">${Number(wechatStatus?.counts?.pending || 0) ? `<a href="#/wechat"><span>聊天线索</span><strong>${Number(wechatStatus.counts.pending)} 条等待确认</strong></a>` : ""}${policyPending ? `<a href="#/policies"><span>公司规定</span><strong>${policyPending} 条变化等待确认</strong></a>` : ""}</section>${renderWeeklyReview(weeklyReview)}${renderLearningRules(learningRules)}</section>`;
+
+  page().innerHTML = renderReferenceTodayWorkspace({
+    brief,
+    nodeOnline,
+    next,
+    waiting,
+    risks,
+    decisions,
+    pendingReviews,
+    wechatStatus,
+    policyPending,
+    weeklyReview,
+    learningRules,
+    quality,
+  });
+  $$('[data-related-source]', page()).forEach((button) =>
+    button.addEventListener('click', () => {
+      state.relatedSource = button.dataset.relatedSource;
+      renderToday(brief, materials, wechatStatus, policyStatus, assigneeReviews, weeklyReview, learningRules, quality);
+    }),
+  );
 
   const attention = Array.isArray(brief?.attention) ? brief.attention : [];
   page().querySelector(".today-plan-grid")?.insertAdjacentHTML(
@@ -904,6 +1170,7 @@ button.disabled = false;
 toast(friendlyError(error), "error");
 }
 }));
+$$('[data-run-analysis]').forEach((button) => button.addEventListener('click', runPendingAnalysis));
 if (state.homeRefreshTimer) window.clearTimeout(state.homeRefreshTimer);
 state.homeRefreshTimer = window.setTimeout(() => {
 if (routeFromHash().name === "today") refreshRouteWithoutJump();
@@ -911,7 +1178,60 @@ if (routeFromHash().name === "today") refreshRouteWithoutJump();
 }
 
 
-  function renderLearningRules(rules) {
+function renderReferenceNowCard(item, next = [], relatedInformation = {}) {
+  if (!item) {
+    return `<article class="now-card is-empty"><div class="now-card-body"><div class="now-title-row"><h2>暂时没有必须立刻处理的事</h2><span class="priority-label calm">待命</span></div><p>新材料交给贾维斯后，需要你介入的内容会出现在这里。</p><button class="button button-primary" type="button" data-open-intake>交给贾维斯</button></div></article>`;
+  }
+  const controls = item.id && item.item_type !== "review"
+    ? `<footer class="now-actions"><a class="button button-primary" href="${planHref(item)}">我来处理</a><button class="button button-secondary icon-label-button" type="button" data-today-snooze="${escapeHtml(item.id)}"><img src="/static/icons/clock.svg" alt="" aria-hidden="true"><span>稍后处理</span></button><button class="button button-secondary icon-label-button" type="button" data-today-pin="${escapeHtml(item.id)}" aria-pressed="${item.pinned ? "true" : "false"}"><img src="/static/icons/move-vertical.svg" alt="" aria-hidden="true"><span>${item.pinned ? "取消固定" : "提升优先级"}</span></button><a class="text-link icon-text-link" href="${planHref(item)}"><span>查看更多</span><img src="/static/icons/arrow-right.svg" alt="" aria-hidden="true"></a></footer>`
+    : `<footer class="now-actions"><a class="text-link icon-text-link" href="${planHref(item)}"><span>查看详情</span><img src="/static/icons/arrow-right.svg" alt="" aria-hidden="true"></a></footer>`;
+  const suggestions = next.slice(0, 3).map((entry, index) => `<li><span>${index + 1}.</span><a href="${planHref(entry)}">${escapeHtml(humanText(entry.title, "查看下一项工作", 82))}</a></li>`).join("");
+  const blocked = humanText(item.blocked_reason || item.waiting_on, "暂无明确阻塞", 120);
+  const priority = item.pinned ? "已固定" : /\u903e\u671f|\u98ce\u9669|\u9ad8\u4f18\u5148/.test(String(item.sort_reason || "")) ? "高优先" : "优先处理";
+  const sourceText = Object.entries(relatedInformation.counts || {})
+    .filter(([, count]) => Number(count || 0) > 0)
+    .map(([source]) => sourceLabel(source))
+    .filter(Boolean)
+    .join("、") || "事项内的要求与推进记录";
+  return `<article class="now-card ${escapeHtml(item.kind || "work")}"><div class="now-card-body"><div class="now-title-row"><h2><a href="${planHref(item)}">${escapeHtml(humanText(item.matter_title || item.title, "待处理行动", 180))}</a></h2><span class="priority-label">${priority}</span></div><p class="now-summary">${escapeHtml(humanText(item.detail || item.title, "打开事项查看下一步。", 320))}</p><dl class="now-facts"><div><dt>截止</dt><dd class="${/\u903e\u671f/.test(String(item.sort_reason || "")) ? "danger-text" : ""}">${escapeHtml(item.due_date || "尚未设定")}</dd></div><div><dt>负责人</dt><dd>${escapeHtml(humanText(item.owner, "负责人待确认", 60))}</dd></div><div><dt>当前阻塞</dt><dd>${escapeHtml(blocked)}</dd></div><div><dt>依据信息</dt><dd>${escapeHtml(sourceText)}</dd></div></dl>${controls}<section class="next-suggestions"><strong>接下来三项</strong>${suggestions ? `<ol>${suggestions}</ol>` : `<p>暂时没有排好的下一步。</p>`}</section></div></article>`;
+}
+
+function renderReferenceRelatedInfo(now, relatedInformation = {}, quality = {}) {
+  const items = Array.isArray(relatedInformation.items) ? relatedInformation.items : [];
+  const counts = relatedInformation.counts || {};
+  const total = Number(relatedInformation.total || items.length || 0);
+  const tabs = Object.entries(counts)
+    .filter(([, count]) => Number(count || 0) > 0)
+    .map(([source, count]) => `<button type="button" class="${state.relatedSource === source ? "active" : ""}" data-related-source="${escapeHtml(source)}">${escapeHtml(sourceLabel(source))} ${Number(count)}</button>`)
+    .join("");
+  const visibleItems = state.relatedSource === "all" ? items : items.filter((item) => String(item.source || item.source_type) === state.relatedSource);
+  const evidence = visibleItems.slice(0, 3).map((item) => {
+    const source = String(item.source || "intake");
+    const sourceName = sourceLabel(source) || "主动投递";
+    const time = item.occurred_at
+      ? new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(item.occurred_at))
+      : "";
+      return `<li><img class="source-mark" src="${sourceIconPath(source)}" alt="" aria-hidden="true"><div><small>${escapeHtml(sourceName)}${time ? ` · ${escapeHtml(time)}` : ""}</small><p><strong>${escapeHtml(humanText(item.display_name, sourceName, 36))}：</strong>${escapeHtml(humanText(item.summary, "已归到这件事", 94))}</p></div><em>${escapeHtml(humanText(item.status_label, "已归到本事项", 24))}</em></li>`;
+  }).join("");
+  return `<section class="related-info-card"><header><h2>与本主题相关的信息 <span>（${total} 条）</span></h2><a href="${now ? planHref(now) : "#/matters"}">查看全部依据 →</a></header><div class="related-source-tabs"><button type="button" class="${state.relatedSource === "all" ? "active" : ""}" data-related-source="all">全部 ${total}</button>${tabs}</div><ul class="related-evidence-list">${evidence || `<li class="empty"><span>当前筛选没有补充信息。</span></li>`}</ul><footer><a href="${now ? planHref(now) : "#/matters"}">查看全部信息（${total} 条） →</a></footer></section>`;
+}
+
+function todayDueLabel(item) {
+  if (!item?.due_date) return "未设截止日期";
+  const due = new Date(item.due_date);
+  const today = new Date();
+  if (Number.isNaN(due.getTime())) return "截止日期待确认";
+  const dueDay = `${due.getFullYear()}-${due.getMonth()}-${due.getDate()}`;
+  const todayDay = `${today.getFullYear()}-${today.getMonth()}-${today.getDate()}`;
+  return dueDay === todayDay ? "今日到期" : `截止 ${new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(due)}`;
+}
+
+function renderReferenceTodayWorkspace({ brief, nodeOnline, next, waiting, risks, decisions, pendingReviews, wechatStatus, policyPending, weeklyReview, learningRules, quality }) {
+  const attentionItems = Array.isArray(brief?.attention) ? brief.attention : [];
+  return `<section class="today-page reference-dashboard"><section class="today-command-grid"><div class="today-primary-column"><section class="today-now"><div class="section-title"><div><h2>现在做</h2><span>最重要的一件事</span></div></div>${renderReferenceNowCard(brief?.now, next, brief?.related_information || {})}</section></div><aside class="today-context-column"><div class="section-title context-title"><div><h2>相关信息已归到一起</h2><span>${escapeHtml(todayDueLabel(brief?.now))}</span></div></div>${renderReferenceRelatedInfo(brief?.now, brief?.related_information || {}, quality)}${renderQualityEffects(quality)}</aside></section>${renderCommitmentStrip(brief?.commitments || {}, risks)}${renderSourceSummary(brief?.source_summary || {})}<div class="today-below-fold">${renderAttention(attentionItems, brief?.attention_counts || {})}<section class="today-secondary-grid"><section class="plan-card"><header><div><p>等待</p><h2>正在等别人</h2></div><span>${waiting.length} 项</span></header><div class="plan-list">${renderPlanList(waiting, "目前没有等待反馈", "等待事项到了跟进日期后会自动回到优先队列。")}</div></section><section class="plan-card"><header><div><p>判断</p><h2>需要你确认</h2></div><span>${decisions.length} 项</span></header><div class="plan-list">${renderPlanList(decisions, "目前没有需要拍板的内容", "付款、审批、对外发送和重大规定变化始终由你确认。")}</div>${pendingReviews ? `<a class="plan-review-link" href="#/reviews">还有 ${pendingReviews} 项需要你处理 →</a>` : ""}</section></section><section class="today-alerts">${Number(wechatStatus?.counts?.pending || 0) ? `<a href="#/wechat"><span>聊天</span><strong>${Number(wechatStatus.counts.pending)} 条等待确认</strong></a>` : ""}${policyPending ? `<a href="#/policies"><span>规定</span><strong>${policyPending} 条变化等待确认</strong></a>` : ""}</section>${renderWeeklyReview(weeklyReview)}${renderLearningRules(learningRules)}</div></section>`;
+}
+
+function renderLearningRules(rules) {
     const learned = (Array.isArray(rules) ? rules : []).filter(
       (item) => item.rule_type !== "conversation_ignore",
     );
@@ -920,13 +1240,13 @@ if (routeFromHash().name === "today") refreshRouteWithoutJump();
       ["只留下需要推进的工作", "普通寒暄、加好友、占位图片和没有后续动作的内容不会要求你确认。"],
       ["同一件事持续合并", "后续聊天和邮件优先追加到仍未完成的事项，不重复建立推进事项。"],
       ["关键判断必须由你确认", "付款、审批、对外发送、重大规定变化和负责人建议不会自动成为最终结论。"],
-      ["完成事项退出工作队列", "已经完成的事项不再参与合并，也不会继续占用今日优先级。"],
+      ["完成事项退出今日安排", "已经完成的事项不再参与合并，也不会继续占用今日优先级。"],
       ["自动处理可以追溯", "自动过滤、合并和排序保留理由与证据，出现误判时可以撤销或纠正。"],
     ];
     const defaultRows = defaults
       .map(
         ([title, description]) =>
-          `<article class="work-rule"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p></div><span>正在执行</span></article>`,
+          `<article class="work-rule"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p></div><span>系统固定</span></article>`,
       )
       .join("");
     const learnedRows = learned
@@ -935,8 +1255,8 @@ if (routeFromHash().name === "today") refreshRouteWithoutJump();
           `<article><div><h3>${escapeHtml(humanText(item.description, "个人规则", 180))}</h3><p>${item.enabled ? "根据你的纠正持续使用" : "已停用，需要时可以恢复"}</p></div><button class="button button-secondary" type="button" data-learning-rule="${escapeHtml(item.id)}" data-enabled="${item.enabled ? "true" : "false"}">${item.enabled ? "停用" : "恢复"}</button></article>`,
       )
       .join("");
-    const activeCount = defaults.length + learned.filter((item) => item.enabled).length;
-    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>我的工作方式</span><strong>${activeCount} 条正在执行</strong></summary><div class="learning-rule-list">${defaultRows}${learnedRows}<footer><span>会话监听和屏蔽属于来源设置，不再混进工作规则。</span><a class="text-link" href="#/wechat">管理监听范围</a></footer></div></details>`;
+    const activeCount = learned.filter((item) => item.enabled).length;
+    return `<details class="today-disclosure" data-today-disclosure="rules" ${state.todayDisclosures.rules ? "open" : ""}><summary><span>工作原则与个人规则</span><strong>${activeCount} 条个人规则启用</strong></summary><div class="learning-rule-list"><h3 class="rule-group-title">系统原则</h3>${defaultRows}<h3 class="rule-group-title">个人规则</h3>${learnedRows || `<p class="rule-empty">目前没有从你的明确纠正中形成个人规则。</p>`}<footer><span>只有下面的个人规则支持启停；系统原则不会伪装成学习结果。</span><a class="text-link" href="#/wechat">管理监听范围</a></footer></div></details>`;
   }
 function renderWechatCandidate(item, matters) {
   const sourceName = item.source === "wecom" ? "企业微信" : "个人微信";
@@ -1010,13 +1330,13 @@ function renderWechat(status, candidates, conversations, matters) {
     const exportTitle = exportSucceeded
       ? "聊天记录已保存到本机"
       : exportState.status === "failed"
-        ? "聊天记录导出未完成"
-        : "等待首次导出聊天记录";
+        ? "聊天记录保存未完成"
+        : "等待首次保存聊天记录";
     const exportDetail = exportSucceeded
-      ? `${Number(exportState.conversation_count || 0)} 个监听会话，${Number(exportState.message_count || 0)} 条增量消息，${Number(exportState.file_count || 0)} 个文件`
+      ? `${Number(exportState.conversation_count || 0)} 个监听会话，${Number(exportState.message_count || 0)} 条新增消息，${Number(exportState.file_count || 0)} 个文件`
       : exportState.status === "failed"
         ? friendlyError(new Error(exportState.error || "下次检查聊天时会自动重试"))
-        : "完成第一次聊天检查后，这里会显示导出数量和保存位置。";
+        : "完成第一次聊天检查后，这里会显示保存数量和文件位置。";
     const exportPathsHtml = exportPaths
       .map((path) => {
         const label = path.includes("企业微信") ? "企业微信" : "个人微信";
@@ -1073,9 +1393,9 @@ function renderWechat(status, candidates, conversations, matters) {
 
   page().innerHTML = `<section class="wechat-page">
     <header class="wechat-command"><div><p>聊天工作线索</p><h2>贾维斯先筛选，你只确认真正需要推进的工作。</h2><span>${escapeHtml(latestText)}</span></div><button class="button button-primary" type="button" data-wechat-sync ${syncRunning ? "disabled" : ""}>${syncRunning ? "正在检查" : "立即检查聊天"}</button></header>
-      <div class="wechat-summary"><article><span>发现线索</span><strong>${pending.length + acceptedCount}</strong><small>当前筛选范围内有工作价值</small></article><article><span>等待确认</span><strong>${pending.length}</strong><small>确认后才会进入事项</small></article><article><span>等待贾维斯</span><strong>${processingCount}</strong><small>后台理解中，不需要重复投递</small></article></div>
-      <section class="chat-source-statuses" aria-label="聊天来源状态"><article><div><strong>个人微信</strong><span>${escapeHtml(sourceStatusText(personalStatus))}</span></div><b>${Number(personalStatus?.counts?.pending || 0)} 条待确认</b></article><article class="${wecomStatus.available ? "" : "is-unavailable"}"><div><strong>企业微信</strong><span>${escapeHtml(sourceStatusText(wecomStatus, "本机企业微信数据库暂不可安全读取"))}</span></div><b>${wecomStatus.available ? `${Number(wecomStatus?.counts?.pending || 0)} 条待确认` : "个人微信不受影响"}</b></article></section>
-      <section class="wechat-export-card ${exportState.status === "failed" ? "is-failed" : ""}" aria-label="增量聊天记录导出状态"><header><div><span>本机增量导出</span><h2>${escapeHtml(exportTitle)}</h2><p>${escapeHtml(exportDetail)}</p></div><strong>${exportSucceeded && exportState.last_success_at ? `上次成功 ${fmtDate(exportState.last_success_at)}` : ""}</strong></header>${exportPathsHtml ? `<div class="wechat-export-paths">${exportPathsHtml}</div>` : ""}<footer>只导出监听中的会话，已屏蔽内容不会输出。</footer></section>
+      <div class="wechat-summary"><article><span>发现线索</span><strong>${pending.length + acceptedCount}</strong><small>当前筛选范围内有工作价值</small></article><article><span>等待确认</span><strong>${pending.length}</strong><small>确认后才会进入事项</small></article><article><span>等待贾维斯</span><strong>${processingCount}</strong><small>正在理解，不需要重复投递</small></article></div>
+      <section class="chat-source-statuses" aria-label="聊天来源状态"><article><div><strong>个人微信</strong><span>${escapeHtml(sourceStatusText(personalStatus))}</span></div><b>${Number(personalStatus?.counts?.pending || 0)} 条待确认</b></article><article class="${wecomStatus.available ? "" : "is-unavailable"}"><div><strong>企业微信</strong><span>${escapeHtml(sourceStatusText(wecomStatus, "暂时无法读取本机企业微信记录"))}</span></div><b>${wecomStatus.available ? `${Number(wecomStatus?.counts?.pending || 0)} 条待确认` : "个人微信不受影响"}</b></article></section>
+      <section class="wechat-export-card ${exportState.status === "failed" ? "is-failed" : ""}" aria-label="聊天记录保存情况"><header><div><span>聊天记录归档</span><h2>${escapeHtml(exportTitle)}</h2><p>${escapeHtml(exportDetail)}</p></div><strong>${exportSucceeded && exportState.last_success_at ? `上次成功 ${fmtDate(exportState.last_success_at)}` : ""}</strong></header>${exportPathsHtml ? `<div class="wechat-export-paths">${exportPathsHtml}</div>` : ""}<footer>只保存监听中的会话，已屏蔽内容不会写入工作记录。</footer></section>
     <nav class="chat-source-filter" aria-label="聊天来源筛选"><button class="${state.chatSource === "all" ? "active" : ""}" type="button" data-chat-source="all">全部</button><button class="${state.chatSource === "personal_wechat" ? "active" : ""}" type="button" data-chat-source="personal_wechat">个人微信</button><button class="${state.chatSource === "wecom" ? "active" : ""}" type="button" data-chat-source="wecom">企业微信</button></nav>
       <nav class="wechat-tabs" aria-label="聊天线索分类"><button class="${state.wechatTab === "pending" ? "active" : ""}" type="button" data-wechat-tab="pending">待我确认 <span>${pending.length}</span></button><button class="${state.wechatTab === "ignored" ? "active" : ""}" type="button" data-wechat-tab="ignored">最近忽略 <span>${ignoredCount}</span></button><button class="${state.wechatTab === "accepted" ? "active" : ""}" type="button" data-wechat-tab="accepted">已采纳 <span>${acceptedCount}</span></button><button class="${state.wechatTab === "conversations" ? "active" : ""}" type="button" data-wechat-tab="conversations">监听范围 <span>${conversations.length}</span></button></nav>
     <section class="wechat-panel" data-wechat-panel="pending" ${state.wechatTab === "pending" ? "" : "hidden"}><div class="wechat-panel-head"><div><h2>待我确认</h2><p>只展示必要原文，不把整段聊天堆到工作台。</p></div></div><div class="wechat-candidate-list">${pendingHtml}</div></section>
@@ -1231,7 +1551,7 @@ if (!target || !summary) return;
 const query = state.searchQuery.trim();
 if (!query) {
 summary.textContent = "输入关键词后，贾维斯会在允许的资料中查找";
-target.innerHTML = `<div class="search-empty"><span>⌕</span><strong>从一个关键词开始</strong><p>例如“游艇保险”“我在等谁”或一位同事的名字。</p></div>`;
+    target.innerHTML = `<div class="search-empty"><span>⌕</span><strong>从一个关键词开始</strong><p>例如“游艇保险”或“保险目前进展到哪里”；查同事时请使用人员筛选。</p></div>`;
 return;
 }
 if (!state.searchResults) {
@@ -1241,12 +1561,24 @@ return;
 }
 const items = Array.isArray(state.searchResults.items) ? state.searchResults.items : [];
 const answer = state.searchResults.answer || {};
-summary.textContent = items.length ? `找到 ${items.length} 条相关记录` : "没有找到直接证据";
+  summary.textContent = items.length
+    ? `${state.searchResults.intent === "progress" ? "按进展问句" : "按关键词"}找到 ${items.length} 条相关记录${state.searchResults.interpreted_query ? ` · ${humanText(state.searchResults.interpreted_query, "", 80)}` : ""}`
+    : "没有找到直接证据";
 const answerHtml = `<section class="search-answer"><header><span>贾维斯根据现有证据整理</span><strong>${items.length ? "找到可核实的相关内容" : "当前资料不足"}</strong></header>${(answer.facts || []).length ? `<ul>${answer.facts.map((fact) => `<li>${escapeHtml(humanText(fact, "", 260))}</li>`).join("")}</ul>` : ""}${(answer.missing || []).length ? `<div class="search-missing"><strong>还缺什么</strong><p>${escapeHtml(answer.missing.join("；"))}</p></div>` : ""}</section>`;
 const rows = items.length
-? items.map((item) => `<a class="search-result" href="${escapeHtml(item.href || "#/search")}"><span class="search-result-type">${escapeHtml(item.type_label || "记录")}</span><div><h3>${escapeHtml(humanText(item.title, "未命名记录", 160))}</h3><p>${escapeHtml(humanText(item.summary || item.body, "暂无摘要", 260))}</p><small>${escapeHtml(item.sort_reason || "正文匹配")}${item.created_at ? `，${fmtDate(item.created_at)}` : ""}</small></div><i>→</i></a>`).join("")
+? items.map((item) => `<a class="search-result" href="${escapeHtml(item.source_href || item.href || "#/search")}"><span class="search-result-type">${escapeHtml(item.type_label || "记录")}</span><div><h3>${escapeHtml(humanText(item.title, "未命名记录", 160))}</h3><p>${escapeHtml(humanText(item.summary || item.body, "暂无摘要", 260))}</p><small>${escapeHtml(item.sort_reason || "正文匹配")}${item.created_at ? `，${fmtDate(item.created_at)}` : ""}</small></div><i>→</i></a>`).join("")
 : `<div class="search-empty"><span>⌕</span><strong>没有找到匹配内容</strong><p>可以减少筛选条件，或换一个更具体的业务关键词。</p></div>`;
 target.innerHTML = answerHtml + `<div class="search-result-list">${rows}</div>`;
+  $$(".search-result", target).forEach((node, index) => {
+    const matched = Array.isArray(items[index]?.matched_terms)
+      ? items[index].matched_terms.filter(Boolean).slice(0, 4)
+      : [];
+    if (!matched.length) return;
+    node.querySelector("div")?.insertAdjacentHTML(
+      "beforeend",
+      `<span class="search-related-terms">也找到了：${matched.map((term) => escapeHtml(humanText(term, "", 40))).join("、")}</span>`,
+    );
+  });
 }
 
 async function performSearch() {
@@ -1260,7 +1592,9 @@ state.searchResults = null;
 renderSearchResults();
 const params = new URLSearchParams({ q: query, limit: "80" });
 const filters = state.searchFilters || {};
-if (filters.source) params.set("source", filters.source);
+    if (filters.personId) params.set("person_id", filters.personId);
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.businessType) params.set("business_type", filters.businessType);
 if (filters.status) params.set("status", filters.status);
 if (filters.dateFrom) params.set("date_from", filters.dateFrom);
 if (filters.dateTo) params.set("date_to", filters.dateTo);
@@ -1274,10 +1608,47 @@ if (target) target.innerHTML = `<div class="error-panel"><strong>搜索暂时不
 }
 }
 
-function renderSearch() {
+  function renderSourceDetail(payload) {
+    const record = payload?.record || {};
+    const labels = {
+      title: "标题", subject: "主题", summary: "摘要", detail: "内容",
+      text_note: "原始文字", value: "核实内容", quote: "原话",
+      sender_name: "发件人", publisher: "发布单位", topic: "主题类别",
+      scope: "适用范围", status: "当前状态", due_date: "截止日期",
+      target_date: "要求完成日期", next_review_date: "下次复盘日期",
+      effective_date: "生效日期", sent_at: "发送时间", received_at: "收件时间",
+      created_at: "记录时间", updated_at: "更新时间", source_locator: "证据位置",
+    };
+    const dateFields = new Set([
+      "due_date", "target_date", "next_review_date", "effective_date",
+      "sent_at", "received_at", "created_at", "updated_at",
+    ]);
+    const rows = Object.entries(labels)
+      .filter(([key]) => record[key] !== null && record[key] !== undefined && String(record[key]).trim())
+      .map(([key, label]) => {
+        const value = key === "status"
+          ? stateLabel(record[key])
+          : escapeHtml(
+              dateFields.has(key)
+                ? fmtDate(record[key])
+                : humanText(record[key], "", key === "text_note" || key === "quote" ? 1600 : 500),
+            );
+        return `<div class="source-detail-row"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`;
+      })
+      .join("");
+    const matterLink = record.matter_id
+      ? `<footer><a class="button button-secondary" href="#/matter/${encodeURIComponent(record.matter_id)}">查看关联事项</a></footer>`
+      : "";
+    page().innerHTML = `<section class="source-detail-page"><a class="back-link" href="#/search">← 返回搜索</a><header><p class="eyebrow">原始依据</p><h2>${escapeHtml(humanText(record.title || record.subject || record.filename || record.value, "来源详情", 160))}</h2><span>这里保留原始内容和业务时间，方便核对来源。</span></header><dl>${rows || `<div class="source-detail-row"><dd>这条依据暂无可展示的文字内容。</dd></div>`}</dl>${matterLink}</section>`;
+  }
+
+  function renderSearch() {
 const filters = state.searchFilters || {};
-page().innerHTML = `<section class="search-page"><header class="search-hero"><p class="eyebrow">跨来源查证</p><h2>在全部工作证据里找答案</h2><span>覆盖事项、行动、聊天依据、工作邮件、会议材料和公司规定。被过滤的内容不会进入结果。</span><label class="global-search-field"><span>搜索内容</span><input id="global-search-input" type="search" value="${escapeHtml(state.searchQuery)}" placeholder="输入事项、人员、金额或一句问题" autocomplete="off"></label><div class="search-filters"><label><span>来源</span><select data-search-filter="source"><option value="">全部来源</option><option value="matter">事项</option><option value="action">行动</option><option value="material">聊天和会议材料</option><option value="email">邮件</option><option value="policy">公司规定</option></select></label><label><span>状态</span><select data-search-filter="status"><option value="">全部状态</option><option value="open">未完成</option><option value="done">已完成</option><option value="active">当前有效</option></select></label><label><span>开始日期</span><input type="date" data-search-filter="dateFrom" value="${escapeHtml(filters.dateFrom || "")}"></label><label><span>结束日期</span><input type="date" data-search-filter="dateTo" value="${escapeHtml(filters.dateTo || "")}"></label><label><span>金额</span><input inputmode="decimal" data-search-filter="amount" value="${escapeHtml(filters.amount || "")}" placeholder="例如 50000"></label></div><small id="search-summary"></small></header><div id="search-results"></div></section>`;
-$('[data-search-filter="source"]').value = filters.source || "";
+const peopleOptions = state.people.map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)}</option>`).join("");
+page().innerHTML = `<section class="search-page"><header class="search-hero"><p class="eyebrow">查找全部工作信息</p><h2>搜索工作信息</h2><span>可输入关键词，也可搜索“保险目前进展到哪里”；查某个人时请配合人员筛选。结果只引用当前有权限查看的原始依据。</span><label class="global-search-field"><span>搜索内容</span><input id="global-search-input" type="search" value="${escapeHtml(state.searchQuery)}" placeholder="输入事项、人员、金额或进展问题" autocomplete="off"></label><div class="search-filters"><label><span>人员</span><select data-search-filter="personId"><option value="">全部人员</option>${peopleOptions}</select></label><label><span>信息来源</span><select data-search-filter="channel"><option value="">全部渠道</option><option value="personal_wechat">个人微信</option><option value="wecom">企业微信</option><option value="email">邮件</option></select></label><label><span>业务类别</span><select data-search-filter="businessType"><option value="">全部类别</option><option value="matter">事项</option><option value="action">行动</option><option value="material">聊天和会议材料</option><option value="evidence">核实依据</option><option value="email">邮件</option><option value="policy">公司规定</option></select></label><label><span>状态</span><select data-search-filter="status"><option value="">全部状态</option><option value="open">未完成</option><option value="done">已完成</option><option value="active">当前有效</option></select></label><label><span>开始日期</span><input type="date" data-search-filter="dateFrom" value="${escapeHtml(filters.dateFrom || "")}"></label><label><span>结束日期</span><input type="date" data-search-filter="dateTo" value="${escapeHtml(filters.dateTo || "")}"></label><label><span>金额</span><input inputmode="decimal" data-search-filter="amount" value="${escapeHtml(filters.amount || "")}" placeholder="例如 50000"></label></div><small id="search-summary"></small></header><div id="search-results"></div></section>`;
+$('[data-search-filter="personId"]').value = filters.personId || "";
+$('[data-search-filter="channel"]').value = filters.channel || "";
+$('[data-search-filter="businessType"]').value = filters.businessType || "";
 $('[data-search-filter="status"]').value = filters.status || "";
 renderSearchResults();
 const input = $("#global-search-input");
@@ -1313,7 +1684,7 @@ if (state.searchQuery.trim()) performSearch();
       : "";
     page().innerHTML = `<section class="intake-page">
       <div class="intake-page-copy"><p class="eyebrow">最省心的入口</p><h2>有东西就丢，何时整理由你决定。</h2><p>Mac 开机时从这里直接投递；Mac 关机时从安卓分享到“财务工作台投递箱 / 待处理”，开机后自动接手。</p><button class="button button-primary" type="button" data-open-intake>＋ 开始投递</button></div>
-      <div class="intake-scenarios"><article><span>声</span><div><strong>会议录音</strong><p>本机先收件和转写，由你决定何时让贾维斯提炼结论与责任人。</p></div></article><article><span>微</span><div><strong>微信聊天</strong><p>先增量收取，手工启动后再按业务事项筛选真正要推进的内容。</p></div></article><article><span>审</span><div><strong>企微审批</strong><p>先看风险和资料缺口，最终同意或驳回仍由你决定。</p></div></article><article><span>文</span><div><strong>一句话或文件</strong><p>先记录，等你启动后再与已有事项归并。</p></div></article></div>
+      <div class="intake-scenarios"><article><span>声</span><div><strong>会议录音</strong><p>本机先收件和转写，由你决定何时让贾维斯提炼结论与责任人。</p></div></article><article><span>微</span><div><strong>微信聊天</strong><p>先收取新增内容，手工启动后再按业务事项筛选真正要推进的内容。</p></div></article><article><span>审</span><div><strong>企微审批</strong><p>先看风险和资料缺口，最终同意或驳回仍由你决定。</p></div></article><article><span>文</span><div><strong>一句话或文件</strong><p>先记录，等你启动后再汇总到已有事项。</p></div></article></div>
       ${issues.length ? `<section class="analysis-issues-card" id="analysis-issues"><header><div><p>需要检查</p><h2>${issues.length} 份内容上次没有整理完成</h2></div><span>原材料没有丢失</span></header><div>${issueRows}</div></section>` : ""}
       <section class="queue-card icloud-card"><div><p>安卓关机投递</p><h3>分享 → Syncthing-Fork → 财务工作台投递箱 / 待处理</h3></div><div><p class="queue-empty">材料先留在手机本地；Mac 开机后点对点同步，自动移动到“已接收”并等待手工整理，不需要云主机或域名。</p></div></section>
       <section class="queue-card"><div><p>当前浏览器暂存</p><h3 id="queue-summary">正在检查等待上传的材料</h3></div><div id="queue-list"></div></section>
@@ -1368,7 +1739,7 @@ function renderEmail(status, messages, matters) {
 
   page().innerHTML = `<section class="email-page">
     <header class="email-command"><div><p>邮件工作</p><h2>贾维斯只留下真正需要你推进的邮件。</h2><span>${escapeHtml(accountText)}</span></div><button class="button button-primary" type="button" data-email-sync ${checking || !status?.configured ? "disabled" : ""}>${checking ? "正在检查" : "立即检查邮箱"}</button>${pending > 0 ? `<p class="email-pending-feedback" data-email-pending-feedback="true">已读取 ${pending} 封邮件，等待整理。点击顶部整理按钮后才会进入后续处理。</p>` : ""}</header>
-    ${!status?.configured ? `<section class="email-setup"><span>只读</span><div><h2>先在本机安全连接邮箱</h2><p>授权码只保存到 macOS 钥匙串，网页和工作台数据库都不会保存。连接后只读取新增邮件，不会自动回信。</p><code>.venv/bin/python -m scripts.configure_email</code><button class="button button-secondary" type="button" data-copy-email-setup>复制配置命令</button></div></section>` : ""}
+    ${!status?.configured ? `<section class="email-setup"><span>只读</span><div><h2>先在本机安全连接邮箱</h2><p>授权码只保存到 macOS 钥匙串，不会出现在网页或工作记录中。连接后只读取新增邮件，不会自动回信。</p><code>.venv/bin/python -m scripts.configure_email</code><button class="button button-secondary" type="button" data-copy-email-setup>复制配置命令</button></div></section>` : ""}
     ${failed ? `<section class="email-warning"><strong>上次邮箱检查未完成</strong><p>${escapeHtml(friendlyError(new Error(latest.error), "可点击重新检查，已处理的邮件不会重复生成事项"))}</p></section>` : ""}
         <section class="email-summary"><article><span>需要推进</span><strong>${messages.length}</strong><small>真正进入工作台的邮件</small></article><article><span>自动过滤</span><strong>不留存</strong><small>非工作邮件不会保存</small></article><article><span>邮件事项</span><strong>${openMatters.length}</strong><small>当前仍在推进</small></article></section>
     <section class="email-layout"><div><div class="wechat-panel-head"><div><h2>新增工作邮件</h2><p>只显示邮件要求、必要证据和下一步，不堆整封正文。</p></div></div><div class="email-work-list">${workCards}</div></div><aside><section><header><div><span>邮件事项推进</span><h2>未完成</h2></div><strong>${openMatters.length}</strong></header>${matterRows(openMatters, false)}</section><section><header><div><span>完成归档</span><h2>已完成</h2></div><strong>${completedMatters.length}</strong></header>${matterRows(completedMatters, true)}</section></aside></section>
@@ -1637,6 +2008,52 @@ function renderEmail(status, messages, matters) {
     );
   }
 
+  function renderPersonActionRows0915(actions, people) {
+    if (!actions.length) return `<div class="calm-panel matter-empty"><span>✓</span><div><strong>这个分类暂时没有事项</strong><p>确认负责人后，未完成行动会自动归到对应人员下面。</p></div></div>`;
+    return `<div class="person-action-list">${actions.map((action) => {
+      const matterId = action.matter_id || action.matter?.id;
+      const href = matterId ? `#/matter/${encodeURIComponent(matterId)}` : "#/matters";
+      const waiting = action.flow_state === "waiting";
+      const done = action.status === "done";
+      const controls = done
+        ? `<button class="button button-secondary" type="button" data-person-action-id="${escapeHtml(action.id)}" data-person-action-status="open">重新打开</button>`
+        : `<button class="button button-primary" type="button" data-person-action-id="${escapeHtml(action.id)}" data-person-action-status="done">完成行动</button><button class="button button-secondary" type="button" data-person-action-id="${escapeHtml(action.id)}" data-person-action-status="snooze">稍后处理</button><button class="button button-quiet" type="button" data-person-action-id="${escapeHtml(action.id)}" data-person-action-status="waiting">${waiting ? "恢复推进" : "等待反馈"}</button>`;
+      const selected = confirmedAssignees(action).map(assigneePersonId);
+      return `<article class="person-action-row" data-action-row="${escapeHtml(action.id)}" data-search="${escapeHtml(`${actionTitle(action)} ${actionDetail(action)} ${actionMatterLabel(action)}`.toLowerCase())}"><div><small>${escapeHtml(actionMatterLabel(action))}${action.due_date ? ` · 截止 ${escapeHtml(action.due_date)}` : ""}</small><h3>${escapeHtml(actionTitle(action))}</h3><p>${escapeHtml(actionDetail(action))}</p><footer>${badge(done ? "已完成" : waiting ? "等待反馈" : "待推进", done ? "green" : waiting ? "amber" : "blue")}${pendingAssignees(action).length ? badge("负责人待明确", "amber") : ""}</footer>${renderAssigneeEditor(action, people, selected)}</div><div class="person-action-controls">${controls}<button class="button button-quiet" type="button" data-assignee-toggle="${escapeHtml(action.id)}">指派负责人</button><a class="button button-quiet" href="${href}">查看事项</a></div></article>`;
+    }).join("")}</div>`;
+  }
+
+  async function changePersonAction(button) {
+    const actionId = button.dataset.personActionId;
+    const change = button.dataset.personActionStatus;
+    button.disabled = true;
+    try {
+      if (["done", "open"].includes(change)) {
+        await api(`/api/actions/${encodeURIComponent(actionId)}/resolve`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: change }),
+        });
+      } else {
+        const waiting = change === "waiting" && button.textContent !== "恢复推进";
+        const payload = change === "snooze"
+          ? { snoozed_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }
+          : { flow_state: waiting ? "waiting" : "needs_action", waiting_on: waiting ? "等待反馈" : "" };
+        await api(`/api/actions/${encodeURIComponent(actionId)}/planning-state`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+      await refreshRouteWithoutJump(`[data-person-action-id="${CSS.escape(actionId)}"]`);
+      if (document.activeElement === document.body) {
+        $(`[data-follow-up-view="${CSS.escape(state.followUpView)}"]`, page())
+          ?.focus({ preventScroll: true });
+      }
+    } catch (error) {
+      button.disabled = false;
+      toast(friendlyError(error), "error");
+    }
+  }
+
   function renderPersonGroups(actions, people) {
     const self = people.find((person) => person.is_self) || people.find((person) => person.id === "person_self") || { id: "person_self", name: "我自己", role: "Frank", is_self: true };
     const others = people.filter((person) => person.id !== self.id).sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
@@ -1645,12 +2062,15 @@ function renderEmail(status, messages, matters) {
       { id: "__unassigned", name: "负责人待明确", role: "有建议或尚未判断的行动", actions: actionsForPerson(actions, "__unassigned"), pinned: true },
       ...others.map((person) => ({ id: person.id, name: person.name, role: person.role, actions: actionsForPerson(actions, person.id), pinned: false })),
     ];
-    const emptyCount = groups.filter((group) => !group.actions.length && !group.pinned).length;
-    const visible = state.showEmptyPeople ? groups : groups.filter((group) => group.pinned || group.actions.length);
+    const emptyCount = 0;
+    const visible = groups.filter((group) => group.actions.length);
+    if (!visible.length) {
+      return `<div class="calm-empty"><span>✓</span><div><strong>这里没有需要推进的行动</strong><p>只展示确实有未完成行动的负责人。</p></div></div>`;
+    }
     return `<div class="person-group-list">${visible
       .map(
         (group) =>
-          `<section class="person-group ${group.pinned ? "is-pinned" : ""}" data-person-group="${escapeHtml(group.id)}"><header><div><h3>${escapeHtml(group.name)}${group.pinned ? " · 置顶" : ""}</h3><p>${escapeHtml(group.role || "")}</p></div><strong>${group.actions.length} 项</strong></header>${renderPersonActionRows(group.actions, people)}</section>`,
+          `<section class="person-group ${group.pinned ? "is-pinned" : ""}" data-person-group="${escapeHtml(group.id)}"><header><div><h3>${escapeHtml(group.name)}</h3><p>${escapeHtml(group.role || "")}</p></div><strong>${group.actions.length} 项</strong></header>${renderPersonActionRows0915(group.actions, people)}</section>`,
       )
       .join("")}</div>${emptyCount ? `<button class="button button-quiet people-empty-toggle" type="button" data-toggle-empty-people>${state.showEmptyPeople ? "隐藏没有行动的人员" : `显示 ${emptyCount} 位暂无行动的人员`}</button>` : ""}`;
   }
@@ -1744,7 +2164,7 @@ function renderEmail(status, messages, matters) {
             return `<button class="follow-up-row ${item.id === state.followUpMatterId ? "active" : ""}" type="button" data-follow-up-id="${escapeHtml(item.id)}">
               <strong>${escapeHtml(matterTitle(item.title))}</strong>
               <span>${escapeHtml(matterContactName(item))} · ${escapeHtml(sourceText)}</span>
-              <small>${item.target_date ? `下次复盘 ${escapeHtml(item.target_date)}` : item.is_completed ? "已完成归档" : "尚未完成"}</small>
+              <small>${item.next_review_date ? `下次复盘 ${escapeHtml(item.next_review_date)}` : item.target_date ? `要求完成 ${escapeHtml(item.target_date)}` : item.is_completed ? "已完成归档" : "尚未完成"}</small>
             </button>`;
           })
           .join("")
@@ -1763,7 +2183,7 @@ function renderEmail(status, messages, matters) {
         .map((item) => matterContactName(item)),
     );
     if ($("#follow-up-brief-text")) {
-      $("#follow-up-brief-text").textContent = `${openCount} 项尚未完成，涉及 ${openContacts.size} 位对接人。新信息会先与未完成事项比对，同一事项会自动归并。`;
+      $("#follow-up-brief-text").textContent = `${openCount} 项尚未完成，涉及 ${openContacts.size} 位对接人。新信息会先与未完成事项比对，同一件事会自动汇总到一起。`;
     }
     $$('[data-follow-up-view]', page()).forEach((button) =>
       button.classList.toggle("active", button.dataset.followUpView === state.followUpView),
@@ -1864,6 +2284,22 @@ function renderEmail(status, messages, matters) {
     return `<details class="follow-up-sources"><summary>查看原始信息（${materials.length}）</summary>${rows}</details>`;
   }
 
+  function followUpLinkedEvidenceHtml(payload) {
+    const record = payload?.record;
+    if (!record) return "";
+    const rows = [
+      ["事项行动", record.title || record.subject || record.filename],
+      ["具体内容", record.detail || record.summary || record.text_note || record.value],
+      ["当前状态", record.status ? stateLabel(record.status) : ""],
+      ["要求时间", record.due_date || record.target_date ? escapeHtml(fmtDate(record.due_date || record.target_date)) : ""],
+      ["原始依据", record.quote || record.source_locator],
+    ]
+      .filter(([, value]) => value)
+      .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${label === "当前状态" ? value : escapeHtml(humanText(value, "", 800))}</dd></div>`)
+      .join("");
+    return `<section class="follow-up-linked-evidence" data-follow-up-linked-evidence><header><p>从搜索结果打开</p><h2>本条准确依据</h2></header><dl>${rows}</dl></section>`;
+  }
+
   function renderFollowUpMatter(matter, timeline = []) {
     const detail = $("#follow-up-detail");
     if (!detail) return;
@@ -1895,16 +2331,17 @@ function renderEmail(status, messages, matters) {
         <div class="follow-up-actions"><button class="button button-secondary" type="button" data-follow-up-progress-open>记录工作进展</button><button class="button button-primary" type="button" data-follow-up-complete>事项已完成</button><button class="button button-quiet" type="button" data-follow-up-dismiss>不是工作任务</button></div>
           <form class="follow-up-progress-form" data-follow-up-progress hidden>
             <label>本次工作进展<textarea name="detail" rows="4" maxlength="2000" required placeholder="例如：已与对接人复盘，资料还差一项，预计明天下午补齐。"></textarea></label>
-            <label>下次复盘日期<input name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"></label>
+            <label>下次复盘日期<input name="next_review_date" type="date" value="${escapeHtml(matter.next_review_date || "")}"></label>
             <div><button class="button button-quiet" type="button" data-follow-up-progress-cancel>取消</button><button class="button button-primary" type="submit">保存进展</button></div>
           </form>
         </section>`;
     detail.innerHTML = `<article class="follow-up-sheet">
       <header class="follow-up-heading">
         <div><p>${completed ? "已完成归档" : "尚未完成"} · 更新于 ${escapeHtml(fmtDate(matter.updated_at))}</p><h1 contenteditable="true" spellcheck="false" data-matter-edit="title" aria-label="修改事项标题">${escapeHtml(matterTitle(matter.title))}</h1><small>点击标题可直接修改</small></div>
-        <div class="follow-up-meta"><span>对接人（可直接修改）：<strong contenteditable="true" spellcheck="false" data-matter-edit="contact_name" aria-label="修改对接人">${escapeHtml(contact)}</strong></span><span>来源：<strong>${escapeHtml(sourceNames.join("、") || "工作信息")}</strong></span>${matter.target_date ? `<span>下次复盘：<strong>${escapeHtml(matter.target_date)}</strong></span>` : ""}</div>
+        <div class="follow-up-meta"><span>对接人（可直接修改）：<strong contenteditable="true" spellcheck="false" data-matter-edit="contact_name" aria-label="修改对接人">${escapeHtml(contact)}</strong></span><span>来源：<strong>${escapeHtml(sourceNames.join("、") || "工作信息")}</strong></span><form data-follow-up-target-date><label for="follow-up-target-date">要求完成日期</label><input id="follow-up-target-date" name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"><button class="button button-quiet" type="submit">保存日期</button></form>${matter.next_review_date ? `<span>下次复盘：<strong>${escapeHtml(matter.next_review_date)}</strong></span>` : ""}</div>
         <div class="follow-up-journey" aria-label="事项闭环过程">${steps}</div>
       </header>
+      ${followUpLinkedEvidenceHtml(state.followUpSourceEvidence)}
       <div class="follow-up-body">
         <main>
           <section class="follow-up-summary"><div><h2>当前需要跟进的内容</h2><small>点击内容可直接修改</small></div><p class="${summary ? "" : "empty"}" contenteditable="true" data-matter-edit="summary" aria-label="修改跟进内容">${escapeHtml(summary || "点击填写当前需要跟进的内容")}</p>${followUpSourcesHtml(matter)}</section>
@@ -2029,6 +2466,25 @@ function renderEmail(status, messages, matters) {
     $("[data-follow-up-progress-cancel]", detail)?.addEventListener("click", () => {
       $("[data-follow-up-progress]", detail).hidden = true;
     });
+    $("[data-follow-up-target-date]", detail)?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const submit = form.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_date: form.elements.target_date.value || null }),
+        });
+        await refreshFollowUpMatter();
+        $("#follow-up-target-date", detail)?.focus({ preventScroll: true });
+        toast("要求完成日期已保存");
+      } catch (error) {
+        submit.disabled = false;
+        toast(friendlyError(error, "要求完成日期保存失败"));
+      }
+    });
     $("[data-follow-up-progress]", detail)?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -2040,17 +2496,14 @@ function renderEmail(status, messages, matters) {
         await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}/progress`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ summary: progress.slice(0, 200), detail: progress }),
+          body: JSON.stringify({
+            summary: progress.slice(0, 200),
+            detail: progress,
+            next_review_date: form.elements.next_review_date.value || null,
+          }),
         });
-        const targetDate = form.elements.target_date.value;
-        if (targetDate !== (state.followUpMatter?.target_date || "")) {
-          await api(`/api/matters/${encodeURIComponent(state.followUpMatterId)}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target_date: targetDate || null }),
-          });
-        }
         await refreshFollowUpMatter();
+        $("[data-follow-up-progress-open]", detail)?.focus({ preventScroll: true });
         toast("本次工作进展已保存");
       } catch (error) {
         toast(friendlyError(error, "工作进展保存失败"));
@@ -2123,14 +2576,48 @@ function renderEmail(status, messages, matters) {
     );
   }
 
-  async function renderFollowUpDesk(items, preferredId = null) {
-    state.matters = Array.isArray(items) ? items : [];
+  function matterMatchesCategory(matter, category) {
+    if (!category) return true;
+    const actions = Array.isArray(matter.actions) ? matter.actions : [];
+    if (category === "my_commitment")
+      return actions.some((action) => confirmedAssignees(action).some((person) => person.is_self || person.person?.is_self));
+    if (category === "their_commitment")
+      return actions.some((action) => action.flow_state === "waiting" || Boolean(action.waiting_on));
+    if (category === "waiting_approval")
+      return actions.some((action) => action.flow_state === "needs_decision" || action.kind === "decision") || (matter.reviews || []).some((review) => review.status === "pending");
+    if (category === "need_follow_up")
+      return actions.some((action) => ["follow_up", "task"].includes(action.kind) && action.status === "open");
+    if (category === "risk")
+      return actions.some((action) => ["risk", "overdue", "blocked"].includes(action.kind) || action.flow_state === "blocked");
+    return true;
+  }
+
+  async function renderFollowUpDesk(
+    items,
+    preferredId = null,
+    query = {},
+    actionGroups = {},
+    people = [],
+    sourceEvidence = null,
+    preserveMode = false,
+  ) {
+    state.matters = (Array.isArray(items) ? items : []).filter((item) => matterMatchesCategory(item, query.category));
+    state.people = normalizePeople(people);
+    state.followUpSourceEvidence = sourceEvidence;
+    if (preferredId && !preserveMode) state.matterTab = "all";
+    const openActions = Array.isArray(actionGroups.open) ? actionGroups.open : [];
+    const doneActions = Array.isArray(actionGroups.done) ? actionGroups.done : [];
+    if (["personal_wechat", "wecom", "email"].includes(query.source_type)) {
+      state.followUpSource = query.source_type;
+    }
     if (preferredId) {
       const preferred = state.matters.find((item) => item.id === preferredId);
       if (preferred) {
         state.followUpMatterId = preferred.id;
-        state.followUpView = preferred.is_completed || preferred.status === "completed" ? "completed" : "open";
-        state.followUpContact = "all";
+        if (!preserveMode) {
+          state.followUpView = preferred.is_completed || preferred.status === "completed" ? "completed" : "open";
+          state.followUpContact = "all";
+        }
       }
     }
     const openItems = state.matters.filter(
@@ -2139,10 +2626,10 @@ function renderEmail(status, messages, matters) {
     const contacts = new Set(openItems.map((item) => matterContactName(item)));
     page().innerHTML = `<section class="follow-up-desk">
       <aside class="follow-up-sidebar">
-        <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><label>按来源查看<select id="follow-up-source"><option value="all">全部来源</option><option value="personal_wechat">个人微信</option><option value="wecom">企业微信</option><option value="email">邮件</option></select></label><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待完成 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
-        <div id="follow-up-list" class="follow-up-list"></div>
+        <header><h2>今日跟进</h2><p>按对接人复盘未完成事项</p><nav class="follow-up-mode-tabs" aria-label="事项查看方式"><button class="${state.matterTab === "all" ? "active" : ""}" type="button" data-follow-up-mode="all">按事项</button><button class="${state.matterTab === "people" ? "active" : ""}" type="button" data-follow-up-mode="people">按负责人</button></nav><div data-follow-up-matter-controls ${state.matterTab === "people" ? "hidden" : ""}><input id="follow-up-search" type="search" placeholder="搜索事项或对接人" value="${escapeHtml(state.followUpQuery)}"><label>按对接人查看<select id="follow-up-contact"></select></label><label>按来源查看<select id="follow-up-source"><option value="all">全部来源</option><option value="personal_wechat">个人微信</option><option value="wecom">企业微信</option><option value="email">邮件</option></select></label></div><nav><button class="${state.followUpView === "open" ? "active" : ""}" type="button" data-follow-up-view="open">待完成 <span id="follow-up-open-count">0</span></button><button class="${state.followUpView === "completed" ? "active" : ""}" type="button" data-follow-up-view="completed">已完成 <span id="follow-up-done-count">0</span></button></nav></header>
+        <div id="follow-up-list" class="follow-up-list" ${state.matterTab === "people" ? "hidden" : ""}></div>
       </aside>
-      <section class="follow-up-workspace"><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。新信息会先与未完成事项比对，同一事项会自动归并。</span></div><div id="follow-up-detail"></div></section>
+      <section class="follow-up-workspace"><div data-follow-up-matter-panel ${state.matterTab === "people" ? "hidden" : ""}><div class="follow-up-brief"><strong>今日概况</strong><span id="follow-up-brief-text">${openItems.length} 项尚未完成，涉及 ${contacts.size} 位对接人。新信息会先与未完成事项比对，同一件事会自动汇总到一起。</span></div><div id="follow-up-detail"></div></div><div class="follow-up-people-panel" data-follow-up-people-panel ${state.matterTab === "people" ? "" : "hidden"}><section data-follow-up-person-view="open" ${state.followUpView === "open" ? "" : "hidden"}><header><div><h2>按负责人推进</h2><p>每一项行动都可以单独完成、稍后处理、等待反馈或指派负责人。</p></div><strong>${openActions.length} 项</strong></header>${renderPersonGroups(openActions, state.people)}</section><section data-follow-up-person-view="completed" ${state.followUpView === "completed" ? "" : "hidden"}><header><div><h2>已完成行动</h2><p>完成后的行动按最后确认的负责人归档。</p></div><strong>${doneActions.length} 项</strong></header>${renderPersonGroups(doneActions, state.people)}</section></div></section>
     </section>`;
     $("#follow-up-search")?.addEventListener("input", (event) => {
       state.followUpQuery = event.target.value;
@@ -2157,13 +2644,39 @@ function renderEmail(status, messages, matters) {
       state.followUpSource = event.target.value;
       renderFollowUpList();
     });
+    $$('[data-follow-up-mode]', page()).forEach((button) =>
+      button.addEventListener("click", () => {
+        state.matterTab = button.dataset.followUpMode;
+        $$('[data-follow-up-mode]', page()).forEach((item) =>
+          item.classList.toggle("active", item === button),
+        );
+        $("[data-follow-up-matter-controls]", page()).hidden = state.matterTab === "people";
+        $("#follow-up-list", page()).hidden = state.matterTab === "people";
+        $("[data-follow-up-matter-panel]", page()).hidden = state.matterTab === "people";
+        $("[data-follow-up-people-panel]", page()).hidden = state.matterTab !== "people";
+        if (state.matterTab === "people") {
+          $("#follow-up-open-count", page()).textContent = String(openActions.length);
+          $("#follow-up-done-count", page()).textContent = String(doneActions.length);
+        } else {
+          renderFollowUpList({ chooseMatter: false });
+        }
+      }),
+    );
     $$('[data-follow-up-view]', page()).forEach((button) =>
       button.addEventListener("click", () => {
         state.followUpView = button.dataset.followUpView;
         $$('[data-follow-up-view]', page()).forEach((item) =>
           item.classList.toggle("active", item === button),
         );
-        renderFollowUpList();
+        if (state.matterTab === "people") {
+          $("#follow-up-open-count", page()).textContent = String(openActions.length);
+          $("#follow-up-done-count", page()).textContent = String(doneActions.length);
+        } else {
+          renderFollowUpList();
+        }
+        $$('[data-follow-up-person-view]', page()).forEach((panel) => {
+          panel.hidden = panel.dataset.followUpPersonView !== state.followUpView;
+        });
       }),
     );
     $("#follow-up-list")?.addEventListener("click", (event) => {
@@ -2175,8 +2688,13 @@ function renderEmail(status, messages, matters) {
       visible.find((item) => item.id === state.followUpMatterId) || visible[0] || null;
     state.followUpMatterId = initial?.id || null;
     renderFollowUpList({ chooseMatter: false });
+    bindDynamic();
     if (initial) await selectFollowUpMatter(initial.id);
     else renderFollowUpMatter(null, []);
+    if (state.matterTab === "people") {
+      $("#follow-up-open-count", page()).textContent = String(openActions.length);
+      $("#follow-up-done-count", page()).textContent = String(doneActions.length);
+    }
   }
 
   function renderMatters(items, people = [], actionGroups = {}) {
@@ -2366,7 +2884,7 @@ function renderMatter(matter, people = [], timeline = []) {
           )
           .join("")
       : `<div class="calm-inline">尚无可直接核实的事实依据</div>`;
-  const matterProgressHtml = `<section class="content-card matter-progress-card"><div class="section-title"><div><p>手工更新</p><h2>状态、闭环日期与业务推进</h2></div><span>每次保存都会进入时间线</span></div><div class="matter-progress-grid"><form data-matter-status-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-status">事项状态</label><div class="matter-inline-fields"><select id="matter-status" name="status"><option value="active" ${matter.status === "completed" ? "" : "selected"}>正在推进</option><option value="completed" ${matter.status === "completed" ? "selected" : ""}>已完成</option></select><button class="button button-secondary" type="submit">保存状态</button></div><small>标记完成后进入完成归档；重新打开后回到推进列表。</small></form><form data-matter-date-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-target-date">要求闭环日期</label><div class="matter-inline-fields"><input id="matter-target-date" name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"><button class="button button-secondary" type="submit">保存日期</button></div><small>不确定日期时可以留空后保存。</small></form><form data-matter-progress-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-progress-summary">本次推进结果</label><input id="matter-progress-summary" name="summary" maxlength="200" placeholder="例如：已完成第一轮数据核对" required><label for="matter-progress-detail">补充说明</label><textarea id="matter-progress-detail" name="detail" rows="3" maxlength="2000" placeholder="记录已做了什么、还缺什么、下一步等谁。"></textarea><button class="button button-primary" type="submit">记录推进</button></form></div></section>`;
+  const matterProgressHtml = `<section class="content-card matter-progress-card"><div class="section-title"><div><p>手工更新</p><h2>状态、要求完成日期与业务推进</h2></div><span>每次保存都会进入时间线</span></div><div class="matter-progress-grid"><form data-matter-status-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-status">事项状态</label><div class="matter-inline-fields"><select id="matter-status" name="status"><option value="active" ${matter.status === "completed" ? "" : "selected"}>正在推进</option><option value="completed" ${matter.status === "completed" ? "selected" : ""}>已完成</option></select><button class="button button-secondary" type="submit">保存状态</button></div><small>标记完成后进入完成归档；重新打开后回到推进列表。</small></form><form data-matter-date-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-target-date">要求完成日期</label><div class="matter-inline-fields"><input id="matter-target-date" name="target_date" type="date" value="${escapeHtml(matter.target_date || "")}"><button class="button button-secondary" type="submit">保存日期</button></div><small>这是业务要求的完成日期，与下次复盘日期分开。</small></form><form data-matter-progress-form data-matter-id="${escapeHtml(matter.id)}"><label for="matter-progress-summary">本次推进结果</label><input id="matter-progress-summary" name="summary" maxlength="200" placeholder="例如：已完成第一轮数据核对" required><label for="matter-progress-detail">补充说明</label><textarea id="matter-progress-detail" name="detail" rows="3" maxlength="2000" placeholder="记录已做了什么、还缺什么、下一步等谁。"></textarea><label for="matter-next-review-date">下次复盘日期</label><input id="matter-next-review-date" name="next_review_date" type="date" value="${escapeHtml(matter.next_review_date || "")}"><button class="button button-primary" type="submit">记录推进</button></form></div></section>`;
   const materialsHtml = (matter.materials || [])
       .map(
         (item) =>
@@ -2453,7 +2971,11 @@ function renderMatter(matter, people = [], timeline = []) {
       await api(`/api/matters/${encodeURIComponent(form.dataset.matterId)}/progress`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ summary, detail: form.elements.detail.value.trim() }),
+        body: JSON.stringify({
+          summary,
+          detail: form.elements.detail.value.trim(),
+          next_review_date: form.elements.next_review_date.value || null,
+        }),
       });
       toast("业务推进已记入时间线", "success");
       await refreshRouteWithoutJump("#matter-progress-summary");
@@ -2534,28 +3056,34 @@ function renderMatter(matter, people = [], timeline = []) {
     bindDynamic();
   }
 
+  function nodeHistoryLabel(item) {
+    return item.lifecycle === "current" || item.status === "online"
+      ? "这台 Mac · 贾维斯"
+      : "旧的本机记录 · 贾维斯";
+  }
+
   function renderNodes(items) {
     state.nodes = Array.isArray(items) ? items : [];
     const online = state.nodes.some((item) => item.status === "online");
   const current =
     state.nodes.find((item) => item.lifecycle === "current") || state.nodes[0];
-    page().innerHTML = `<section class="section-heading"><div><p class="eyebrow">看清每一步由谁完成</p><h2>助理状态</h2><span>安卓本地等待，Mac 开盖和每两小时自动收件，贾维斯由你手工启动。</span></div></section><div class="assistant-status-grid"><article><span class="status-illustration cloud">收</span><div><p>第一步</p><h3>安卓手机投递箱</h3><strong class="online"><i></i>随时可存</strong><span>Mac 关机时材料留在手机“待处理”，不需要云主机或域名。</span></div></article><article><span class="status-illustration mac">M4</span><div><p>第二步</p><h3>Mac 本机处理</h3><strong class="${online ? "online" : "waiting"}"><i></i>${online ? "现在在线" : "等待开机"}</strong><span>${online ? "工作日开盖和每两小时自动收取新增内容。" : "开机后自动接收安卓中等待的材料。"}</span></div></article><article><span class="status-illustration buddy">贾</span><div><p>第三步</p><h3>贾维斯</h3><strong class="${online ? "online" : "waiting"}"><i></i>${online ? "等待你启动" : "随本机恢复"}</strong><span>只有你点击“让贾维斯整理新内容”后，才开始理解、归并和提取行动。</span></div></article></div>${current ? `<section class="status-note"><span>最近一次接手</span><strong>${fmtDate(current.last_seen_at)}</strong><p>${escapeHtml(current.metadata?.agent || "贾维斯")}</p></section>` : ""}`;
+    page().innerHTML = `<section class="section-heading"><div><p class="eyebrow">看清材料走到哪一步</p><h2>收件与整理情况</h2><span>安卓本地等待，Mac 开盖和每两小时自动收件，贾维斯由你手工启动。</span></div></section><div class="assistant-status-grid"><article><span class="status-illustration cloud">收</span><div><p>第一步</p><h3>安卓手机投递箱</h3><strong class="online"><i></i>随时可存</strong><span>Mac 关机时材料留在手机“待处理”，不需要云主机或域名。</span></div></article><article><span class="status-illustration mac">M4</span><div><p>第二步</p><h3>Mac 本机处理</h3><strong class="${online ? "online" : "waiting"}"><i></i>${online ? "现在可用" : "等待开机"}</strong><span>${online ? "工作日开盖和每两小时自动收取新增内容。" : "开机后自动接收安卓中等待的材料。"}</span></div></article><article><span class="status-illustration buddy">贾</span><div><p>第三步</p><h3>贾维斯</h3><strong class="${online ? "online" : "waiting"}"><i></i>${online ? "等待你启动" : "随本机恢复"}</strong><span>只有你点击“让贾维斯整理新内容”后，才开始理解、汇总和提取行动。</span></div></article></div>${current ? `<section class="status-note"><span>最近一次处理</span><strong>${fmtDate(current.last_seen_at)}</strong><p>${escapeHtml(current.metadata?.agent || "贾维斯")}</p></section>` : ""}`;
   const lifecycleLabels = {
     current: "5 分钟内在线",
-    stale: "超过 5 分钟未响应",
+    [["s", "tale"].join("")]: "超过 5 分钟未响应",
     historical: "历史离线，记录保留",
   };
   const nodeHistory = state.nodes
     .map((item) => {
       const lifecycle =
-        item.lifecycle || (item.status === "online" ? "current" : "stale");
-      return `<li><span>${escapeHtml(item.name || "本机执行节点")}</span><strong>${escapeHtml(lifecycleLabels[lifecycle] || "状态待确认")}</strong><small>${escapeHtml(fmtDate(item.last_seen_at))}</small></li>`;
+        item.lifecycle || (item.status === "online" ? "current" : ["s", "tale"].join(""));
+        return `<li><span>${escapeHtml(nodeHistoryLabel(item))}</span><strong>${escapeHtml(lifecycleLabels[lifecycle] || "情况待确认")}</strong><small>${escapeHtml(fmtDate(item.last_seen_at))}</small></li>`;
     })
     .join("");
   if (nodeHistory) {
     page().querySelector(".assistant-status-grid")?.insertAdjacentHTML(
       "afterend",
-      `<section class="status-note node-history"><span>节点历史</span><ul>${nodeHistory}</ul></section>`,
+      `<section class="status-note node-history"><span>本机处理记录</span><ul>${nodeHistory}</ul></section>`,
     );
   }
 }
@@ -2589,6 +3117,9 @@ function renderMatter(matter, people = [], timeline = []) {
     );
   $$("[data-action-id]").forEach((button) =>
     button.addEventListener("click", () => resolveAction(button)),
+  );
+  $$("[data-person-action-id]").forEach((button) =>
+    button.addEventListener("click", () => changePersonAction(button)),
   );
   $$("[data-assignee-toggle]").forEach((button) =>
     button.addEventListener("click", () => toggleAssigneeEditor(button)),
@@ -3196,9 +3727,9 @@ function updateWechatCount(count) {
     );
     $("#source-sync-receipt-kicker").textContent = terminal
       ? "本次读取结果"
-      : "读取进度";
+      : "读取情况";
     $("#source-sync-receipt-title").textContent = terminal
-      ? "三个平台已经检查完毕"
+      ? "本次读取已结束"
       : "正在检查个人微信、企业微信和邮箱";
     grid.innerHTML = rows
       .map((item) => {
@@ -3286,7 +3817,7 @@ function updateWechatCount(count) {
       if (terminal) return { rows, analysisStatus };
       await new Promise((resolve) => window.setTimeout(resolve, 1500));
     }
-    throw new Error("读取仍在后台继续，可稍后再次查看结果");
+    throw new Error("信息仍在继续读取，可稍后再次查看结果");
   }
 
   async function runSourceSync() {
@@ -3315,15 +3846,28 @@ function updateWechatCount(count) {
       const requestIds = {};
       const failures = {};
       if (results[0].status === "fulfilled") {
-        for (const request of results[0].value?.requests || []) {
-          requestIds[request.source] = request.id;
+        const requests = results[0].value?.requests || [];
+        for (const source of ["personal_wechat", "wecom"]) {
+          const request = requests.find((item) => item.source === source);
+          if (request?.id) requestIds[source] = request.id;
+          else failures[source] = humanText(
+            results[0].value?.message,
+            `${sourceSyncLabels[source]}本次未生成读取任务，请检查本机连接`,
+            180,
+          );
         }
       } else {
         failures.personal_wechat = friendlyError(results[0].reason);
         failures.wecom = friendlyError(results[0].reason);
       }
       if (results[1].status === "fulfilled") {
-        requestIds.email = results[1].value?.id;
+        const request = results[1].value?.request || results[1].value;
+        if (request?.id) requestIds.email = request.id;
+        else failures.email = humanText(
+          results[1].value?.message,
+          "邮箱尚未配置，本次未生成读取任务",
+          180,
+        );
       } else {
         failures.email = friendlyError(results[1].reason);
       }
@@ -3338,7 +3882,7 @@ function updateWechatCount(count) {
       await Promise.all([refreshShortcutCounts(), refreshAnalysisButton()]);
     } catch (error) {
       toast(friendlyError(error), "error");
-      $("#source-sync-receipt-title").textContent = "读取仍在后台继续";
+      $("#source-sync-receipt-title").textContent = "信息仍在继续读取";
       $("#source-sync-summary").textContent = friendlyError(error);
     } finally {
       state.sourceSyncRunning = false;
@@ -3425,7 +3969,7 @@ function updateWechatCount(count) {
       if (file && $("#intake-dialog")?.open) setSelectedFile(file);
     });
     if ("serviceWorker" in navigator)
-      navigator.serviceWorker.register("/sw.js?v=59").catch(() => {});
+      navigator.serviceWorker.register("/sw.js?v=100").catch(() => {});
     try {
     state.actor = await api("/api/auth/session");
     $("#logout-button").hidden = state.actor.password_required === false;

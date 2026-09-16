@@ -11,8 +11,10 @@
       name="description"
       content="Frank 的个人工作台"
     />
-    <link rel="manifest" href="/manifest.webmanifest?v=24" />
-    <link rel="stylesheet" href="/static/app.css?v=59" />
+    <link rel="manifest" href="/manifest.webmanifest?v=100" />
+    <link rel="stylesheet" href="/static/app.css?v=100" />
+    <link rel="stylesheet" href="/static/dashboard-reference.css?v=100" />
+    <link rel="stylesheet" href="/static/dashboard-responsive.css?v=100" />
     <title>Frank 的个人工作台</title>
   </head>
   <body>
@@ -78,9 +80,9 @@
       <div id="workbench" class="workbench" hidden>
         <aside class="side-rail" aria-label="主导航">
           <div class="rail-brand">
-          <span class="brand-seal small">F</span>
+            <span class="brand-seal small">F</span>
             <div>
-            <strong>Frank 的个人工作台</strong><span>个人信息与事项中心</span>
+              <strong>Frank 的个人工作台</strong><span>贾维斯</span>
             </div>
           </div>
 
@@ -95,33 +97,45 @@
           <nav class="rail-nav" id="desktop-nav" aria-label="主导航">
             <p class="nav-section-label">工作台</p>
             <a href="#/today" data-route="today">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4l8 7.2v8.3a.5.5 0 0 1-.5.5H15v-6H9v6H4.5a.5.5 0 0 1-.5-.5z" /></svg>
-              <span>跟进事项</span>
+ <img src="/static/icons/house.svg" alt="" aria-hidden="true" />
+              <span>今天</span>
             </a>
-            <a href="#/wechat" data-route="wechat">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z" /><path d="M8 9h8M8 12h5" /></svg>
-              <span>聊天监控</span><b id="wechat-count" hidden>0</b>
-            </a>
-            <a href="#/email" data-route="email">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4z" /><path d="m4 7 8 6 8-6" /></svg>
-              <span>邮件工作</span><b id="email-count" hidden>0</b>
+            <a href="#/matters" data-route="matters">
+ <img src="/static/icons/square-check.svg" alt="" aria-hidden="true" />
+              <span>事项</span>
             </a>
             <a href="#/policies" data-route="policies">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h9l3 3V20.5H6z" /><path d="M15 3.5v3h3M9 11h6M9 15h6" /></svg>
-              <span>公司规定</span>
+ <img src="/static/icons/file-text.svg" alt="" aria-hidden="true" />
+              <span>规定</span>
             </a>
             <a href="#/search" data-route="search">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 5 5" /></svg>
+ <img src="/static/icons/search.svg" alt="" aria-hidden="true" />
               <span>搜索</span><kbd>⌘K</kbd>
+            </a>
+            <p class="nav-section-label">信息来源</p>
+            <a href="#/wechat" data-route="wechat">
+ <img src="/static/icons/message-square-more.svg" alt="" aria-hidden="true" />
+              <span>聊天线索</span><b class="nav-count" id="wechat-count" hidden>0</b>
+            </a>
+            <a href="#/email" data-route="email">
+ <img src="/static/icons/mail.svg" alt="" aria-hidden="true" />
+              <span>邮件工作</span><b class="nav-count" id="email-count" hidden>0</b>
             </a>
           </nav>
 
-          <div class="rail-footer">
-            <div class="connection-row">
-              <span class="status-dot" id="connection-dot"></span
-              ><span id="connection-label">检查连接</span>
-            </div>
-            <button
+      <div class="rail-footer">
+        <button class="button button-primary button-wide rail-intake" type="button" data-open-intake>
+          ＋ 交给贾维斯
+        </button>
+        <div class="connection-row">
+            <span class="status-dot" id="connection-dot"></span
+            ><span id="connection-label">检查连接</span>
+          </div>
+<a class="rail-settings" href="#/nodes" aria-label="设置与工作状态">
+            <img src="/static/icons/settings.svg" alt="" aria-hidden="true" />
+            <span>设置</span>
+          </a>
+          <button
               class="button button-quiet button-wide"
               id="logout-button"
               type="button"
@@ -131,52 +145,47 @@
           </div>
         </aside>
 
-        <div class="content-shell">
+      <div class="content-shell">
+        <div class="workspace-header">
           <header class="topbar">
             <div class="topbar-title">
               <p class="eyebrow" id="page-kicker">Frank 的个人工作台</p>
               <h1 id="page-title">今天</h1>
             </div>
-            <div class="topbar-actions">
-              <button class="button button-secondary" id="run-source-sync-global" type="button">读取新信息</button>
-              <button class="button button-secondary" id="run-analysis-global" type="button">整理新内容</button>
-              <button class="button button-primary" type="button" data-open-intake>导入材料</button>
-              <span class="offline-pill" id="offline-pill" hidden>连接中断，材料暂存在当前设备</span>
-            </div>
+            <span class="offline-pill" id="offline-pill" hidden>连接中断，材料暂存在当前设备</span>
           </header>
 
           <section class="workflow-band" aria-label="工作台三步流程">
             <article class="workflow-step workflow-step-action">
-              <div class="workflow-step-number">1</div>
+          <div class="workflow-step-number"><img src="/static/icons/hugeicons-download-02.svg" alt="" aria-hidden="true" /></div>
               <div class="workflow-step-copy">
                 <span>读取新信息</span>
                 <small id="source-sync-detail">个人微信、企业微信和邮箱</small>
               </div>
-              <button class="button button-primary" id="run-source-sync-workflow" type="button">立即读取</button>
+              <button class="button button-primary" id="run-source-sync-global" type="button">立即读取</button>
             </article>
             <article class="workflow-step workflow-step-action">
-              <div class="workflow-step-number">2</div>
+            <div class="workflow-step-number"><img src="/static/icons/hugeicons-list.svg" alt="" aria-hidden="true" /></div>
               <div class="workflow-step-copy">
                 <span>整理新内容</span>
                 <small id="analysis-run-detail">仅手工启动，不会自动消耗额度</small>
               </div>
-              <button class="button button-secondary" id="run-analysis-workflow" type="button">让贾维斯整理</button>
+              <button class="button button-secondary" id="run-analysis-global" type="button">让贾维斯整理</button>
             </article>
             <article class="workflow-step workflow-step-attention">
-              <div class="workflow-step-number">3</div>
+            <div class="workflow-step-number"><img src="/static/icons/hugeicons-user-time-02.svg" alt="" aria-hidden="true" /></div>
               <div class="workflow-step-copy">
                 <span>需要我处理</span>
                 <small id="attention-total">目前没有等待确认</small>
               </div>
-              <nav class="work-queue-bar" aria-label="待确认与来源入口">
-                <a href="#/wechat" data-route="wechat"><span>聊天线索</span></a>
-                <a href="#/email" data-route="email"><span>邮件工作</span></a>
+              <nav class="work-queue-bar" aria-label="待确认入口">
                 <a href="#/reviews" data-route="reviews"><span>需要拍板</span><b id="review-count" hidden>0</b></a>
                 <a href="#/policies" data-route="policies"><span>公司规定</span><b id="policy-count" hidden>0</b></a>
-                <a class="work-queue-status" href="#/nodes" data-route="nodes"><span class="status-dot" id="shortcut-node-dot"></span><span>运行状态</span></a>
+                <a class="work-queue-status" href="#/nodes" data-route="nodes"><span class="status-dot" id="shortcut-node-dot"></span><span>收件情况</span></a>
               </nav>
             </article>
       </section>
+        </div>
       <section
         id="source-sync-receipt"
         class="source-sync-receipt"
@@ -185,8 +194,8 @@
       >
         <header>
           <div>
-            <p id="source-sync-receipt-kicker">读取进度</p>
-            <h2 id="source-sync-receipt-title">正在检查三个平台</h2>
+            <p id="source-sync-receipt-kicker">读取情况</p>
+            <h2 id="source-sync-receipt-title">正在读取三个平台的信息</h2>
           </div>
           <button
             class="button button-quiet"
@@ -391,7 +400,7 @@
           <i></i>
           <span>2</span>
           <p>
-                  <strong>贾维斯整理</strong><small>提炼、归并、安排追踪</small>
+            <strong>贾维斯整理</strong><small>提炼、汇总、安排追踪</small>
           </p>
           <i></i>
           <span>3</span>
@@ -417,6 +426,6 @@
         <span></span><strong>贾维斯正在整理页面</strong>
       </div>
     </template>
-    <script src="/static/app.js?v=59" defer></script>
+    <script src="/static/app.js?v=100" defer></script>
   </body>
 </html>
