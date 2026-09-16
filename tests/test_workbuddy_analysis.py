@@ -33,6 +33,71 @@ def _use_fake_deepseek(monkeypatch, fake_run) -> None:
     monkeypatch.setattr("scripts.workbuddy_analysis.call_deepseek_json", fake_call)
 
 
+def test_wechat_media_evidence_comes_from_the_model_client(monkeypatch) -> None:
+    def fake_call(_prompt, _timeout, _schema, **kwargs):
+        kwargs["media_evidence"].append(
+            {
+                "source": "/tmp/contract.png",
+                "media_type": "image/png",
+                "status": "model_processed",
+            }
+        )
+        return json.dumps(
+            {
+                "classification": "relevant",
+                "summary": "合同付款资料需要复核",
+                "uncertainty_reason": "",
+                "confidence": 0.97,
+                "evidence": ["图片显示合同付款资料待复核"],
+                "extracted": {
+                    "matter_title": "合同付款复核",
+                    "actions": [{"kind": "task", "title": "复核合同付款资料"}],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("scripts.workbuddy_analysis.call_deepseek_json", fake_call)
+
+    result = classify_wechat_with_workbuddy(
+        {"metadata": {"media_paths": ["/tmp/contract.png"]}},
+        "个人微信会话：供应商\n对方：非文字消息 [附件：image]",
+    )
+
+    assert result["classification"] == "relevant"
+    assert result["media_evidence"][0]["status"] == "model_processed"
+
+
+def test_wechat_image_path_without_client_evidence_is_not_treated_as_read(
+    monkeypatch,
+) -> None:
+    def fake_call(_prompt, _timeout, _schema, **_kwargs):
+        return json.dumps(
+            {
+                "classification": "relevant",
+                "summary": "合同付款资料需要复核",
+                "uncertainty_reason": "",
+                "confidence": 0.97,
+                "evidence": ["图片显示合同付款资料待复核"],
+                "extracted": {
+                    "matter_title": "合同付款复核",
+                    "actions": [{"kind": "task", "title": "复核合同付款资料"}],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("scripts.workbuddy_analysis.call_deepseek_json", fake_call)
+
+    result = classify_wechat_with_workbuddy(
+        {"metadata": {"media_paths": ["/missing/contract.png"]}},
+        "个人微信会话：供应商\n对方：非文字消息 [附件：image]",
+    )
+
+    assert result["classification"] == "irrelevant"
+    assert result["media_evidence"] == []
+
+
 def test_policy_classifier_accepts_word_confidence_and_controls_attachments(
     monkeypatch, tmp_path
 ) -> None:

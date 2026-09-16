@@ -181,7 +181,10 @@ def save_key(key: bytes, dataset: Path) -> Path:
 def capture_key(duration: int = 60) -> Path:
     _, build = app_version()
     if build != SUPPORTED_BUILD:
-        raise RuntimeError("企业微信升级后需要重新验证")
+        raise RuntimeError(
+            "当前企业微信版本需要人工确认后才能重新配置；"
+            "工作台不会自动操作企业微信进程"
+        )
     dataset = discover_dataset()
     import frida
 
@@ -220,11 +223,16 @@ def load_key(dataset: Path) -> bytes:
     account = dataset.parent.name
     path = VAULT_ROOT / "private" / f"key-{hashlib.sha256(account.encode()).hexdigest()[:16]}.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("app_build") != app_version()[1]:
-        raise RuntimeError("企业微信升级后需要重新验证")
     key = bytes.fromhex(str(payload.get("key") or ""))
     if not validates_key(key, dataset):
-        raise RuntimeError("已保存的企业微信密钥未通过数据库校验")
+        if payload.get("app_build") != app_version()[1]:
+            raise RuntimeError(
+                "企业微信更新后的本地数据自动验证未通过；"
+                "为避免触发系统安全防护，工作台没有操作企业微信进程"
+            )
+        raise RuntimeError("已保存的企业微信密钥未通过本地数据校验")
+    if payload.get("app_build") != app_version()[1]:
+        save_key(key, dataset)
     return key
 
 

@@ -955,7 +955,7 @@ def enrich_media(
                     media["extractionStatus"] = "completed"
                     message["text"] = f"[图片识别] {text}"
                 else:
-                    media["extractionStatus"] = "failed"
+                    media["extractionStatus"] = "completed"
             elif kind == "voice":
                 if inline_voice:
                     with tempfile.NamedTemporaryFile(suffix=".silk") as voice:
@@ -974,6 +974,55 @@ def enrich_media(
             media["extractionStatus"] = "failed"
         message["media"] = media
     return messages
+
+
+def _message_cursor(message: dict[str, Any]) -> tuple[int, int, int]:
+    cursor = message.get("cursor") if isinstance(message.get("cursor"), dict) else {}
+    return (
+        int(cursor.get("sortSeq") or 0),
+        int(cursor.get("createTime") or message.get("timestamp") or 0),
+        int(cursor.get("localId") or message.get("messageId") or 0),
+    )
+
+
+def _retry_safe_windows(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    ordered = sorted(messages, key=_message_cursor)
+    barrier = next(
+        (
+            message
+            for message in ordered
+            if (message.get("media") or {}).get("extractionStatus") == "failed"
+        ),
+        None,
+    )
+    if barrier is None:
+        return group_messages(ordered)
+
+    result: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    previous_ms = 0
+    for message in ordered:
+        raw_timestamp = int(
+            message.get("timestampMs") or message.get("timestamp") or 0
+        )
+        message_ms = (
+            raw_timestamp if raw_timestamp > 10_000_000_000 else raw_timestamp * 1000
+        )
+        if current and (
+            len(current) >= 200 or message_ms - previous_ms > 24 * 60 * 60 * 1000
+        ):
+            result.append(current)
+            current = (
+                [barrier]
+                if _message_cursor(message) > _message_cursor(barrier)
+                else []
+            )
+        if message not in current:
+            current.append(message)
+        previous_ms = message_ms
+    if current:
+        result.append(current)
+    return result
 
 
 def _enabled_at() -> int:
@@ -1004,7 +1053,6 @@ def run_direct_wechat_sync(
         conversations = read_messages(clear, dataset, start_ms)
     image_keys = load_image_keys(dataset.account)
     scanned = created = skipped = 0
-    prepared: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
     for session_id, conversation in conversations.items():
         current = existing.get(session_id)
         if current and current.get("listen_status") == "blocked":
@@ -1013,15 +1061,8 @@ def run_direct_wechat_sync(
         if current and current.get("create_time") and mode != "rescan":
             floor = int(current["create_time"]) * 1000 - 5 * 60 * 1000
             messages = [item for item in messages if int(item["timestampMs"]) >= floor]
-        if any(
-            (item.get("media") or {}).get("extractionStatus") == "failed"
-            for item in messages
-        ):
-            raise RuntimeError("部分图片或语音暂不可读取，将在下次检查时重试")
-        prepared.append((session_id, conversation, messages))
-    for session_id, conversation, messages in prepared:
         scanned += len(messages)
-        for window in group_messages(messages):
+        for window in _retry_safe_windows(messages):
             result = client.request_json(
                 "POST",
                 "/api/wechat/windows",

@@ -5,11 +5,21 @@ import hashlib
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
 from .assignees import prefill_matter_contact
+from .attachment_safety import remove_owned_staged_attachment
 from .db import Database, utc_now
+from .wechat import (
+    _matching_open_action,
+    _record_source_event,
+    _same_matter_topic,
+)
+
+
+_EMAIL_ANALYSIS_LOCK = Lock()
 
 
 def _id(prefix: str) -> str:
@@ -41,8 +51,9 @@ def _clean_email_routing(value: Any) -> str:
 
 
 class EmailWorkService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, attachment_staging_dir: Path):
         self.database = database
+        self.attachment_staging_dir = attachment_staging_dir
 
     def request_sync(self, actor: str) -> dict[str, Any]:
         if not self.database.fetch_one("SELECT account_id FROM email_accounts LIMIT 1"):
@@ -178,10 +189,53 @@ class EmailWorkService:
             "(SELECT COUNT(*) FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') + "
             "(SELECT COUNT(*) FROM reminders x WHERE x.matter_id = m.id "
             "AND x.status NOT IN ('done', 'dismissed')) AS open_count "
-            "FROM matters m WHERE m.id = ?",
+            "FROM matters m WHERE m.id = ? AND m.status = 'active'",
             (matter_id,),
         )
         return bool(row and row["open_count"])
+
+    def _find_open_topic_matter(self, payload: dict[str, Any]) -> str | None:
+        title = _clean_email_subject(payload.get("matter_title"))
+        summary = " ".join(
+            [
+                _clean_email_routing(payload.get("summary")),
+                *(
+                    _clean_email_routing(item.get("title"))
+                    for item in (payload.get("actions") or [])
+                    if isinstance(item, dict)
+                ),
+            ]
+        )
+        if not title and not summary:
+            return None
+        candidate = {
+            "extracted_json": json.dumps({"matter_title": title}, ensure_ascii=False),
+            "summary": summary,
+        }
+        rows = self.database.fetch_all(
+            "SELECT m.id AS matter_id, m.title AS matter_title, "
+            "m.title || ' ' || m.summary || ' ' || "
+            "COALESCE(GROUP_CONCAT(CASE WHEN a.status = 'open' THEN a.title END, ' '), '') "
+            "AS summary FROM matters m LEFT JOIN actions a ON a.matter_id = m.id "
+            "WHERE m.status = 'active' AND ("
+            "EXISTS (SELECT 1 FROM actions x WHERE x.matter_id = m.id AND x.status = 'open') OR "
+            "EXISTS (SELECT 1 FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') OR "
+            "EXISTS (SELECT 1 FROM reminders x WHERE x.matter_id = m.id "
+            "AND x.status NOT IN ('done', 'dismissed'))"
+            ") GROUP BY m.id ORDER BY m.updated_at DESC"
+        )
+        matches: list[str] = []
+        for row in rows:
+            option = {
+                **row,
+                "extracted_json": json.dumps(
+                    {"matter_title": row["matter_title"]}, ensure_ascii=False
+                ),
+            }
+            if _same_matter_topic(candidate, option):
+                matches.append(str(row["matter_id"]))
+        unique = list(dict.fromkeys(matches))
+        return unique[0] if len(unique) == 1 else None
 
     def ingest_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         account = self.database.fetch_one(
@@ -316,7 +370,10 @@ class EmailWorkService:
             )
             if existing and self._matter_is_open(existing["matter_id"]):
                 matter_id = existing["matter_id"]
+        if work and not matter_id:
+            matter_id = self._find_open_topic_matter(payload)
 
+        existing_matter = bool(matter_id)
         with self.database.connect() as connection:
             if work and not matter_id:
                 matter_id = _id("matter")
@@ -328,8 +385,8 @@ class EmailWorkService:
                 )
             elif work and matter_id:
                 connection.execute(
-                    "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
-                    (payload.get("summary", "")[:1000], now, matter_id),
+                    "UPDATE matters SET updated_at = ? WHERE id = ?",
+                    (now, matter_id),
                 )
 
             connection.execute(
@@ -363,16 +420,25 @@ class EmailWorkService:
                 ),
             )
             if work and matter_id:
+                created_action_ids: list[str] = []
+                continued_action_ids: list[str] = []
                 for item in payload.get("actions", [])[:12]:
                     title = str(item.get("title") or "").strip()
                     if not title:
                         continue
+                    existing_action = _matching_open_action(
+                        connection, matter_id, item
+                    )
+                    if existing_action:
+                        continued_action_ids.append(str(existing_action["id"]))
+                        continue
+                    action_id = _id("action")
                     connection.execute(
                         "INSERT INTO actions "
                         "(id, matter_id, material_id, kind, title, detail, status, owner, due_date, "
                         "created_by, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
                         (
-                            _id("action"),
+                            action_id,
                             matter_id,
                             item.get("kind") if item.get("kind") in {"task", "risk", "decision", "waiting", "conclusion"} else "task",
                             title[:160],
@@ -384,26 +450,62 @@ class EmailWorkService:
                             now,
                         ),
                     )
+                    created_action_ids.append(action_id)
                 if not payload.get("actions"):
-                    connection.execute(
-                        "INSERT INTO actions "
-                        "(id, matter_id, material_id, kind, title, detail, status, owner, created_by, created_at, updated_at) "
-                        "VALUES (?, ?, NULL, 'task', ?, ?, 'open', '财务负责人', ?, ?, ?)",
-                        (
-                            _id("action"),
-                            matter_id,
-                            (payload.get("summary") or payload["subject"] or "跟进邮件要求")[:160],
-                            payload.get("reason", "")[:1000],
-                            f"email:{message_id}",
-                            now,
-                            now,
-                        ),
+                    fallback = {
+                        "kind": "task",
+                        "title": (
+                            payload.get("summary")
+                            or payload["subject"]
+                            or "跟进邮件要求"
+                        )[:160],
+                    }
+                    existing_action = _matching_open_action(
+                        connection, matter_id, fallback
                     )
+                    if existing_action:
+                        continued_action_ids.append(str(existing_action["id"]))
+                    else:
+                        action_id = _id("action")
+                        connection.execute(
+                            "INSERT INTO actions "
+                            "(id, matter_id, material_id, kind, title, detail, status, owner, created_by, created_at, updated_at) "
+                            "VALUES (?, ?, NULL, 'task', ?, ?, 'open', '财务负责人', ?, ?, ?)",
+                            (
+                                action_id,
+                                matter_id,
+                                fallback["title"],
+                                payload.get("reason", "")[:1000],
+                                f"email:{message_id}",
+                                now,
+                                now,
+                            ),
+                        )
+                        created_action_ids.append(action_id)
+                _record_source_event(
+                    connection,
+                    matter_id=matter_id,
+                    event_type="source.follow_up" if existing_matter else "source.received",
+                    actor="email-sync",
+                    object_type="email_message",
+                    object_id=message_id,
+                    summary=payload.get("summary") or payload.get("subject") or "收到工作邮件",
+                    payload={
+                        "evidence": payload.get("evidence", [])[:4],
+                        "continued_action_ids": continued_action_ids,
+                        "created_action_ids": created_action_ids,
+                    },
+                    now=now,
+                )
 
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
         return self._public_message(row or {})
 
     def complete_analysis(self, message_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        with _EMAIL_ANALYSIS_LOCK:
+            return self._complete_analysis(message_id, result)
+
+    def _complete_analysis(self, message_id: str, result: dict[str, Any]) -> dict[str, Any]:
         message = self.database.fetch_one(
             "SELECT * FROM email_messages WHERE id = ?", (message_id,)
         )
@@ -436,7 +538,7 @@ class EmailWorkService:
             matter_id = None
         if matter_id and not self._matter_is_open(str(matter_id)):
             matter_id = None
-        if work and not matter_id:
+        if accepted_work and not matter_id:
             existing = self.database.fetch_one(
                 "SELECT matter_id FROM email_messages WHERE account_id = ? AND thread_key = ? "
                 "AND matter_id IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
@@ -444,6 +546,15 @@ class EmailWorkService:
             )
             if existing and self._matter_is_open(existing["matter_id"]):
                 matter_id = existing["matter_id"]
+        if accepted_work and not matter_id:
+            matter_id = self._find_open_topic_matter(
+                {
+                    **result,
+                    "summary": summary,
+                    "actions": actions,
+                    "matter_title": result.get("matter_title") or message.get("subject"),
+                }
+            )
 
         material_metadata: dict[str, Any] = {}
         if message.get("material_id"):
@@ -454,6 +565,7 @@ class EmailWorkService:
                 material.get("metadata_json") if material else "{}", {}
             )
         now = utc_now()
+        existing_matter = bool(matter_id)
         with self.database.connect() as connection:
             if accepted_work and not matter_id:
                 matter_id = _id("matter")
@@ -469,8 +581,8 @@ class EmailWorkService:
                 )
             elif accepted_work and matter_id:
                 connection.execute(
-                    "UPDATE matters SET summary = ?, updated_at = ? WHERE id = ?",
-                    (summary, now, matter_id),
+                    "UPDATE matters SET updated_at = ? WHERE id = ?",
+                    (now, matter_id),
                 )
 
             status = "active" if work or policy_relevant else "ignored"
@@ -492,16 +604,26 @@ class EmailWorkService:
                 ),
             )
             if accepted_work and matter_id:
+                created_action_ids: list[str] = []
+                continued_action_ids: list[str] = []
                 for item in actions:
                     title = _clean_email_routing(item.get("title"))
                     if not title:
                         continue
+                    clean_item = {**item, "title": title}
+                    existing_action = _matching_open_action(
+                        connection, matter_id, clean_item
+                    )
+                    if existing_action:
+                        continued_action_ids.append(str(existing_action["id"]))
+                        continue
+                    action_id = _id("action")
                     connection.execute(
                         "INSERT INTO actions "
                         "(id, matter_id, material_id, kind, title, detail, status, owner, due_date, "
                         "created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
                         (
-                            _id("action"),
+                            action_id,
                             matter_id,
                             message.get("material_id"),
                             item.get("kind")
@@ -516,8 +638,26 @@ class EmailWorkService:
                             now,
                         ),
                     )
+                    created_action_ids.append(action_id)
             if accepted_work and matter_id:
                 prefill_matter_contact(connection, matter_id, actions, now)
+                _record_source_event(
+                    connection,
+                    matter_id=matter_id,
+                    event_type="source.follow_up" if existing_matter else "source.received",
+                    actor="jarvis-batch",
+                    object_type="email_message",
+                    object_id=message_id,
+                    summary=summary or message.get("subject") or "收到工作邮件",
+                    payload={
+                        "material_id": message.get("material_id"),
+                        "evidence": evidence,
+                        "continued_action_ids": continued_action_ids,
+                        "created_action_ids": created_action_ids,
+                        "automatic": True,
+                    },
+                    now=now,
+                )
 
             if message.get("material_id"):
                 if status == "ignored":
@@ -535,9 +675,7 @@ class EmailWorkService:
 
         if not work and not policy_relevant:
             for value in material_metadata.get("attachment_paths", []):
-                path = Path(str(value))
-                if path.is_file():
-                    path.unlink(missing_ok=True)
+                remove_owned_staged_attachment(str(value), self.attachment_staging_dir)
         row = self.database.fetch_one("SELECT * FROM email_messages WHERE id = ?", (message_id,))
         return self._public_message(row or {})
 
@@ -550,29 +688,54 @@ class EmailWorkService:
         if row.get("classification") != "work" or not row.get("needs_follow_up"):
             raise ValueError("这封邮件不是待确认工作")
         now = utc_now()
-        matter_id = _id("matter")
-        action_id = _id("action")
         title = (row.get("subject") or row.get("summary") or "邮件工作事项")[:120]
         action_title = (row.get("summary") or row.get("subject") or "跟进邮件要求")[:160]
+        suggested_action = {"kind": "task", "title": action_title}
+        matter_id = self._find_open_topic_matter(
+            {
+                "matter_title": title,
+                "summary": row.get("summary") or "",
+                "actions": [suggested_action],
+            }
+        )
+        existing_matter = bool(matter_id)
+        if not matter_id:
+            matter_id = _id("matter")
         with self.database.connect() as connection:
-            connection.execute(
-                "INSERT INTO matters (id, title, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (matter_id, title, row.get("summary") or "", now, now),
+            if not existing_matter:
+                connection.execute(
+                    "INSERT INTO matters (id, title, summary, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (matter_id, title, row.get("summary") or "", now, now),
+                )
+            else:
+                connection.execute(
+                    "UPDATE matters SET updated_at = ? WHERE id = ?", (now, matter_id)
+                )
+            existing_action = _matching_open_action(
+                connection, matter_id, suggested_action
             )
-            connection.execute(
-                "INSERT INTO actions (id, matter_id, material_id, kind, title, detail, status, "
-                "created_by, created_at, updated_at) VALUES (?, ?, ?, 'task', ?, ?, 'open', ?, ?, ?)",
-                (
-                    action_id,
-                    matter_id,
-                    row.get("material_id"),
-                    action_title,
-                    row.get("reason") or "",
-                    f"email:{message_id}",
-                    now,
-                    now,
-                ),
-            )
+            created_action_ids: list[str] = []
+            continued_action_ids: list[str] = []
+            if existing_action:
+                continued_action_ids.append(str(existing_action["id"]))
+            else:
+                action_id = _id("action")
+                connection.execute(
+                    "INSERT INTO actions (id, matter_id, material_id, kind, title, detail, status, "
+                    "created_by, created_at, updated_at) VALUES (?, ?, ?, 'task', ?, ?, 'open', ?, ?, ?)",
+                    (
+                        action_id,
+                        matter_id,
+                        row.get("material_id"),
+                        action_title,
+                        row.get("reason") or "",
+                        f"email:{message_id}",
+                        now,
+                        now,
+                    ),
+                )
+                created_action_ids.append(action_id)
             connection.execute(
                 "UPDATE email_messages SET matter_id = ?, updated_at = ? WHERE id = ?",
                 (matter_id, now, message_id),
@@ -582,6 +745,23 @@ class EmailWorkService:
                     "UPDATE materials SET matter_id = ?, status = 'processed', updated_at = ? WHERE id = ?",
                     (matter_id, now, row["material_id"]),
                 )
+            _record_source_event(
+                connection,
+                matter_id=matter_id,
+                event_type="source.follow_up" if existing_matter else "source.received",
+                actor=actor,
+                object_type="email_message",
+                object_id=message_id,
+                summary=row.get("summary") or row.get("subject") or "收到工作邮件",
+                payload={
+                    "material_id": row.get("material_id"),
+                    "evidence": _json(row.get("evidence_json"), [])[:4],
+                    "continued_action_ids": continued_action_ids,
+                    "created_action_ids": created_action_ids,
+                    "automatic": False,
+                },
+                now=now,
+            )
         self.database.audit(
             _id("audit"), actor, "email.confirmed", "email_message", message_id, matter_id
         )
@@ -614,6 +794,18 @@ class EmailWorkService:
                 "UPDATE email_messages SET ignored_action_ids_json = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(ignored_action_ids, ensure_ascii=False), now, message_id),
             )
+            if row.get("matter_id"):
+                _record_source_event(
+                    connection,
+                    matter_id=str(row["matter_id"]),
+                    event_type="source.follow_up.undone",
+                    actor=actor,
+                    object_type="email_message",
+                    object_id=message_id,
+                    summary="已撤销这封邮件带来的推进内容",
+                    payload={"dismissed_action_ids": ignored_action_ids},
+                    now=now,
+                )
         self.database.audit(
             _id("audit"), actor, "email.ignored", "email_message", message_id, row.get("matter_id")
         )
@@ -640,6 +832,18 @@ class EmailWorkService:
                     f"UPDATE actions SET status = 'open', updated_at = ? "
                     f"WHERE id IN ({placeholders}) AND status = 'dismissed'",
                     (now, *ignored_action_ids),
+                )
+            if row.get("matter_id"):
+                _record_source_event(
+                    connection,
+                    matter_id=str(row["matter_id"]),
+                    event_type="source.follow_up.restored",
+                    actor=actor,
+                    object_type="email_message",
+                    object_id=message_id,
+                    summary="已恢复这封邮件带来的推进内容",
+                    payload={"restored_action_ids": ignored_action_ids},
+                    now=now,
                 )
         self.database.audit(
             _id("audit"), actor, "email.restored", "email_message", message_id, row.get("matter_id")

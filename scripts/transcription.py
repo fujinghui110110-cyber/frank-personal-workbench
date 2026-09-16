@@ -9,6 +9,19 @@ from typing import Any
 
 AUDIO_VIDEO_TYPES = {"audio", "video"}
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+
+def _resolve_whisper_model(model: str) -> str:
+    if Path(model).exists():
+        return model
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model, local_files_only=True)
+    except (ImportError, OSError):
+        return model
+
+
 MEETING_ACTION_PATTERNS = (
     (
         "decision",
@@ -172,7 +185,7 @@ def transcribe_material(material: dict[str, Any], content: bytes) -> dict[str, A
     filename = str(material.get("filename") or "会议录音.wav")
     title = Path(filename).stem[:80] or "会议录音"
     suffix = Path(filename).suffix or ".wav"
-    model = os.getenv("WORKBENCH_WHISPER_MODEL", DEFAULT_MODEL)
+    model = _resolve_whisper_model(os.getenv("WORKBENCH_WHISPER_MODEL", DEFAULT_MODEL))
     language = os.getenv("WORKBENCH_WHISPER_LANGUAGE", "zh")
     prompt = f"这是Frank 的中文工作会议。会议主题：{title}。"
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .attachment_safety import resolve_authorized_attachment
 from .config import Settings
 from .db import Database, utc_now
 
@@ -120,7 +121,10 @@ class PolicyService:
         scope = _clean(result.get("scope"), 500)
         requirements = _list(result.get("requirements"), 20)
         evidence = _list(result.get("evidence"), 4)
-        attachments = _list(result.get("attachments"), 20)
+        attachments = self._authorized_attachment_paths(
+            _clean(payload.get("material_id"), 200) or None,
+            _list(result.get("attachments"), 20),
+        )
         matched_policy_id = self._matched_policy_id(result, publisher, topic, scope, title)
         confidence = max(0.0, min(float(result.get("confidence") or 0), 1.0))
         is_authority = result.get("is_authority") is True
@@ -485,15 +489,90 @@ class PolicyService:
     ) -> list[tuple[Path, bytes]]:
         operations: list[tuple[Path, bytes]] = []
         for value in _json(version.get("attachments_json"), []):
-            source = Path(str(value)).expanduser()
-            if source.suffix.lower() not in FORMAL_EXTENSIONS or not source.is_file():
-                continue
-            content = source.read_bytes()
+            material_id = self._candidate_material_id(version.get("candidate_id"))
+            source = self._authorized_attachment_source(material_id, str(value))
+            filename = self._formal_attachment_filename(material_id, source) if source else None
+            if source is None or filename is None:
+                attachment_name = Path(str(value)).name[:160] or "未命名附件"
+                raise OSError(f"正式附件无法安全读取或已缺失：{attachment_name}")
+            try:
+                content = source.read_bytes()
+            except OSError as error:
+                raise OSError(f"正式附件无法安全读取：{filename}") from error
             digest = hashlib.sha256(content).hexdigest()[:12]
-            target = self.root / "附件" / _safe_name(policy["topic"]) / _safe_name(policy["title"]) / f"{digest}-{_safe_name(source.name)}"
+            target = self.root / "附件" / _safe_name(policy["topic"]) / _safe_name(policy["title"]) / f"{digest}-{_safe_name(filename)}"
             if not target.exists():
                 operations.append((target, content))
         return operations
+
+    def _authorized_attachment_paths(
+        self, material_id: str | None, attachment_paths: list[str]
+    ) -> list[str]:
+        if material_id is None:
+            return []
+        return [
+            str(source)
+            for attachment_path in attachment_paths
+            if (
+                source := self._authorized_attachment_source(
+                    material_id, attachment_path
+                )
+            ) is not None
+            and self._formal_attachment_filename(material_id, source) is not None
+        ]
+
+    def _authorized_attachment_source(
+        self, material_id: str | None, attachment_path: str
+    ) -> Path | None:
+        if material_id is None:
+            return None
+        material = self.database.fetch_one(
+            "SELECT storage_key, metadata_json FROM materials WHERE id = ?", (material_id,)
+        )
+        if not material:
+            return None
+        metadata = _json(material.get("metadata_json"), {})
+        authorized_paths = _list(metadata.get("attachment_paths"), 20)
+        storage_key = str(material.get("storage_key") or "")
+        if storage_key:
+            authorized_paths.append(str(self.settings.data_dir / storage_key))
+        return resolve_authorized_attachment(
+            attachment_path,
+            tuple(authorized_paths),
+            (self.settings.email_attachment_staging_dir, self.settings.objects_dir),
+        )
+
+    def _formal_attachment_filename(
+        self, material_id: str | None, source: Path
+    ) -> str | None:
+        if material_id is None:
+            return None
+        material = self.database.fetch_one(
+            "SELECT storage_key, filename FROM materials WHERE id = ?", (material_id,)
+        )
+        if not material:
+            return None
+        storage_key = str(material.get("storage_key") or "")
+        if storage_key:
+            stored_source = resolve_authorized_attachment(
+                source,
+                (str(self.settings.data_dir / storage_key),),
+                (self.settings.objects_dir,),
+            )
+            if stored_source == source:
+                filename = Path(str(material.get("filename") or "")).name
+                return filename if Path(filename).suffix.lower() in FORMAL_EXTENSIONS else None
+        return source.name if source.suffix.lower() in FORMAL_EXTENSIONS else None
+
+    def _candidate_material_id(self, candidate_id: str | None) -> str | None:
+        if candidate_id is None:
+            return None
+        candidate = self.database.fetch_one(
+            "SELECT material_id FROM company_policy_candidates WHERE id = ?", (candidate_id,)
+        )
+        if not candidate:
+            return None
+        return _clean(candidate.get("material_id"), 200) or None
 
     @staticmethod
     def _write_batch(operations: list[tuple[Path, bytes | None]]) -> None:

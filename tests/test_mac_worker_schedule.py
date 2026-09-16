@@ -202,3 +202,47 @@ def test_worker_waits_when_service_is_not_ready(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert "工作台暂未就绪" in output
     assert "Traceback" not in output
+
+
+def test_worker_exits_after_three_consecutive_service_errors(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(mac_worker, "WorkbenchClient", lambda *_: object())
+    monkeypatch.setattr(
+        mac_worker,
+        "request_incremental_sync",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("连接被拒绝")),
+    )
+    monkeypatch.setattr(mac_worker.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(sys, "argv", ["mac_worker", "--once", "--poll-seconds", "2"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        mac_worker.main()
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().out.count("工作台暂未就绪") == 3
+
+
+def test_success_resets_consecutive_service_errors(monkeypatch) -> None:
+    outcomes = iter([RuntimeError("失败一"), RuntimeError("失败二"), None,
+                     RuntimeError("失败三"), RuntimeError("失败四"), RuntimeError("失败五")])
+    attempts = 0
+
+    def request_sync(_client):
+        nonlocal attempts
+        attempts += 1
+        outcome = next(outcomes)
+        if outcome:
+            raise outcome
+
+    monkeypatch.setattr(mac_worker, "WorkbenchClient", lambda *_: object())
+    monkeypatch.setattr(mac_worker, "scheduled_sync_reason", lambda *_: "test")
+    monkeypatch.setattr(mac_worker, "request_incremental_sync", request_sync)
+    monkeypatch.setattr(mac_worker, "scan_icloud_inbox", lambda *_: False)
+    monkeypatch.setattr(mac_worker, "drain_pending_work", lambda *_: 0)
+    monkeypatch.setattr(mac_worker.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(sys, "argv", ["mac_worker", "--poll-seconds", "2"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        mac_worker.main()
+
+    assert exit_info.value.code == 1
+    assert attempts == 6

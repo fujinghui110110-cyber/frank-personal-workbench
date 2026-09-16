@@ -30,6 +30,7 @@ SYNC_INTERVAL_SECONDS = 2 * 60 * 60
 WAKE_GAP_SECONDS = 60
 DEFAULT_ANALYSIS_CONCURRENCY = 300
 MAX_ANALYSIS_CONCURRENCY = 500
+MAX_CONSECUTIVE_SERVICE_ERRORS = 3
 
 
 def error_text(error: BaseException) -> str:
@@ -458,6 +459,7 @@ def main() -> None:
     sync_inbox = Path(args.sync_inbox).expanduser()
     last_loop_epoch: float | None = None
     last_sync_epoch: float | None = None
+    consecutive_service_errors = 0
     while True:
         now_epoch = time.time()
         reason = scheduled_sync_reason(
@@ -498,6 +500,16 @@ def main() -> None:
                 service_error = True
                 print(f"工作台暂未就绪：{error_text(error)}；等待重试。", flush=True)
         last_loop_epoch = time.time()
+        if service_error:
+            consecutive_service_errors += 1
+            if consecutive_service_errors >= MAX_CONSECUTIVE_SERVICE_ERRORS:
+                print(
+                    "工作台连续连接失败，交由 macOS 自动重启执行节点。",
+                    flush=True,
+                )
+                raise SystemExit(1)
+        else:
+            consecutive_service_errors = 0
         if args.once and not service_error:
             return
         if not imported and not worked:

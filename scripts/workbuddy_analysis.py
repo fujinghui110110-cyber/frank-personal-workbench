@@ -327,17 +327,23 @@ def _call_workbuddy_json(
     *,
     image_paths: list[str] | None = None,
     image_bytes: bytes | None = None,
+    media_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     for attempt in range(2):
+        attempt_media_evidence: list[dict[str, Any]] = []
         output = call_deepseek_json(
             prompt,
             timeout,
             schema,
             image_paths=image_paths,
             image_bytes=image_bytes,
+            media_evidence=attempt_media_evidence,
         )
         try:
-            return _json_object(output)
+            result = _json_object(output)
+            if media_evidence is not None:
+                media_evidence.extend(attempt_media_evidence)
+            return result
         except ValueError:
             if attempt == 1:
                 raise RuntimeError("贾维斯 调用未完成") from None
@@ -397,8 +403,13 @@ def classify_wechat_with_workbuddy(
         _WECHAT_JSON_SCHEMA,
     )
     image_paths = list((material.get("metadata") or {}).get("media_paths") or [])
+    media_evidence: list[dict[str, Any]] = []
     raw = (
-        _call_workbuddy_json(*call_args, image_paths=image_paths)
+        _call_workbuddy_json(
+            *call_args,
+            image_paths=image_paths,
+            media_evidence=media_evidence,
+        )
         if image_paths
         else _call_workbuddy_json(*call_args)
     )
@@ -442,8 +453,11 @@ def classify_wechat_with_workbuddy(
         "confidence": raw.get("confidence"),
         "evidence": evidence,
         "extracted": extracted,
+        "media_evidence": media_evidence,
     }
-    if not review_worthy_wechat_result(result, source_text):
+    if not review_worthy_wechat_result(
+        result, source_text, media_was_read=bool(media_evidence)
+    ):
         result["classification"] = "irrelevant"
         result["uncertainty_reason"] = ""
     return result

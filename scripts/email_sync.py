@@ -24,7 +24,12 @@ from app.client import WorkbenchClient
 
 CONFIG_PATH = Path.home() / "Library/Application Support/FinanceWorkbench/email.json"
 KEYCHAIN_SERVICE = "finance-workbench-email"
-ATTACHMENT_DIR = Path.home() / "Library/Application Support/FinanceWorkbench/email-attachments"
+ATTACHMENT_DIR = Path(
+    os.getenv(
+        "WORKBENCH_EMAIL_ATTACHMENT_STAGING_DIR",
+        "~/Library/Application Support/FinanceWorkbench/email-attachments",
+    )
+).expanduser()
 FORMAL_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 _OBVIOUS_NONWORK_RE = re.compile(
     r"验证码|校验码|登录提醒|安全提醒|密码重置|订阅确认|退订|促销|优惠券|限时折扣|"

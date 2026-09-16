@@ -1,7 +1,17 @@
 from scripts.transcription import (
+    _resolve_whisper_model,
     format_transcript,
     prepare_analysis_result,
 )
+
+
+def test_cached_whisper_model_is_used_without_network(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda model, local_files_only: f"/cached/{model}" if local_files_only else "",
+    )
+
+    assert _resolve_whisper_model("owner/model") == "/cached/owner/model"
 
 
 def sample_transcription():

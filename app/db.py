@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS matters (
     summary TEXT NOT NULL DEFAULT '',
     owner TEXT NOT NULL DEFAULT '财务负责人',
     target_date TEXT,
+    next_review_date TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -486,6 +488,74 @@ CREATE TABLE IF NOT EXISTS daily_briefs (
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS contacts (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    organization TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contact_identities (
+    id TEXT PRIMARY KEY,
+    contact_id TEXT NOT NULL REFERENCES contacts(id),
+    source TEXT NOT NULL,
+    stable_id TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source, stable_id)
+);
+
+CREATE TABLE IF NOT EXISTS contact_interactions (
+    id TEXT PRIMARY KEY,
+    contact_id TEXT REFERENCES contacts(id),
+    matter_id TEXT REFERENCES matters(id),
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'unknown',
+    summary TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(source, source_ref)
+);
+
+CREATE TABLE IF NOT EXISTS commitments (
+    id TEXT PRIMARY KEY,
+    contact_id TEXT REFERENCES contacts(id),
+    matter_id TEXT REFERENCES matters(id),
+    action_id TEXT REFERENCES actions(id),
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    due_at TEXT,
+    next_follow_up_at TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source, source_ref, category)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitments_status
+ON commitments(status, category, next_follow_up_at, due_at);
+CREATE INDEX IF NOT EXISTS idx_contact_identities_lookup
+ON contact_identities(source, stable_id);
+
+CREATE TABLE IF NOT EXISTS search_terms (
+    id TEXT PRIMARY KEY,
+    canonical TEXT NOT NULL,
+    alternatives_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(canonical)
+);
+
 CREATE TABLE IF NOT EXISTS learned_rules (
     id TEXT PRIMARY KEY,
     rule_type TEXT NOT NULL,
@@ -737,6 +807,8 @@ class Database:
             }
             if "target_date" not in matter_columns:
                 connection.execute("ALTER TABLE matters ADD COLUMN target_date TEXT")
+            if "next_review_date" not in matter_columns:
+                connection.execute("ALTER TABLE matters ADD COLUMN next_review_date TEXT")
             if "status_override" not in matter_columns:
                 connection.execute(
                     "ALTER TABLE matters ADD COLUMN status_override INTEGER NOT NULL DEFAULT 0"
@@ -864,14 +936,44 @@ class Database:
                 "SELECT MIN(x.id) FROM materials x WHERE x.matter_id = actions.matter_id "
                 "HAVING COUNT(*) = 1) WHERE material_id IS NULL"
             )
+            search_terms = {
+                "孙庆": ["Hank", "hank", "孙总"],
+                "李静": ["李姐", "静姐"],
+                "欧波": ["欧哥"],
+                "冯李香": ["李香", "香姐"],
+                "陈贞婷": ["阿婷"],
+                "潘朝荟": ["应收会计", "收入会计", "资产管理员", "收入审计员"],
+                "朱青霞": ["朱青霞-球会总账", "总账主管"],
+                "付款": ["支付", "付钱", "打款"],
+                "发票": ["票据", "开票", "收票"],
+                "合同": ["协议", "合约"],
+                "预算": ["预算案", "预算额度"],
+                "审批": ["审核", "批复", "签批"],
+            }
+            for canonical, alternatives in search_terms.items():
+                term_id = "term_" + hashlib.sha256(
+                    canonical.encode("utf-8")
+                ).hexdigest()[:24]
+                connection.execute(
+                    "INSERT INTO search_terms "
+                    "(id, canonical, alternatives_json, enabled, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT(canonical) DO NOTHING",
+                    (
+                        term_id,
+                        canonical,
+                        json.dumps(alternatives, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self, busy_timeout_ms: int = 5000) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {max(0, int(busy_timeout_ms))}")
         try:
             yield connection
             connection.commit()

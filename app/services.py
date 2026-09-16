@@ -947,6 +947,7 @@ class WorkbenchService:
         material = self.database.fetch_one("SELECT * FROM materials WHERE id = ?", (material_id,))
         if not material:
             raise KeyError("材料不存在")
+        explicit_existing_matter = bool(matter_id)
         if matter_id:
             matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
             if not matter:
@@ -971,6 +972,36 @@ class WorkbenchService:
             material_id,
             matter_id,
         )
+        if explicit_existing_matter:
+            observed_title = normalized_title(
+                str(material.get("filename") or material.get("text_note") or "")[:200]
+            )
+            if observed_title:
+                rule_id = "rule_" + hashlib.sha256(
+                    f"feedback:topic_merge:{observed_title}".encode("utf-8")
+                ).hexdigest()[:24]
+                pattern = {
+                    "scope": "exact_observed_topic",
+                    "observed_title": observed_title,
+                    "matter_id": matter_id,
+                    "source": {
+                        "type": "material.assigned",
+                        "ref": material_id,
+                        "actor": actor,
+                        "recorded_at": now,
+                    },
+                    "last_used_at": now,
+                }
+                with self.database.connect() as connection:
+                    connection.execute(
+                        "INSERT INTO learned_rules "
+                        "(id,rule_type,description,pattern_json,source_count,enabled,created_at,updated_at) "
+                        "VALUES (?, 'topic_merge', ?, ?, 1, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                        "pattern_json=excluded.pattern_json, source_count=learned_rules.source_count+1, "
+                        "enabled=1, updated_at=excluded.updated_at",
+                        (rule_id, f"同主题内容归入“{matter['title']}”",
+                         json.dumps(pattern, ensure_ascii=False, separators=(",", ":")), now, now),
+                    )
         detail = self.get_matter(matter_id)
         if not detail:
             raise RuntimeError("事项关联失败")
@@ -1138,6 +1169,37 @@ class WorkbenchService:
         if not material:
             raise RuntimeError("任务材料不存在")
         matter_id = result.get("matter_id") or material["matter_id"]
+        auto_matched_open_matter = False
+        if not matter_id and str(result.get("matter_title") or "").strip():
+            requested_title = normalized_title(str(result["matter_title"]))
+            learned_match = None
+            for rule in self.database.fetch_all(
+                "SELECT pattern_json FROM learned_rules "
+                "WHERE rule_type = 'topic_merge' AND enabled = 1 ORDER BY updated_at DESC"
+            ):
+                pattern = parse_json(rule.get("pattern_json"), {})
+                if pattern.get("observed_title") == requested_title:
+                    learned_match = pattern.get("matter_id")
+                    break
+            if learned_match and self.database.fetch_one(
+                "SELECT id FROM matters WHERE id = ? AND status = 'active'", (learned_match,)
+            ):
+                matter_id = learned_match
+                auto_matched_open_matter = True
+            exact_matches = [
+                row
+                for row in self.database.fetch_all(
+                    "SELECT m.id, m.title FROM matters m WHERE m.status = 'active' AND ("
+                    "EXISTS (SELECT 1 FROM actions a WHERE a.matter_id = m.id AND a.status = 'open') OR "
+                    "EXISTS (SELECT 1 FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') OR "
+                    "EXISTS (SELECT 1 FROM reminders x WHERE x.matter_id = m.id "
+                    "AND x.status NOT IN ('done', 'dismissed')))"
+                )
+                if normalized_title(str(row.get("title") or "")) == requested_title
+            ]
+            if not matter_id and len(exact_matches) == 1:
+                matter_id = exact_matches[0]["id"]
+                auto_matched_open_matter = True
         if matter_id and not self.database.fetch_one(
             "SELECT id FROM matters WHERE id = ?", (matter_id,)
         ):
@@ -1147,7 +1209,6 @@ class WorkbenchService:
             if not fact.get("source_locator"):
                 raise ValueError("财务事实必须提供原文定位")
         self.reserve_job_result(job_id, worker_id, lease_token)
-        matter_id = result.get("matter_id") or material["matter_id"]
         if matter_id:
             matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
             if not matter:
@@ -1164,6 +1225,8 @@ class WorkbenchService:
         actions = result.get("actions", [])
         now = utc_now()
         material_metadata = parse_json(material.get("metadata_json"), {})
+        if auto_matched_open_matter:
+            material_metadata["continued_existing_matter"] = True
         brief = result.get("brief") if isinstance(result.get("brief"), dict) else {}
         agent_trace = (
             result.get("agent_trace") if isinstance(result.get("agent_trace"), dict) else {}
@@ -1479,6 +1542,16 @@ class WorkbenchService:
             matter_id,
             {"facts": len(facts), "inferences": len(inferences), "actions": len(actions)},
         )
+        if auto_matched_open_matter:
+            self.database.audit(
+                new_id("audit"),
+                worker_id,
+                "material.merged_into_open_matter",
+                "material",
+                job["material_id"],
+                matter_id,
+                {"reason": "同名未完成事项"},
+            )
         self.record_matter_event(
             matter_id,
             "worker.result",
@@ -1737,10 +1810,63 @@ class WorkbenchService:
             "行动规划已更新",
             values,
         )
+        self._record_action_feedback_rules(action, changes, actor)
         updated = self.database.fetch_one("SELECT * FROM actions WHERE id = ?", (action_id,))
         if not updated:
             raise RuntimeError("行动规划写入失败")
         return self._attach_action_assignees([updated])[0]
+
+    def _record_action_feedback_rules(
+        self, action: dict[str, Any], changes: dict[str, Any], actor: str
+    ) -> None:
+        now = utc_now()
+        feedback: list[tuple[str, str, Any, Any]] = []
+        if changes.get("pinned") is True:
+            current = self.database.fetch_one(
+                "SELECT pinned_at FROM actions WHERE id = ?", (action["id"],)
+            )
+            feedback.append(
+                ("action_pin", "pinned", current.get("pinned_at") if current else now,
+                 action.get("pinned_at"))
+            )
+        if changes.get("snoozed_until"):
+            feedback.append(
+                ("action_defer", "snoozed_until", changes["snoozed_until"], action.get("snoozed_until"))
+            )
+        with self.database.connect() as connection:
+            for rule_type, field, desired, previous in feedback:
+                rule_id = "rule_" + hashlib.sha256(
+                    f"feedback:{rule_type}:{action['id']}".encode("utf-8")
+                ).hexdigest()[:24]
+                pattern = {
+                    "scope": "exact_action",
+                    "action_id": action["id"],
+                    "matter_id": action["matter_id"],
+                    "field": field,
+                    "desired_value": desired,
+                    "previous_value": previous,
+                    "source": {
+                        "type": "action.planning_updated",
+                        "ref": action["id"],
+                        "actor": actor,
+                        "recorded_at": now,
+                    },
+                    "last_used_at": now,
+                }
+                description = (
+                    f"固定行动“{action['title']}”优先处理"
+                    if rule_type == "action_pin"
+                    else f"行动“{action['title']}”延期至 {str(desired)[:10]}"
+                )
+                connection.execute(
+                    "INSERT INTO learned_rules "
+                    "(id, rule_type, description, pattern_json, source_count, enabled, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 1, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                    "description=excluded.description, pattern_json=excluded.pattern_json, "
+                    "source_count=learned_rules.source_count+1, enabled=1, updated_at=excluded.updated_at",
+                    (rule_id, rule_type, description,
+                     json.dumps(pattern, ensure_ascii=False, separators=(",", ":")), now, now),
+                )
 
     def get_matter(self, matter_id: str) -> dict[str, Any] | None:
         matter = self.database.fetch_one("SELECT * FROM matters WHERE id = ?", (matter_id,))
@@ -1829,13 +1955,15 @@ class WorkbenchService:
         if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
             raise KeyError("事项不存在")
         rows = self.database.fetch_all(
-            "SELECT * FROM matter_events WHERE matter_id = ? "
-            "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+            "SELECT * FROM (SELECT rowid AS event_rowid, * FROM matter_events "
+            "WHERE matter_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?) "
+            "ORDER BY created_at ASC, event_rowid ASC",
             (matter_id, min(max(limit, 1), 500)),
         )
         events: list[dict[str, Any]] = []
         for row in rows:
             event = dict(row)
+            event.pop("event_rowid", None)
             event["payload"] = parse_json(event.pop("payload_json", "{}"), {})
             event["type"] = event["event_type"]
             event["source"] = {
@@ -1846,6 +1974,85 @@ class WorkbenchService:
             events.append(event)
         return public_labels(events)
 
+    def matter_related_information(
+        self, matter_id: str, limit: int = 20
+    ) -> dict[str, Any]:
+        if not self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,)):
+            raise KeyError("事项不存在")
+
+        rows: list[dict[str, Any]] = []
+        rows.extend(
+            self.database.fetch_all(
+                "SELECT wc.id, wc.source, COALESCE(NULLIF(c.display_name, ''), '聊天') "
+                "AS display_name, wc.summary, wc.window_end AS occurred_at, "
+                "wc.material_id FROM wechat_candidates wc "
+                "LEFT JOIN wechat_conversations c ON c.session_id = wc.session_id "
+                "WHERE wc.matter_id = ? AND wc.status = 'accepted'",
+                (matter_id,),
+            )
+        )
+        rows.extend(
+            self.database.fetch_all(
+                "SELECT em.id, 'email' AS source, "
+                "COALESCE(NULLIF(em.sender_name, ''), '邮件') AS display_name, "
+                "COALESCE(NULLIF(em.summary, ''), em.subject) AS summary, "
+                "em.sent_at AS occurred_at, em.material_id "
+                "FROM email_messages em WHERE em.matter_id = ? AND em.status = 'active'",
+                (matter_id,),
+            )
+        )
+        rows.extend(
+            self.database.fetch_all(
+                "SELECT m.id, CASE "
+                "WHEN m.source_type IN ('wechat_auto', 'wechat_channel') THEN 'personal_wechat' "
+                "WHEN m.source_type IN ('wecom_auto', 'wecom_channel') THEN 'wecom' "
+                "WHEN m.source_type IN ('email', 'email_auto') THEN 'email' "
+                "ELSE 'intake' END AS source, "
+                "COALESCE(NULLIF(m.filename, ''), '主动投递') AS display_name, "
+                "COALESCE(NULLIF(m.text_note, ''), m.filename) AS summary, "
+                "m.received_at AS occurred_at, m.id AS material_id "
+                "FROM materials m WHERE m.matter_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM wechat_candidates wc "
+                "WHERE wc.material_id = m.id AND wc.matter_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM email_messages em "
+                "WHERE em.material_id = m.id AND em.matter_id = ?)",
+                (matter_id, matter_id, matter_id),
+            )
+        )
+
+        source_labels = {
+            "personal_wechat": "个人微信",
+            "wecom": "企业微信",
+            "email": "邮箱",
+            "intake": "主动投递",
+        }
+        rows.sort(key=lambda item: str(item.get("occurred_at") or ""), reverse=True)
+        counts: dict[str, int] = {}
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            source = str(row.get("source") or "intake")
+            counts[source] = counts.get(source, 0) + 1
+            if len(items) >= min(max(limit, 1), 100):
+                continue
+            summary = " ".join(
+                str(row.get("summary") or "已归到本事项").split()
+            )
+            if len(summary) > 180:
+                summary = f"{summary[:179]}…"
+            items.append(
+                {
+                    "source": source,
+                    "source_label": source_labels.get(source, "其他信息"),
+                    "display_name": row.get("display_name")
+                    or source_labels.get(source, "信息"),
+                    "summary": summary,
+                    "occurred_at": row.get("occurred_at"),
+                    "status_label": "已归到本事项",
+                    "material_id": row.get("material_id"),
+                }
+            )
+        return public_labels({"total": len(rows), "counts": counts, "items": items})
+
     def update_matter(
         self, matter_id: str, changes: dict[str, Any], actor: str
     ) -> dict[str, Any]:
@@ -1854,7 +2061,7 @@ class WorkbenchService:
             raise KeyError("事项不存在")
         detail_keys = {"title", "summary", "contact_name"} & changes.keys()
         if detail_keys:
-            if {"status", "target_date"} & changes.keys():
+            if {"status", "target_date", "next_review_date"} & changes.keys():
                 raise ValueError("事项内容与状态或日期请分别保存")
             values: dict[str, Any] = {}
             event_changes: dict[str, dict[str, Any]] = {}
@@ -2001,46 +2208,59 @@ class WorkbenchService:
                 ),
                 payload,
             )
-        if "target_date" not in changes:
+        if "target_date" not in changes and "next_review_date" not in changes:
             if "status" in changes:
                 updated = self.get_matter(matter_id)
                 if not updated:
                     raise RuntimeError("事项更新失败")
                 return updated
-            raise ValueError("请提供事项状态或要求闭环日期")
-        target_date = changes.get("target_date") or None
-        if target_date:
-            try:
-                date.fromisoformat(str(target_date))
-            except ValueError as exc:
-                raise ValueError("要求闭环日期格式不正确") from exc
+            raise ValueError("请提供事项状态、要求完成日期或下次复盘日期")
+        date_changes: dict[str, Any] = {}
+        for field, label in (
+            ("target_date", "要求完成日期"),
+            ("next_review_date", "下次复盘日期"),
+        ):
+            if field not in changes:
+                continue
+            value = changes.get(field) or None
+            if value:
+                try:
+                    date.fromisoformat(str(value))
+                except ValueError as exc:
+                    raise ValueError(f"{label}格式不正确") from exc
+            date_changes[field] = value
         now = utc_now()
         with self.database.connect() as connection:
+            assignments = ", ".join(f"{field} = ?" for field in date_changes)
             connection.execute(
-                "UPDATE matters SET target_date = ?, updated_at = ? WHERE id = ?",
-                (target_date, now, matter_id),
+                f"UPDATE matters SET {assignments}, updated_at = ? WHERE id = ?",
+                (*date_changes.values(), now, matter_id),
             )
-        payload = {"before": matter.get("target_date"), "after": target_date}
-        self.database.audit(
-            new_id("audit"), actor, "matter.target_date.updated", "matter", matter_id,
-            matter_id, payload,
-        )
-        self.record_matter_event(
-            matter_id,
-            "matter.target_date.updated",
-            actor,
-            "matter",
-            matter_id,
-            "要求闭环日期已调整" if target_date else "已清除要求闭环日期",
-            payload,
-        )
+        for field, value in date_changes.items():
+            event_type = f"matter.{field}.updated"
+            label = "要求完成日期" if field == "target_date" else "下次复盘日期"
+            payload = {"before": matter.get(field), "after": value}
+            self.database.audit(
+                new_id("audit"), actor, event_type, "matter", matter_id, matter_id, payload
+            )
+            self.record_matter_event(
+                matter_id, event_type, actor, "matter", matter_id,
+                f"{label}已调整" if value else f"已清除{label}", payload,
+            )
         updated = self.get_matter(matter_id)
         if not updated:
             raise RuntimeError("事项更新失败")
         return updated
 
     def add_matter_progress(
-        self, matter_id: str, summary: str, detail: str, actor: str
+        self,
+        matter_id: str,
+        summary: str,
+        detail: str,
+        actor: str,
+        *,
+        next_review_date: str | None = None,
+        update_next_review_date: bool = False,
     ) -> dict[str, Any]:
         matter = self.database.fetch_one("SELECT id FROM matters WHERE id = ?", (matter_id,))
         if not matter:
@@ -2049,27 +2269,52 @@ class WorkbenchService:
         detail = detail.strip()
         if not summary:
             raise ValueError("请填写本次推进情况")
-        event = self.record_matter_event(
-            matter_id,
-            "progress.note",
-            actor,
-            "matter",
-            matter_id,
-            summary,
-            {"detail": detail},
-        )
+        if update_next_review_date and next_review_date:
+            try:
+                date.fromisoformat(next_review_date)
+            except ValueError as exc:
+                raise ValueError("下次复盘日期格式不正确") from exc
+        event_id = new_id("event")
         now = utc_now()
+        payload = {"detail": detail}
+        if update_next_review_date:
+            payload["next_review_date"] = next_review_date
         with self.database.connect() as connection:
             connection.execute(
-                "UPDATE matters SET updated_at = ? WHERE id = ?", (now, matter_id)
+                "INSERT INTO matter_events "
+                "(id, matter_id, event_type, actor, object_type, object_id, summary, "
+                "payload_json, created_at) VALUES (?, ?, 'progress.note', ?, 'matter', ?, ?, ?, ?)",
+                (event_id, matter_id, actor, matter_id, summary[:500],
+                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")), now),
             )
-        self.database.audit(
-            new_id("audit"), actor, "matter.progress.recorded", "matter", matter_id,
-            matter_id, {"summary": summary, "detail": detail},
-        )
+            if update_next_review_date:
+                connection.execute(
+                    "UPDATE matters SET next_review_date = ?, updated_at = ? WHERE id = ?",
+                    (next_review_date, now, matter_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE matters SET updated_at = ? WHERE id = ?", (now, matter_id)
+                )
+            connection.execute(
+                "INSERT INTO audit_events "
+                "(id, actor, action, object_type, object_id, matter_id, metadata_json, created_at) "
+                "VALUES (?, ?, 'matter.progress.recorded', 'matter', ?, ?, ?, ?)",
+                (new_id("audit"), actor, matter_id, matter_id,
+                 json.dumps({"summary": summary, **payload}, ensure_ascii=False,
+                            separators=(",", ":")), now),
+            )
+        event = self.database.fetch_one("SELECT * FROM matter_events WHERE id = ?", (event_id,))
         if not event:
             raise RuntimeError("推进记录保存失败")
-        return event
+        event["payload"] = parse_json(event.pop("payload_json", "{}"), {})
+        event["type"] = event["event_type"]
+        event["source"] = {
+            "actor": event.get("actor"),
+            "object_type": event.get("object_type"),
+            "object_id": event.get("object_id"),
+        }
+        return public_labels(event)
 
     def _rebuild_search_index(self) -> None:
         with self.database.connect() as connection:
@@ -2237,6 +2482,120 @@ class WorkbenchService:
         if not state or int(state.get("version") or 0) != 1:
             self._rebuild_search_index()
 
+    def source_summary(self) -> dict[str, Any]:
+        analysis = self.analysis_status()
+        source_specs = (
+            ("personal_wechat", "个人微信", ("wechat_auto",)),
+            ("wecom", "企业微信", ("wecom_auto",)),
+            ("email", "邮箱", ("email_auto",)),
+        )
+        sources: list[dict[str, Any]] = []
+        for key, label, material_types in source_specs:
+            if key == "email":
+                latest = self.database.fetch_one(
+                    "SELECT * FROM email_sync_requests ORDER BY requested_at DESC LIMIT 1"
+                )
+                account = self.database.fetch_one(
+                    "SELECT * FROM email_accounts ORDER BY updated_at DESC LIMIT 1"
+                )
+                configured = bool(account)
+                success_at = (account or {}).get("last_success_at")
+                new_items = int((latest or {}).get("pending_count") or 0)
+                error = str((latest or {}).get("error") or (account or {}).get("last_error") or "")
+            else:
+                latest = self.database.fetch_one(
+                    "SELECT * FROM wechat_sync_requests WHERE source = ? "
+                    "ORDER BY requested_at DESC LIMIT 1",
+                    (key,),
+                )
+                success = self.database.fetch_one(
+                    "SELECT completed_at FROM wechat_sync_requests "
+                    "WHERE source = ? AND status = 'completed' "
+                    "ORDER BY completed_at DESC LIMIT 1",
+                    (key,),
+                )
+                configured = True
+                success_at = (success or {}).get("completed_at")
+                new_items = int((latest or {}).get("window_count") or 0)
+                error = str((latest or {}).get("error") or "")
+
+            placeholders = ",".join("?" for _ in material_types)
+            waiting = self.database.fetch_one(
+                "SELECT COUNT(*) AS total FROM jobs j JOIN materials m ON m.id = j.material_id "
+                f"WHERE m.source_type IN ({placeholders}) AND j.status = 'held' "
+                "AND j.job_type IN ('workbuddy_analyze', 'wechat_classify', 'email_classify')",
+                tuple(material_types),
+            )
+            waiting_count = int((waiting or {}).get("total") or 0)
+            raw_status = str((latest or {}).get("status") or "")
+            possible_missing = raw_status in {"failed", "unsupported"} or bool(error)
+            if not configured:
+                status_code, status_label = "not_configured", "尚未配置"
+            elif raw_status in {"pending", "claimed", "processing", "running"}:
+                status_code, status_label = "reading", "正在读取"
+            elif raw_status == "completed":
+                status_code, status_label = "success", "读取完成"
+            elif possible_missing:
+                status_code, status_label = "attention", "需要检查"
+            else:
+                status_code, status_label = "waiting", "等待首次读取"
+            detail = (
+                "可能有未读取信息，请重新读取"
+                if possible_missing
+                else f"新增 {new_items} 份，{waiting_count} 份等待整理"
+                if raw_status == "completed"
+                else status_label
+            )
+            sources.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "status": status_code,
+                    "status_label": status_label,
+                    "last_checked_at": (latest or {}).get("completed_at") or success_at,
+                    "new_items": new_items,
+                    "waiting_to_organize": waiting_count,
+                    "possible_missing": possible_missing,
+                    "detail": detail,
+                }
+            )
+        possible_missing = any(item["possible_missing"] for item in sources)
+        pending = sum(item["waiting_to_organize"] for item in sources)
+        configured_sources = [item for item in sources if item["status"] != "not_configured"]
+        successful = sum(item["status"] == "success" for item in configured_sources)
+        summary = (
+            "可能有未读取信息"
+            if possible_missing
+            else f"{successful} 处信息读取完成，{pending} 份等待整理"
+        )
+        return public_labels(
+            {
+                "summary": summary,
+                "possible_missing": possible_missing,
+                "pending_organizing": max(pending, int(analysis.get("pending") or 0)),
+                "sources": sources,
+            }
+        )
+
+    def _expanded_search_groups(self, terms: list[str]) -> list[list[str]]:
+        rows = self.database.fetch_all(
+            "SELECT canonical, alternatives_json FROM search_terms WHERE enabled = 1"
+        )
+        groups: list[list[str]] = []
+        for term in terms:
+            normalized = unicodedata.normalize("NFKC", term).casefold()
+            expanded = [term]
+            for row in rows:
+                family = [row["canonical"], *_json_list(row.get("alternatives_json"))]
+                if any(
+                    unicodedata.normalize("NFKC", str(item)).casefold() == normalized
+                    for item in family
+                ):
+                    expanded = [str(item) for item in family if str(item).strip()]
+                    break
+            groups.append(list(dict.fromkeys(expanded)))
+        return groups
+
     def search(
         self,
         query: str,
@@ -2247,6 +2606,9 @@ class WorkbenchService:
         date_from: str = "",
         date_to: str = "",
         amount: str = "",
+        person_id: str = "",
+        channel: str = "",
+        business_type: str = "",
     ) -> dict[str, Any]:
         query = query.strip()
         if not query:
@@ -2256,9 +2618,23 @@ class WorkbenchService:
                 "answer": {"facts": [], "inferences": [], "missing": [], "sources": []},
             }
 
-        allowed_sources = {"matter", "action", "material", "evidence", "email", "policy"}
-        if source and source not in allowed_sources:
+        allowed_types = {"matter", "action", "material", "evidence", "email", "policy"}
+        allowed_channels = {"personal_wechat", "wecom", "email"}
+        if source in allowed_channels and not channel:
+            channel, source = source, ""
+        if source and source not in allowed_types:
             raise ValueError("不支持的来源筛选")
+        if business_type and business_type not in allowed_types:
+            raise ValueError("不支持的业务类型筛选")
+        if source and business_type and source != business_type:
+            raise ValueError("source 与 business_type 筛选冲突")
+        business_type = business_type or source
+        if channel and channel not in allowed_channels:
+            raise ValueError("不支持的渠道筛选")
+        if person_id and not self.database.fetch_one(
+            "SELECT id FROM people WHERE id = ? AND enabled = 1", (person_id,)
+        ):
+            raise ValueError("已确认负责人不存在")
         for value in (date_from, date_to):
             if value:
                 try:
@@ -2266,9 +2642,17 @@ class WorkbenchService:
                 except ValueError as exc:
                     raise ValueError("筛选日期格式不正确") from exc
 
+        cleaned_query = re.sub(
+            r"^(请问|帮我查查|帮我看看|查询|查一下)", "", query
+        )
+        cleaned_query = re.sub(
+            r"(目前|现在)?(的)?(进展到哪里|进展如何|进展怎么样|到哪一步了?|情况如何|怎么样|是什么)[？?。！!]*$",
+            "",
+            cleaned_query,
+        ).strip() or query
         terms = [
             term
-            for term in re.findall(r"[\w\u3400-\u9fff]+", query, re.UNICODE)
+            for term in re.findall(r"[\w\u3400-\u9fff]+", cleaned_query, re.UNICODE)
             if term
         ]
         if not terms:
@@ -2283,8 +2667,12 @@ class WorkbenchService:
                 },
             }
 
+        search_groups = self._expanded_search_groups(terms)
         match_query = " AND ".join(
-            f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
+            "(" + " OR ".join(
+                f'"{item.replace(chr(34), chr(34) * 2)}"' for item in group
+            ) + ")"
+            for group in search_groups
         )
         rows = self.database.fetch_all(
             "SELECT entity_id, entity_type, matter_id, title, body, created_at, "
@@ -2292,31 +2680,67 @@ class WorkbenchService:
             "bm25(search_fts) AS relevance FROM search_fts WHERE search_fts MATCH ? "
             "ORDER BY CASE WHEN lower(title) = lower(?) THEN 0 "
             "WHEN lower(title) LIKE lower(?) THEN 1 ELSE 2 END, relevance, "
-            "created_at DESC, entity_type ASC, entity_id ASC LIMIT 200",
-            (match_query, query, f"%{query}%"),
+            "created_at DESC, entity_type ASC, entity_id ASC",
+            (match_query, cleaned_query, f"%{cleaned_query}%"),
         )
-        if not rows:
-            like_terms = [
-                term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                for term in terms
+        escaped_groups = [
+            [
+                item.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                for item in group
             ]
-            like_clause = " AND ".join(
-                "(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')"
-                for _ in like_terms
+            for group in search_groups
+        ]
+        like_clause = " AND ".join(
+            "(" + " OR ".join(
+                "title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'"
+                for _ in group
+            ) + ")"
+            for group in escaped_groups
+        )
+        like_params = [
+            value
+            for group in escaped_groups
+            for term in group
+            for value in (f"%{term}%", f"%{term}%")
+        ]
+        like_rows = self.database.fetch_all(
+            "SELECT entity_id, entity_type, matter_id, title, body, created_at, "
+            "body AS snippet, 0 AS relevance FROM search_fts WHERE "
+            f"{like_clause} ORDER BY CASE WHEN lower(title) = lower(?) THEN 0 "
+            "WHEN lower(title) LIKE lower(?) THEN 1 ELSE 2 END, "
+            "created_at DESC, entity_type ASC, entity_id ASC",
+            (*like_params, cleaned_query, f"%{cleaned_query}%"),
+        )
+        seen_rows = {(row["entity_type"], row["entity_id"]) for row in rows}
+        rows.extend(
+            row for row in like_rows
+            if (row["entity_type"], row["entity_id"]) not in seen_rows
+        )
+        channel_by_entity: dict[tuple[str, str], str] = {}
+        for context in self.database.fetch_all(
+            "SELECT sf.entity_type, sf.entity_id, CASE "
+            "WHEN mat.source_type IN ('wechat_auto','wechat_channel') THEN 'personal_wechat' "
+            "WHEN mat.source_type IN ('wecom_auto','wecom_channel') THEN 'wecom' "
+            "WHEN sf.entity_type = 'email' OR mat.source_type IN ('email','email_auto') THEN 'email' "
+            "ELSE '' END AS channel FROM search_fts sf "
+            "LEFT JOIN materials mat ON mat.id = CASE "
+            "WHEN sf.entity_type = 'material' THEN sf.entity_id "
+            "WHEN sf.entity_type = 'email' THEN (SELECT material_id FROM email_messages WHERE id=sf.entity_id) "
+            "WHEN sf.entity_type = 'action' THEN (SELECT material_id FROM actions WHERE id=sf.entity_id) "
+            "WHEN sf.entity_type = 'evidence' THEN (SELECT material_id FROM evidence WHERE id=sf.entity_id) "
+            "ELSE NULL END"
+        ):
+            channel_by_entity[(context["entity_type"], context["entity_id"])] = context["channel"]
+        person_matters = set()
+        person_actions = set()
+        if person_id:
+            confirmed_assignments = self.database.fetch_all(
+                "SELECT DISTINCT a.id AS action_id, a.matter_id FROM action_assignees aa "
+                "JOIN actions a ON a.id = aa.action_id "
+                "WHERE aa.person_id = ? AND aa.status = 'confirmed'", (person_id,)
             )
-            like_params = [
-                value
-                for term in like_terms
-                for value in (f"%{term}%", f"%{term}%")
-            ]
-            rows = self.database.fetch_all(
-                "SELECT entity_id, entity_type, matter_id, title, body, created_at, "
-                "body AS snippet, 0 AS relevance FROM search_fts WHERE "
-                f"{like_clause} ORDER BY CASE WHEN lower(title) = lower(?) THEN 0 "
-                "WHEN lower(title) LIKE lower(?) THEN 1 ELSE 2 END, "
-                "created_at DESC, entity_type ASC, entity_id ASC LIMIT 200",
-                (*like_params, query, f"%{query}%"),
-            )
+            person_actions = {row["action_id"] for row in confirmed_assignments}
+            person_matters = {row["matter_id"] for row in confirmed_assignments}
         status_maps = {
             "matter": {
                 row["id"]: row["status"]
@@ -2357,8 +2781,18 @@ class WorkbenchService:
             item = dict(row)
             item_status = status_maps.get(item["entity_type"], {}).get(item["entity_id"], "")
             created_date = str(item.get("created_at") or "")[:10]
-            if source and item["entity_type"] != source:
+            if business_type and item["entity_type"] != business_type:
                 continue
+            if channel and channel_by_entity.get(
+                (item["entity_type"], item["entity_id"]), ""
+            ) != channel:
+                continue
+            if person_id:
+                if item["entity_type"] == "action":
+                    if item["entity_id"] not in person_actions:
+                        continue
+                elif item.get("matter_id") not in person_matters:
+                    continue
             if status and item_status != status:
                 continue
             if date_from and created_date < date_from:
@@ -2374,16 +2808,20 @@ class WorkbenchService:
             item["status"] = item_status
             item["type_label"] = labels.get(item["entity_type"], "记录")
             item["searchable"] = True
+            item["channel"] = channel_by_entity.get(
+                (item["entity_type"], item["entity_id"]), ""
+            )
             item["summary"] = re.sub(
                 r"<[^>]+>", "", item.get("snippet") or item.get("body") or ""
             )[:260]
             item["href"] = (
-                f"#/matter/{item['matter_id']}"
+                f"#/matter/{item['matter_id']}?source_type={item['entity_type']}&source_id={item['entity_id']}"
                 if item.get("matter_id")
-                else "#/policies"
+                else f"#/policies/{item['entity_id']}"
                 if item["entity_type"] == "policy"
-                else "#/search"
+                else f"#/source/{item['entity_type']}/{item['entity_id']}"
             )
+            item["source_href"] = item["href"]
             item["sort_reason"] = (
                 "标题完全匹配"
                 if str(item.get("title") or "").casefold() == query.casefold()
@@ -2414,10 +2852,45 @@ class WorkbenchService:
             "missing": [] if items else ["当前允许检索的资料中没有找到直接证据"],
             "sources": sources,
         }
-        return public_labels({"query": query, "items": items, "answer": answer})
+        return public_labels(
+            {
+                "query": query,
+                "interpreted_query": cleaned_query,
+                "intent": "progress" if cleaned_query != query else "lookup",
+                "matched_terms": [
+                    item for group in search_groups for item in group
+                ],
+                "items": items,
+                "answer": answer,
+            }
+        )
+
+    def search_source_detail(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        queries = {
+            "matter": ("SELECT id, title, summary, status, target_date, next_review_date, "
+                       "created_at, updated_at FROM matters WHERE id = ?"),
+            "action": ("SELECT id, matter_id, material_id, title, detail, status, due_date, "
+                       "next_follow_up_at, created_at, updated_at FROM actions WHERE id = ?"),
+            "material": ("SELECT id, source_type, filename, text_note, status, matter_id, "
+                         "received_at, updated_at FROM materials WHERE id = ?"),
+            "evidence": ("SELECT id, matter_id, material_id, claim_type, field_type, value, "
+                         "source_locator, quote, confidence, status, created_at FROM evidence WHERE id = ?"),
+            "email": ("SELECT id, material_id, matter_id, sender_name, subject, sent_at, "
+                      "status, summary, reason, created_at FROM email_messages WHERE id = ?"),
+            "policy": ("SELECT id, canonical_key, title, publisher, topic, scope, summary, "
+                       "effective_date, status, version, last_verified_at, created_at, updated_at "
+                       "FROM company_policies WHERE id = ?"),
+        }
+        query = queries.get(entity_type)
+        if not query:
+            raise ValueError("不支持的来源类型")
+        row = self.database.fetch_one(query, (entity_id,))
+        if not row:
+            raise KeyError("来源记录不存在")
+        return public_labels({"entity_type": entity_type, "record": row})
 
     def today_brief(self, brief_date: str | None = None) -> dict[str, Any]:
-        self.refresh_reminders()
+        self.refresh_reminders_if_available()
         target = brief_date or datetime.now(UTC).date().isoformat()
         try:
             target_date = date.fromisoformat(target)
@@ -2446,7 +2919,11 @@ class WorkbenchService:
             target_date,
             now,
         )
-        watermark_source = {
+        source_summary = self.source_summary()
+        commitments = self.commitment_view()
+        brief_inputs = {
+            "source_summary": source_summary,
+            "commitments": commitments,
             "actions": [
                 [
                     item.get("id"),
@@ -2480,8 +2957,8 @@ class WorkbenchService:
                 for item in sorted(reminders, key=lambda row: str(row.get("id") or ""))
             ],
         }
-        source_watermark = hashlib.sha256(
-            json.dumps(watermark_source, sort_keys=True).encode("utf-8")
+        source_signature = hashlib.sha256(
+            json.dumps(brief_inputs, sort_keys=True).encode("utf-8")
         ).hexdigest()[:20]
         existing = self.database.fetch_one(
             "SELECT * FROM daily_briefs WHERE brief_date = ?", (target,)
@@ -2489,18 +2966,26 @@ class WorkbenchService:
         if existing:
             cached = parse_json(existing.get("payload_json"), {})
             if (
-                cached.get("source_watermark") == source_watermark
+                cached.get("_source_signature") == source_signature
                 and "attention" in cached
                 and "attention_counts" in cached
             ):
-                return public_labels(
-                    {
-                        "id": existing["id"],
-                        "brief_date": target,
-                        "generated_at": existing["generated_at"],
-                        **cached,
-                    }
+                cached.pop("_source_signature", None)
+                response = {
+                    "id": existing["id"],
+                    "brief_date": target,
+                    "generated_at": existing["generated_at"],
+                    "source_watermark": source_signature,
+                    **cached,
+                }
+                current = response.get("now") or {}
+                matter_id = current.get("matter_id")
+                response["related_information"] = (
+                    self.matter_related_information(matter_id, 20)
+                    if matter_id
+                    else {"total": 0, "counts": {}, "items": []}
                 )
+                return public_labels(response)
 
         self_person_ids = {
             row["id"]
@@ -2637,7 +3122,7 @@ class WorkbenchService:
 
         payload = {
             "headline": f"{target} 工作简报",
-            "source_watermark": source_watermark,
+            "_source_signature": source_signature,
             "now": execution[0] if execution else None,
             "next": execution[1:4],
             "waiting": waiting[:12],
@@ -2645,6 +3130,8 @@ class WorkbenchService:
             "decisions": decisions[:20],
             "attention": attention,
             "attention_counts": workflow_stats["attention_counts"],
+            "source_summary": source_summary,
+            "commitments": commitments,
             "counts": {
                 **{
                     key: value
@@ -2657,25 +3144,299 @@ class WorkbenchService:
         }
         generated_at = utc_now()
         brief_id = existing["id"] if existing else new_id("brief")
-        with self.database.connect() as connection:
-            connection.execute(
-                "INSERT INTO daily_briefs (id, brief_date, generated_at, payload_json) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(brief_date) DO UPDATE SET "
-                "generated_at = excluded.generated_at, payload_json = excluded.payload_json",
-                (
-                    brief_id,
-                    target,
-                    generated_at,
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                ),
-            )
+        try:
+            with self.database.connect(busy_timeout_ms=50) as connection:
+                connection.execute(
+                    "INSERT INTO daily_briefs (id, brief_date, generated_at, payload_json) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(brief_date) DO UPDATE SET "
+                    "generated_at = excluded.generated_at, payload_json = excluded.payload_json",
+                    (
+                        brief_id,
+                        target,
+                        generated_at,
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    ),
+                )
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).casefold():
+                raise
+        public_payload = dict(payload)
+        public_payload.pop("_source_signature", None)
+        current = public_payload.get("now") or {}
+        matter_id = current.get("matter_id")
+        public_payload["related_information"] = (
+            self.matter_related_information(matter_id, 20)
+            if matter_id
+            else {"total": 0, "counts": {}, "items": []}
+        )
         return public_labels(
             {
                 "id": brief_id,
                 "brief_date": target,
                 "generated_at": generated_at,
-                **payload,
+                "source_watermark": source_signature,
+                **public_payload,
+            }
+        )
+
+    def identify_contact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        existing = self.database.fetch_one(
+            "SELECT c.* FROM contacts c JOIN contact_identities i ON i.contact_id = c.id "
+            "WHERE i.source = ? AND i.stable_id = ?",
+            (payload["source"], payload["stable_id"]),
+        )
+        contact_id = existing["id"] if existing else new_id("contact")
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO contacts "
+                "(id, display_name, organization, role, notes, enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, '', 1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "display_name = excluded.display_name, "
+                "organization = CASE WHEN excluded.organization <> '' THEN excluded.organization ELSE contacts.organization END, "
+                "role = CASE WHEN excluded.role <> '' THEN excluded.role ELSE contacts.role END, "
+                "updated_at = excluded.updated_at",
+                (
+                    contact_id,
+                    payload["display_name"].strip(),
+                    payload.get("organization", "").strip(),
+                    payload.get("role", "").strip(),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO contact_identities "
+                "(id, contact_id, source, stable_id, display_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source, stable_id) DO UPDATE SET "
+                "contact_id = excluded.contact_id, display_name = excluded.display_name, "
+                "updated_at = excluded.updated_at",
+                (
+                    new_id("identity"),
+                    contact_id,
+                    payload["source"],
+                    payload["stable_id"],
+                    payload["display_name"].strip(),
+                    now,
+                    now,
+                ),
+            )
+        return public_labels(
+            self.database.fetch_one("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+            or {}
+        )
+
+    def record_commitment(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        for field, table in (
+            ("contact_id", "contacts"),
+            ("matter_id", "matters"),
+            ("action_id", "actions"),
+        ):
+            value = payload.get(field)
+            if value and not self.database.fetch_one(
+                f"SELECT id FROM {table} WHERE id = ?", (value,)
+            ):
+                raise KeyError("关联记录不存在")
+        now = utc_now()
+        existing = self.database.fetch_one(
+            "SELECT id FROM commitments WHERE source = ? AND source_ref = ? AND category = ?",
+            (payload["source"], payload["source_ref"], payload["category"]),
+        )
+        commitment_id = existing["id"] if existing else new_id("commitment")
+        with self.database.connect() as connection:
+            connection.execute(
+                "INSERT INTO commitments "
+                "(id, contact_id, matter_id, action_id, source, source_ref, category, summary, "
+                "due_at, next_follow_up_at, status, evidence_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?) "
+                "ON CONFLICT(source, source_ref, category) DO UPDATE SET "
+                "contact_id = excluded.contact_id, matter_id = excluded.matter_id, "
+                "action_id = excluded.action_id, summary = excluded.summary, due_at = excluded.due_at, "
+                "next_follow_up_at = excluded.next_follow_up_at, evidence_json = excluded.evidence_json, "
+                "updated_at = excluded.updated_at",
+                (
+                    commitment_id,
+                    payload.get("contact_id"),
+                    payload.get("matter_id"),
+                    payload.get("action_id"),
+                    payload["source"],
+                    payload["source_ref"],
+                    payload["category"],
+                    payload["summary"].strip(),
+                    payload.get("due_at"),
+                    payload.get("next_follow_up_at"),
+                    json.dumps(payload.get("evidence") or [], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        self.database.audit(
+            new_id("audit"), actor, "commitment.recorded", "commitment", commitment_id,
+            payload.get("matter_id"), {"category": payload["category"]},
+        )
+        return self._commitment_row(commitment_id)
+
+    def _commitment_row(self, commitment_id: str) -> dict[str, Any]:
+        row = self.database.fetch_one(
+            "SELECT c.*, p.display_name AS contact_name, m.title AS matter_title, "
+            "a.title AS action_title FROM commitments c "
+            "LEFT JOIN contacts p ON p.id = c.contact_id "
+            "LEFT JOIN matters m ON m.id = c.matter_id "
+            "LEFT JOIN actions a ON a.id = c.action_id WHERE c.id = ?",
+            (commitment_id,),
+        )
+        if not row:
+            raise KeyError("跟进约定不存在")
+        row["evidence"] = _json_list(row.pop("evidence_json", "[]"))
+        return public_labels(row)
+
+    def update_commitment(
+        self, commitment_id: str, status: str, actor: str
+    ) -> dict[str, Any]:
+        existing = self.database.fetch_one(
+            "SELECT matter_id FROM commitments WHERE id = ?", (commitment_id,)
+        )
+        if not existing:
+            raise KeyError("跟进约定不存在")
+        now = utc_now()
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE commitments SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, commitment_id),
+            )
+        self.database.audit(
+            new_id("audit"), actor, "commitment.status.updated", "commitment",
+            commitment_id, existing.get("matter_id"), {"status": status},
+        )
+        return self._commitment_row(commitment_id)
+
+    def commitment_view(self) -> dict[str, Any]:
+        labels = {
+            "waiting_reply": "待回复",
+            "my_commitment": "我的承诺",
+            "their_commitment": "对方承诺",
+            "waiting_approval": "等待审批",
+            "need_follow_up": "需要复联",
+        }
+        groups: dict[str, list[dict[str, Any]]] = {key: [] for key in labels}
+        rows = self.database.fetch_all(
+            "SELECT c.id FROM commitments c WHERE c.status = 'open' "
+            "ORDER BY COALESCE(c.next_follow_up_at, c.due_at, '9999-12-31'), c.updated_at DESC"
+        )
+        explicit_action_ids: set[str] = set()
+        for row in rows:
+            item = self._commitment_row(row["id"])
+            item["category_label"] = labels[item["category"]]
+            groups[item["category"]].append(item)
+            if item.get("action_id"):
+                explicit_action_ids.add(item["action_id"])
+
+        action_rows = self.database.fetch_all(
+            "SELECT a.*, m.title AS matter_title FROM actions a JOIN matters m ON m.id = a.matter_id "
+            "WHERE a.status = 'open' AND a.flow_state IN ('waiting', 'needs_action')"
+        )
+        now = datetime.now(UTC)
+        for action in action_rows:
+            if action["id"] in explicit_action_ids:
+                continue
+            waiting_on = str(action.get("waiting_on") or "")
+            if action.get("flow_state") == "needs_action":
+                owner = str(action.get("owner") or "")
+                if not any(name in owner for name in ("Frank", "傅京晖", "我自己")):
+                    continue
+                category = "my_commitment"
+            elif any(word in waiting_on for word in ("审批", "审核", "批复", "签批")):
+                category = "waiting_approval"
+            else:
+                follow_up = action.get("next_follow_up_at")
+                try:
+                    follow_up_time = datetime.fromisoformat(str(follow_up).replace("Z", "+00:00")) if follow_up else None
+                except ValueError:
+                    follow_up_time = None
+                if follow_up_time and follow_up_time.tzinfo is None:
+                    follow_up_time = follow_up_time.replace(tzinfo=UTC)
+                category = "need_follow_up" if follow_up_time and follow_up_time <= now else "waiting_reply"
+            groups[category].append(
+                public_labels(
+                    {
+                        "id": f"action:{action['id']}",
+                        "action_id": action["id"],
+                        "matter_id": action["matter_id"],
+                        "matter_title": action["matter_title"],
+                        "summary": action["title"],
+                        "contact_name": waiting_on,
+                        "due_at": action.get("due_date"),
+                        "next_follow_up_at": action.get("next_follow_up_at"),
+                        "category": category,
+                        "category_label": labels[category],
+                        "source": "现有行动",
+                    }
+                )
+            )
+        counts = {key: len(value) for key, value in groups.items()}
+        return {"total": sum(counts.values()), "counts": counts, "groups": groups}
+
+    def quality_metrics(self, days: int = 30) -> dict[str, Any]:
+        days = min(max(days, 1), 365)
+        since = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        action_counts = {
+            row["action"]: int(row["total"])
+            for row in self.database.fetch_all(
+                "SELECT action, COUNT(*) AS total FROM audit_events WHERE created_at >= ? "
+                "GROUP BY action",
+                (since,),
+            )
+        }
+        accepted_reviews = 0
+        rejected_reviews = 0
+        for row in self.database.fetch_all(
+            "SELECT metadata_json FROM audit_events WHERE action = 'review.resolved' "
+            "AND created_at >= ?",
+            (since,),
+        ):
+            resolution = str(parse_json(row.get("metadata_json"), {}).get("resolution") or "")
+            if resolution in {"accepted", "edited"}:
+                accepted_reviews += 1
+            elif resolution in {"rejected", "dismissed"}:
+                rejected_reviews += 1
+        useful = (
+            action_counts.get("wechat.candidate.accepted", 0)
+            + action_counts.get("email.confirmed", 0)
+            + accepted_reviews
+        )
+        ignored = action_counts.get("wechat.candidate.ignored", 0) + action_counts.get("email.ignored", 0)
+        ignored += rejected_reviews
+        restored = action_counts.get("wechat.candidate.restored", 0) + action_counts.get("email.restored", 0)
+        merged = sum(total for code, total in action_counts.items() if "merged" in code or code == "analysis.reconciled")
+        needs_review = int((self.database.fetch_one(
+            "SELECT COUNT(*) AS total FROM jobs WHERE status = 'needs_review'"
+        ) or {}).get("total") or 0)
+        pending_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        old_pending = int((self.database.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM review_items WHERE status = 'pending' AND created_at < ?) + "
+            "(SELECT COUNT(*) FROM wechat_candidates WHERE status IN ('pending', 'processing') AND created_at < ?) AS total",
+            (pending_cutoff, pending_cutoff),
+        ) or {}).get("total") or 0)
+        source_summary = self.source_summary()
+        missing_sources = sum(item["possible_missing"] for item in source_summary["sources"])
+        considered = useful + ignored
+        useful_ratio = round(useful * 100 / considered, 1) if considered else 0
+        metrics = [
+            {"key": "useful", "label": "确认有用", "value": useful_ratio, "unit": "%", "description": f"{useful} 条确认有用，{ignored} 条确认无需处理"},
+            {"key": "merged", "label": "减少重复事项", "value": merged, "unit": "次", "description": "相关后续内容已归入原事项"},
+            {"key": "restored", "label": "恢复误过滤", "value": restored, "unit": "条", "description": "从已忽略内容中恢复"},
+            {"key": "needs_review", "label": "需要复查", "value": needs_review, "unit": "份", "description": "整理失败或内容不完整，需要人工检查"},
+            {"key": "old_pending", "label": "长期未处理", "value": old_pending, "unit": "条", "description": "超过 7 天仍未处理"},
+            {"key": "possible_missing", "label": "可能有未读取信息", "value": missing_sources, "unit": "处", "description": "读取异常的来源数量"},
+        ]
+        return public_labels(
+            {
+                "days": days,
+                "period_label": f"最近 {days} 天",
+                "summary": f"减少 {merged} 次重复事项，{needs_review} 份内容需要复查",
+                "metrics": metrics,
+                "recent_activity": self.activity_receipts(20),
             }
         )
 
@@ -2859,7 +3620,7 @@ class WorkbenchService:
             "FROM wechat_conversations WHERE listen_status = 'blocked'"
         )
         now = utc_now()
-        with self.database.connect() as connection:
+        with self.database.connect(busy_timeout_ms=50) as connection:
             for row in rows:
                 rule_id = "rule_" + hashlib.sha256(
                     f"conversation:{row['source']}:{row['session_id']}".encode("utf-8")
@@ -2890,7 +3651,11 @@ class WorkbenchService:
                 )
 
     def list_learning_rules(self) -> list[dict[str, Any]]:
-        self._sync_conversation_rules()
+        try:
+            self._sync_conversation_rules()
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).casefold():
+                raise
         rows = self.database.fetch_all(
             "SELECT * FROM learned_rules "
             "ORDER BY enabled DESC, source_count DESC, updated_at DESC, id"
@@ -2898,6 +3663,9 @@ class WorkbenchService:
         for row in rows:
             row["pattern"] = parse_json(row.pop("pattern_json", "{}"), {})
             row["enabled"] = bool(row.get("enabled"))
+            row["source"] = row["pattern"].get("source")
+            row["last_used_at"] = row["pattern"].get("last_used_at")
+            row["scope"] = row["pattern"].get("scope")
         return public_labels(rows)
 
     def update_learning_rule(
@@ -2928,6 +3696,34 @@ class WorkbenchService:
                         "WHERE session_id = ?",
                         (now, now, pattern["session_id"]),
                     )
+            elif row.get("rule_type") in {"action_pin", "action_defer"} and pattern.get("action_id"):
+                field = pattern.get("field")
+                if field == "pinned":
+                    desired = pattern.get("desired_value")
+                    if enabled:
+                        connection.execute(
+                            "UPDATE actions SET pinned_at = ?, updated_at = ? WHERE id = ?",
+                            (desired, now, pattern["action_id"]),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE actions SET pinned_at = NULL, updated_at = ? "
+                            "WHERE id = ? AND pinned_at = ?",
+                            (now, pattern["action_id"], desired),
+                        )
+                elif field == "snoozed_until":
+                    desired = pattern.get("desired_value")
+                    if enabled:
+                        connection.execute(
+                            "UPDATE actions SET snoozed_until = ?, updated_at = ? WHERE id = ?",
+                            (desired, now, pattern["action_id"]),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE actions SET snoozed_until = ?, updated_at = ? "
+                            "WHERE id = ? AND snoozed_until = ?",
+                            (pattern.get("previous_value"), now, pattern["action_id"], desired),
+                        )
         self.database.audit(
             new_id("audit"),
             actor,
@@ -2943,6 +3739,9 @@ class WorkbenchService:
             raise RuntimeError("个人规则更新失败")
         updated["pattern"] = parse_json(updated.pop("pattern_json", "{}"), {})
         updated["enabled"] = bool(updated.get("enabled"))
+        updated["source"] = updated["pattern"].get("source")
+        updated["last_used_at"] = updated["pattern"].get("last_used_at")
+        updated["scope"] = updated["pattern"].get("scope")
         return public_labels(updated)
 
     def list_reviews(self, status: str = "pending") -> list[dict[str, Any]]:
@@ -3076,11 +3875,11 @@ class WorkbenchService:
         resolved["payload"] = parse_json(resolved.pop("payload_json", "{}"), {})
         return resolved
 
-    def refresh_reminders(self) -> int:
+    def refresh_reminders(self, busy_timeout_ms: int = 5000) -> int:
         created = 0
         now = utc_now()
         today = date.today().isoformat()
-        with self.database.connect() as connection:
+        with self.database.connect(busy_timeout_ms=busy_timeout_ms) as connection:
             connection.execute(
                 "UPDATE reminders SET status = 'open', updated_at = ? "
                 "WHERE status = 'scheduled' AND due_at IS NOT NULL "
@@ -3180,7 +3979,7 @@ class WorkbenchService:
                     "due_at": None,
                 }
             )
-        with self.database.connect() as connection:
+        with self.database.connect(busy_timeout_ms=busy_timeout_ms) as connection:
             for candidate in candidates:
                 try:
                     connection.execute(
@@ -3205,8 +4004,16 @@ class WorkbenchService:
                     continue
         return created
 
+    def refresh_reminders_if_available(self) -> int:
+        try:
+            return self.refresh_reminders(busy_timeout_ms=50)
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).casefold():
+                raise
+            return 0
+
     def overview(self) -> dict[str, Any]:
-        self.refresh_reminders()
+        self.refresh_reminders_if_available()
         now = datetime.now(UTC)
         open_actions = self.database.fetch_all(
             "SELECT a.*, m.title AS matter_title FROM actions a "

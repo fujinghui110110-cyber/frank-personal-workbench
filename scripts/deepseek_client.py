@@ -64,12 +64,12 @@ def _image_type(content: bytes) -> str | None:
 def _collect_images(
     image_paths: list[str] | None,
     image_bytes: bytes | None,
-) -> list[tuple[str, bytes]]:
-    images: list[tuple[str, bytes]] = []
+) -> list[tuple[str, bytes, str]]:
+    images: list[tuple[str, bytes, str]] = []
     total_bytes = 0
-    candidates: list[bytes] = []
+    candidates: list[tuple[bytes, str]] = []
     if image_bytes:
-        candidates.append(image_bytes)
+        candidates.append((image_bytes, "inline"))
     for raw_path in image_paths or []:
         if len(candidates) >= MAX_IMAGE_COUNT:
             break
@@ -77,14 +77,14 @@ def _collect_images(
             content = Path(raw_path).expanduser().read_bytes()
         except (OSError, TypeError):
             continue
-        candidates.append(content)
-    for content in candidates:
+        candidates.append((content, str(raw_path)))
+    for content, source in candidates:
         media_type = _image_type(content)
         if not media_type:
             continue
         if total_bytes + len(content) > MAX_IMAGE_BYTES:
             continue
-        images.append((media_type, content))
+        images.append((media_type, content, source))
         total_bytes += len(content)
         if len(images) >= MAX_IMAGE_COUNT:
             break
@@ -98,6 +98,7 @@ def call_deepseek_json(
     *,
     image_paths: list[str] | None = None,
     image_bytes: bytes | None = None,
+    media_evidence: list[dict[str, Any]] | None = None,
     api_key: str | None = None,
 ) -> str:
     images = _collect_images(image_paths, image_bytes)
@@ -113,7 +114,7 @@ def call_deepseek_json(
                     "detail": "auto",
                 },
             }
-            for media_type, data in images
+            for media_type, data, _source in images
         )
     payload = {
         "model": VISION_MODEL if images else TEXT_MODEL,
@@ -157,4 +158,13 @@ def call_deepseek_json(
         raise RuntimeError("DeepSeek 返回内容不完整，请重试") from None
     if not isinstance(output, str) or not output.strip():
         raise RuntimeError("DeepSeek 没有返回可用内容，请重试")
+    if media_evidence is not None:
+        media_evidence.extend(
+            {
+                "source": source,
+                "media_type": media_type,
+                "status": "model_processed",
+            }
+            for media_type, _data, source in images
+        )
     return output

@@ -27,6 +27,7 @@ def client(tmp_path: Path):
         mcp_token="mcp-token",
         max_upload_bytes=4096,
         lease_seconds=1,
+        email_attachment_staging_dir=tmp_path / "email-attachments",
     )
     with TestClient(create_app(settings)) as test_client:
         yield test_client
@@ -150,7 +151,7 @@ def test_email_sync_filters_nonwork_and_merges_open_thread(client: TestClient) -
 
     email_matters = client.get("/api/email/matters").json()
     assert len(email_matters) == 1
-    assert email_matters[0]["open_action_count"] == 2
+    assert email_matters[0]["open_action_count"] == 1
 
     finished = client.post(
         f"/api/email/sync/{claimed['id']}/finish",
@@ -323,11 +324,20 @@ def test_irrelevant_email_analysis_erases_content_and_attachment(
 ) -> None:
     owner_login(client)
     client.post("/api/email/accounts/register", json=ACCOUNT, headers=worker_headers())
-    attachment = tmp_path / "temporary-policy.pdf"
+    attachment = (
+        client.app.state.settings.email_attachment_staging_dir
+        / "message-21"
+        / "temporary-policy.pdf"
+    )
+    attachment.parent.mkdir(parents=True)
     attachment.write_bytes(b"temporary")
+    unrelated_file = tmp_path / "unrelated.pdf"
+    unrelated_file.write_bytes(b"must remain")
     pending = client.post(
         "/api/email/messages",
-        json=pending_message(21, attachment_paths=[str(attachment)]),
+        json=pending_message(
+            21, attachment_paths=[str(attachment), str(unrelated_file)]
+        ),
         headers=worker_headers(),
     ).json()
     client.post("/api/analysis/run")
@@ -353,6 +363,7 @@ def test_irrelevant_email_analysis_erases_content_and_attachment(
     assert completed.status_code == 200, completed.text
     assert completed.json()["status"] == "ignored"
     assert not attachment.exists()
+    assert unrelated_file.read_bytes() == b"must remain"
     material = client.app.state.database.fetch_one(
         "SELECT text_note, size, metadata_json FROM materials WHERE id = ?",
         (pending["material_id"],),

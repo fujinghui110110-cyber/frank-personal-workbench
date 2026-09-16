@@ -33,6 +33,9 @@ from .schemas import (
     AssignmentRequest,
     ChannelIntakeRegisterRequest,
     ChannelIntakeRequest,
+    CommitmentRequest,
+    CommitmentStatusRequest,
+    ContactIdentityRequest,
     EmailAccountRegisterRequest,
     EmailAnalysisCompleteRequest,
     EmailMessageRequest,
@@ -83,12 +86,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(configured.database_path)
     service = WorkbenchService(configured, database)
     wechat = WechatService(database)
-    email_work = EmailWorkService(database)
+    email_work = EmailWorkService(database, configured.email_attachment_staging_dir)
     policies = PolicyService(configured, database)
 
     async def refresh_loop() -> None:
         while True:
-            await asyncio.to_thread(service.refresh_reminders)
+            await asyncio.to_thread(service.refresh_reminders_if_available)
             await asyncio.sleep(60)
 
     @asynccontextmanager
@@ -374,6 +377,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[dict[str, Any]]:
         return service.matter_timeline(matter_id, min(max(limit, 1), 500))
 
+    @app.get("/api/matters/{matter_id}/related-information")
+    def matter_related_information(
+        matter_id: str,
+        limit: int = 20,
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.matter_related_information(matter_id, min(max(limit, 1), 200))
+
     @app.patch("/api/matters/{matter_id}")
     def update_matter(
         matter_id: str,
@@ -391,7 +402,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         context: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, Any]:
         return service.add_matter_progress(
-            matter_id, payload.summary, payload.detail, context.actor
+            matter_id,
+            payload.summary,
+            payload.detail,
+            context.actor,
+            next_review_date=payload.next_review_date,
+            update_next_review_date="next_review_date" in payload.model_fields_set,
         )
 
     @app.post("/api/jobs/claim")
@@ -459,7 +475,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def proactive_scan(
         _: AuthContext = Depends(require_scope("reminders:write")),
     ) -> dict[str, int]:
-        return {"created": service.refresh_reminders()}
+        return {"created": service.refresh_reminders_if_available()}
 
     @app.get("/api/overview")
     def overview(
@@ -474,6 +490,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         return service.today_brief(brief_date)
 
+    @app.get("/api/source-summary")
+    def source_summary(
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.source_summary()
+
+    @app.post("/api/contacts/identify")
+    def identify_contact(
+        payload: ContactIdentityRequest,
+        _: AuthContext = Depends(require_scope("jobs:write")),
+    ) -> dict[str, Any]:
+        return service.identify_contact(payload.model_dump())
+
+    @app.get("/api/relationships/commitments")
+    def commitments(
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.commitment_view()
+
+    @app.post("/api/relationships/commitments")
+    def record_commitment(
+        payload: CommitmentRequest,
+        context: AuthContext = Depends(require_scope("jobs:write")),
+    ) -> dict[str, Any]:
+        return service.record_commitment(payload.model_dump(), context.actor)
+
+    @app.patch("/api/relationships/commitments/{commitment_id}")
+    def update_commitment(
+        commitment_id: str,
+        payload: CommitmentStatusRequest,
+        context: AuthContext = Depends(require_scope("reminders:write")),
+    ) -> dict[str, Any]:
+        return service.update_commitment(commitment_id, payload.status, context.actor)
+
+    @app.get("/api/quality/metrics")
+    def quality_metrics(
+        days: int = 30,
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.quality_metrics(days)
+
     @app.get("/api/search")
     def search(
         q: str = "",
@@ -483,6 +540,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         date_from: str = "",
         date_to: str = "",
         amount: str = "",
+        person_id: str = "",
+        channel: str = "",
+        business_type: str = "",
         _: AuthContext = Depends(require_scope("matters:read")),
     ) -> dict[str, Any]:
         return service.search(
@@ -493,7 +553,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             date_from=date_from,
             date_to=date_to,
             amount=amount,
+            person_id=person_id,
+            channel=channel,
+            business_type=business_type,
         )
+
+    @app.get("/api/search/sources/{entity_type}/{entity_id}")
+    def search_source_detail(
+        entity_type: str,
+        entity_id: str,
+        _: AuthContext = Depends(require_scope("matters:read")),
+    ) -> dict[str, Any]:
+        return service.search_source_detail(entity_type, entity_id)
 
     @app.get("/api/activity/receipts")
     def activity_receipts(

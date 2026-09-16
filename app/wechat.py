@@ -111,7 +111,17 @@ def _cursor(message: dict[str, Any]) -> tuple[int, int, int]:
     )
 
 
-def review_worthy_wechat_result(result: dict[str, Any], source_text: str = "") -> bool:
+def _media_retry_pending(message: dict[str, Any]) -> bool:
+    media = message.get("media")
+    return isinstance(media, dict) and media.get("extractionStatus") == "failed"
+
+
+def review_worthy_wechat_result(
+    result: dict[str, Any],
+    source_text: str = "",
+    *,
+    media_was_read: bool = False,
+) -> bool:
     classification = str(result.get("classification") or "").strip().lower()
     if classification != "relevant":
         return False
@@ -121,7 +131,7 @@ def review_worthy_wechat_result(result: dict[str, Any], source_text: str = "") -
     message_text = "\n".join(
         line
         for line in source_text.splitlines()
-        if not line.startswith(("微信会话：", "时间："))
+        if not re.match(r"^(?:(?:个人微信|企业微信|微信)会话|时间)：", line)
     )
     visible_text = _MEDIA_PLACEHOLDER_RE.sub("", message_text)
     try:
@@ -139,7 +149,29 @@ def review_worthy_wechat_result(result: dict[str, Any], source_text: str = "") -
     )
     has_approval = bool(str(extracted.get("approval") or "").strip())
     has_risk = bool(extracted.get("risks"))
-    has_concrete_work = bool(_WORK_SIGNAL_RE.search(visible_text))
+    media_evidence = (
+        result.get("media_evidence") or extracted.get("media_evidence") or []
+    )
+    media_was_read = media_was_read or any(
+        isinstance(item, dict) and item.get("status") == "model_processed"
+        for item in media_evidence
+    )
+    resolved_media_text = " ".join(
+        [
+            str(result.get("summary") or ""),
+            *(str(item or "") for item in (result.get("evidence") or [])),
+            *(
+                str(item.get("title") or "")
+                for item in actions
+                if isinstance(item, dict)
+            ),
+        ]
+    )
+    has_resolved_media_work = bool(
+        media_was_read
+        and _WORK_SIGNAL_RE.search(_MEDIA_PLACEHOLDER_RE.sub("", resolved_media_text))
+    )
+    has_concrete_work = bool(_WORK_SIGNAL_RE.search(visible_text)) or has_resolved_media_work
     if _RELATION_ONLY_RE.search(visible_text) and not has_concrete_work:
         return False
     return bool(
@@ -423,6 +455,84 @@ def _same_matter_topic(
     return similarity >= (0.42 if same_conversation else 0.58)
 
 
+def _action_topic(value: Any) -> str:
+    text = str(value or "").lower().replace("牧阳人", "牧羊人")
+    text = re.sub(
+        r"(?:请|需要|继续|后续|尽快|及时|今天|明天|本周|下周|完成|处理|"
+        r"跟进|推进|核对|复核|确认|提交|反馈|回复|安排|落实|做好)",
+        "",
+        text,
+    )
+    return re.sub(r"[\s·，。；：、/\\()（）《》\[\]【】_\-]+", "", text)
+
+
+def _same_action_topic(left: Any, right: Any) -> bool:
+    left_text = _action_topic(left)
+    right_text = _action_topic(right)
+    if len(left_text) < 3 or len(right_text) < 3:
+        return bool(left_text and left_text == right_text)
+    shorter, longer = sorted((left_text, right_text), key=len)
+    if shorter == longer or (len(shorter) >= 4 and shorter in longer):
+        return True
+    left_pairs = _topic_bigrams(left_text)
+    right_pairs = _topic_bigrams(right_text)
+    return bool(
+        left_pairs
+        and right_pairs
+        and 2 * len(left_pairs & right_pairs) / (len(left_pairs) + len(right_pairs))
+        >= 0.72
+    )
+
+
+def _matching_open_action(
+    connection: Any, matter_id: str, action: dict[str, Any]
+) -> dict[str, Any] | None:
+    rows = connection.execute(
+        "SELECT id, kind, title, detail FROM actions "
+        "WHERE matter_id = ? AND status = 'open' ORDER BY updated_at DESC, id",
+        (matter_id,),
+    ).fetchall()
+    title = str(action.get("title") or "").strip()
+    kind = str(action.get("kind") or "task")
+    for raw_row in rows:
+        row = dict(raw_row)
+        if row["kind"] != kind and {row["kind"], kind} != {"task", "waiting"}:
+            continue
+        if _same_action_topic(row["title"], title):
+            return row
+    return None
+
+
+def _record_source_event(
+    connection: Any,
+    *,
+    matter_id: str,
+    event_type: str,
+    actor: str,
+    object_type: str,
+    object_id: str,
+    summary: str,
+    payload: dict[str, Any],
+    now: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO matter_events "
+        "(id, matter_id, event_type, actor, object_type, object_id, summary, payload_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            _id("event"),
+            matter_id,
+            event_type,
+            actor,
+            object_type,
+            object_id,
+            str(summary or "")[:500],
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            now,
+        ),
+    )
+
+
 def _merged_extracted(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     left = _json(target.get("extracted_json"), {})
     right = _json(source.get("extracted_json"), {})
@@ -435,6 +545,13 @@ def _merged_extracted(target: dict[str, Any], source: dict[str, Any]) -> dict[st
     merged["approval"] = "；".join(
         _unique([left.get("approval") or "", right.get("approval") or ""], 4)
     )[:300]
+    merged["media_evidence"] = _unique(
+        [
+            *(left.get("media_evidence") or []),
+            *(right.get("media_evidence") or []),
+        ],
+        20,
+    )
     merged["source_material_ids"] = _unique(
         [
             target["material_id"],
@@ -545,11 +662,6 @@ class WechatService:
         if not released:
             return {"ignored": 0, "merged": 0, "continued": 0}
         released_at = str(released["created_at"])
-        cutoff = (
-            (datetime.now(UTC) - timedelta(days=7))
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
         ignored = 0
         merged = 0
         keeper_ids: list[str] = []
@@ -557,13 +669,17 @@ class WechatService:
             rows = connection.execute(
                 "SELECT x.*, m.text_note FROM wechat_candidates x "
                 "JOIN materials m ON m.id = x.material_id "
-                "WHERE x.status = 'pending' AND x.updated_at >= ? "
+                "WHERE x.status = 'pending' "
                 "ORDER BY x.session_id, x.created_at, x.id",
-                (released_at,),
             ).fetchall()
-            keepers: list[dict[str, Any]] = []
+            keepers: list[dict[str, Any]] = [
+                dict(row) for row in rows if str(row["updated_at"]) < released_at
+            ]
+            touched_ids: set[str] = set()
             for raw_row in rows:
                 row = dict(raw_row)
+                if str(row["updated_at"]) < released_at:
+                    continue
                 result = {
                     "classification": row.get("classification"),
                     "summary": row.get("summary"),
@@ -572,7 +688,7 @@ class WechatService:
                     "evidence": _json(row.get("evidence_json"), []),
                     "extracted": _json(row.get("extracted_json"), {}),
                 }
-                if row["window_end"] < cutoff or not review_worthy_wechat_result(
+                if not review_worthy_wechat_result(
                     result, str(row.get("text_note") or "")
                 ):
                     connection.execute(
@@ -617,10 +733,12 @@ class WechatService:
                         "SELECT * FROM wechat_candidates WHERE id = ?", (keeper["id"],)
                     ).fetchone()
                     keepers[keepers.index(keeper)] = dict(updated)
+                    touched_ids.add(str(keeper["id"]))
                     merged += 1
                 else:
                     keepers.append(row)
-            keeper_ids = [str(row["id"]) for row in keepers]
+                    touched_ids.add(str(row["id"]))
+            keeper_ids = list(touched_ids)
         continued = 0
         for candidate_id in keeper_ids:
             candidate = self.database.fetch_one(
@@ -990,6 +1108,13 @@ class WechatService:
 
     def ingest_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         messages = sorted(payload["messages"], key=_cursor)
+        retry_messages = [
+            message for message in messages if _media_retry_pending(message)
+        ]
+        retry_cursor_message = retry_messages[0] if retry_messages else None
+        processable_messages = [
+            message for message in messages if not _media_retry_pending(message)
+        ]
         now = utc_now()
         source = str(payload.get("source") or "personal_wechat")
         if source not in _CHAT_SOURCES:
@@ -1045,7 +1170,7 @@ class WechatService:
             listen_from = conversation["listen_from"]
             fresh: list[dict[str, Any]] = []
             fresh_keys: set[tuple[int, int, int]] = set()
-            for message in messages:
+            for message in processable_messages:
                 if (
                     listen_from
                     and _iso_from_epoch(
@@ -1070,10 +1195,13 @@ class WechatService:
                     connection,
                     payload["account_fingerprint"],
                     session_id,
-                    messages[-1],
+                    retry_cursor_message or messages[-1],
                     source,
                 )
-                return {"created": False, "reason": "duplicate"}
+                return {
+                    "created": False,
+                    "reason": "retry_pending" if retry_cursor_message else "duplicate",
+                }
 
             first_cursor = _cursor(fresh[0])
             last_cursor = _cursor(fresh[-1])
@@ -1188,7 +1316,7 @@ class WechatService:
                 connection,
                 payload["account_fingerprint"],
                 session_id,
-                messages[-1],
+                retry_cursor_message or messages[-1],
                 source,
             )
         return {
@@ -1276,8 +1404,22 @@ class WechatService:
             )
             or {}
         )
+        extracted = (
+            dict(result.get("extracted"))
+            if isinstance(result.get("extracted"), dict)
+            else {}
+        )
+        media_evidence = [
+            item
+            for item in (result.get("media_evidence") or [])
+            if isinstance(item, dict) and item.get("status") == "model_processed"
+        ]
+        if media_evidence:
+            extracted["media_evidence"] = media_evidence
+        result = {**result, "extracted": extracted}
         if not review_worthy_wechat_result(
-            result, str(material.get("text_note") or "")
+            result,
+            str(material.get("text_note") or ""),
         ):
             classification = "irrelevant"
         candidate_status = "ignored" if classification == "irrelevant" else "pending"
@@ -1433,7 +1575,8 @@ class WechatService:
             "SELECT m.id AS matter_id, m.title AS matter_title, '' AS session_id, "
             "m.title || ' ' || m.summary || ' ' || "
             "COALESCE(GROUP_CONCAT(CASE WHEN a.status = 'open' THEN a.title END, ' '), '') "
-            "AS summary FROM matters m LEFT JOIN actions a ON a.matter_id = m.id WHERE ("
+            "AS summary FROM matters m LEFT JOIN actions a ON a.matter_id = m.id "
+            "WHERE m.status = 'active' AND ("
             "EXISTS (SELECT 1 FROM actions a WHERE a.matter_id = m.id AND a.status = 'open') OR "
             "EXISTS (SELECT 1 FROM review_items r WHERE r.matter_id = m.id AND r.status = 'pending') OR "
             "EXISTS (SELECT 1 FROM reminders x WHERE x.matter_id = m.id "
@@ -1466,6 +1609,7 @@ class WechatService:
         )
         if not candidate:
             raise KeyError("微信线索不存在")
+        previous_matter_id = candidate.get("matter_id")
         now = utc_now()
         audit_action = {
             "ignore": "wechat.candidate.ignored",
@@ -1510,18 +1654,33 @@ class WechatService:
                     "WHERE action_id IN (SELECT id FROM actions WHERE created_by = ?)",
                     (now, f"wechat_candidate:{candidate_id}"),
                 )
+                if previous_matter_id:
+                    _record_source_event(
+                        connection,
+                        matter_id=str(previous_matter_id),
+                        event_type="source.follow_up.undone",
+                        actor=actor,
+                        object_type="wechat_candidate",
+                        object_id=candidate_id,
+                        summary="已撤销这条聊天进展的自动归并",
+                        payload={"material_id": candidate.get("material_id")},
+                        now=now,
+                    )
         else:
             extracted = _json(candidate.get("extracted_json"), {})
             if action == "merge" and not matter_id:
                 raise ValueError("请选择要合并的事项")
             if action == "accept" and not matter_id:
                 matter_id = self._find_open_matter(candidate)
+            existing_matter = bool(matter_id)
             if matter_id:
                 matter = self.database.fetch_one(
                     "SELECT * FROM matters WHERE id = ?", (matter_id,)
                 )
                 if not matter:
                     raise KeyError("要合并的事项不存在")
+                if matter.get("status") != "active":
+                    raise ValueError("已完成或已结束的事项不能继续合并")
             else:
                 matter_id = _id("matter")
                 title = str(
@@ -1549,6 +1708,8 @@ class WechatService:
                 connection.execute(
                     "UPDATE matters SET updated_at = ? WHERE id = ?", (now, matter_id)
                 )
+                continued_actions: list[str] = []
+                created_actions: list[str] = []
                 for item in (extracted.get("actions") or [])[:20]:
                     if (
                         not isinstance(item, dict)
@@ -1564,6 +1725,12 @@ class WechatService:
                         "waiting",
                     }:
                         kind = "task"
+                    existing_action = _matching_open_action(
+                        connection, matter_id, {**item, "kind": kind}
+                    )
+                    if existing_action:
+                        continued_actions.append(str(existing_action["id"]))
+                        continue
                     action_id = _id("action")
                     connection.execute(
                         "INSERT INTO actions "
@@ -1590,6 +1757,26 @@ class WechatService:
                         normalize_suggestions(item),
                         now,
                     )
+                    created_actions.append(action_id)
+
+                _record_source_event(
+                    connection,
+                    matter_id=matter_id,
+                    event_type="source.follow_up" if existing_matter else "source.received",
+                    actor=actor,
+                    object_type="wechat_candidate",
+                    object_id=candidate_id,
+                    summary=str(candidate.get("summary") or "收到新的聊天进展"),
+                    payload={
+                        "source": candidate.get("source"),
+                        "material_id": candidate.get("material_id"),
+                        "evidence": _json(candidate.get("evidence_json"), [])[:4],
+                        "continued_action_ids": continued_actions,
+                        "created_action_ids": created_actions,
+                        "automatic": actor == "jarvis-batch",
+                    },
+                    now=now,
+                )
 
                 prefill_matter_contact(
                     connection,
@@ -1608,8 +1795,8 @@ class WechatService:
             audit_action,
             "wechat_candidate",
             candidate_id,
-            matter_id,
-            {"action": action},
+            matter_id or previous_matter_id,
+            {"action": action, "automatic": actor == "jarvis-batch"},
         )
         resolved = self.database.fetch_one(
             "SELECT * FROM wechat_candidates WHERE id = ?", (candidate_id,)

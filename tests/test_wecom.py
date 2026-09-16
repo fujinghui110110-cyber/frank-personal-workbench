@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,6 +9,64 @@ from pathlib import Path
 import pytest
 
 from scripts import wecom_crypto, wecom_sync
+
+
+def test_saved_key_is_revalidated_locally_after_wecom_upgrade(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "account-1" / "Data"
+    dataset.mkdir(parents=True)
+    vault = tmp_path / "vault"
+    private = vault / "private"
+    private.mkdir(parents=True)
+    key = bytes(range(16))
+    key_path = private / f"key-{hashlib.sha256('account-1'.encode()).hexdigest()[:16]}.json"
+    key_path.write_text(
+        json.dumps({"version": 1, "app_build": "99905", "key": key.hex()}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wecom_crypto, "VAULT_ROOT", vault)
+    monkeypatch.setattr(wecom_crypto, "app_version", lambda: ("5.0.10", "99949"))
+    monkeypatch.setattr(
+        wecom_crypto,
+        "validates_key",
+        lambda candidate, candidate_dataset: candidate == key and candidate_dataset == dataset,
+    )
+
+    assert wecom_crypto.load_key(dataset) == key
+    refreshed = json.loads(key_path.read_text(encoding="utf-8"))
+    assert refreshed["app_build"] == "99949"
+
+
+def test_failed_upgrade_validation_does_not_capture_or_scan_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "account-1" / "Data"
+    dataset.mkdir(parents=True)
+    vault = tmp_path / "vault"
+    private = vault / "private"
+    private.mkdir(parents=True)
+    key = bytes(range(16))
+    key_path = private / f"key-{hashlib.sha256('account-1'.encode()).hexdigest()[:16]}.json"
+    key_path.write_text(
+        json.dumps({"version": 1, "app_build": "99905", "key": key.hex()}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wecom_crypto, "VAULT_ROOT", vault)
+    monkeypatch.setattr(wecom_crypto, "app_version", lambda: ("5.0.10", "99949"))
+    monkeypatch.setattr(wecom_crypto, "validates_key", lambda *_: False)
+    capture_called = False
+
+    def forbidden_capture(*_args, **_kwargs):
+        nonlocal capture_called
+        capture_called = True
+        raise AssertionError("不应自动操作企业微信进程")
+
+    monkeypatch.setattr(wecom_crypto, "capture_key", forbidden_capture)
+
+    with pytest.raises(RuntimeError, match="工作台没有操作企业微信进程"):
+        wecom_crypto.load_key(dataset)
+    assert capture_called is False
 
 
 def _protobuf_text(value: str) -> bytes:

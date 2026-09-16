@@ -25,12 +25,45 @@ class MatterUpdateRequest(BaseModel):
     summary: str | None = Field(default=None, max_length=4000)
     contact_name: str | None = Field(default=None, max_length=80)
     target_date: str | None = Field(default=None, max_length=10)
+    next_review_date: str | None = Field(default=None, max_length=10)
     status: Literal["active", "completed", "dismissed"] | None = None
 
 
 class MatterProgressRequest(BaseModel):
     summary: str = Field(min_length=1, max_length=200)
     detail: str = Field(default="", max_length=2000)
+    next_review_date: str | None = Field(default=None, max_length=10)
+
+
+class ContactIdentityRequest(BaseModel):
+    source: Literal["personal_wechat", "wecom", "email"]
+    stable_id: str = Field(min_length=1, max_length=300)
+    display_name: str = Field(min_length=1, max_length=160)
+    organization: str = Field(default="", max_length=200)
+    role: str = Field(default="", max_length=160)
+
+
+class CommitmentRequest(BaseModel):
+    source: Literal["personal_wechat", "wecom", "email", "meeting", "manual"]
+    source_ref: str = Field(min_length=1, max_length=300)
+    category: Literal[
+        "waiting_reply",
+        "my_commitment",
+        "their_commitment",
+        "waiting_approval",
+        "need_follow_up",
+    ]
+    summary: str = Field(min_length=1, max_length=500)
+    contact_id: str | None = Field(default=None, max_length=160)
+    matter_id: str | None = Field(default=None, max_length=160)
+    action_id: str | None = Field(default=None, max_length=160)
+    due_at: str | None = Field(default=None, max_length=80)
+    next_follow_up_at: str | None = Field(default=None, max_length=80)
+    evidence: list[str] = Field(default_factory=list, max_length=4)
+
+
+class CommitmentStatusRequest(BaseModel):
+    status: Literal["open", "done", "dismissed"]
 
 
 class JobClaimRequest(BaseModel):

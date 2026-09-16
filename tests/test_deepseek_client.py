@@ -60,6 +60,7 @@ def test_text_request_uses_flash_and_json_mode(monkeypatch) -> None:
 
 def test_image_request_uses_vision_model_and_base64(monkeypatch) -> None:
     captured = {}
+    media_evidence = []
 
     def fake_urlopen(request, timeout):
         captured["payload"] = json.loads(request.data)
@@ -71,6 +72,7 @@ def test_image_request_uses_vision_model_and_base64(monkeypatch) -> None:
         23,
         _schema(),
         image_bytes=b"\x89PNG\r\n\x1a\nexample",
+        media_evidence=media_evidence,
         api_key="secret-key",
     )
 
@@ -80,10 +82,18 @@ def test_image_request_uses_vision_model_and_base64(monkeypatch) -> None:
     assert payload["messages"][1]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
+    assert media_evidence == [
+        {
+            "source": "inline",
+            "media_type": "image/png",
+            "status": "model_processed",
+        }
+    ]
 
 
 def test_unsupported_file_is_not_sent_as_an_image(monkeypatch) -> None:
     captured = {}
+    media_evidence = []
 
     def fake_urlopen(request, timeout):
         captured["payload"] = json.loads(request.data)
@@ -95,10 +105,12 @@ def test_unsupported_file_is_not_sent_as_an_image(monkeypatch) -> None:
         23,
         _schema(),
         image_bytes=b"not-an-image",
+        media_evidence=media_evidence,
         api_key="secret-key",
     )
 
     assert captured["payload"]["model"] == TEXT_MODEL
+    assert media_evidence == []
 
 
 def test_invalid_key_error_never_contains_the_key(monkeypatch) -> None:

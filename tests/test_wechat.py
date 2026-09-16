@@ -752,6 +752,125 @@ def test_wechat_ingest_is_idempotent_and_validates_cursor(client: TestClient) ->
     )
 
 
+def test_failed_media_holds_cursor_while_later_text_is_saved_and_deduplicated(
+    client: TestClient,
+) -> None:
+    login(client)
+    base = int(datetime.now(UTC).timestamp()) - 3600
+    first = message(1, base, "合同付款文本先保存")
+    failed = message(2, base + 10 * 60, "") | {
+        "kind": "image",
+        "media": {
+            "type": "image",
+            "localPath": "/tmp/retry-image.png",
+            "extractionStatus": "failed",
+        },
+    }
+    later = message(3, base + 20 * 60, "预算差异继续核对")
+    payload = window_payload([first, failed, later], session_id="retry-session")
+
+    initial = client.post(
+        "/api/wechat/windows", json=payload, headers=worker_headers()
+    )
+
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["created"] is True
+    material = client.app.state.database.fetch_one(
+        "SELECT text_note FROM materials WHERE id = ?", (initial.json()["material_id"],)
+    )
+    assert "合同付款文本先保存" in material["text_note"]
+    assert "预算差异继续核对" in material["text_note"]
+    assert "retry-image" not in material["text_note"]
+    cursor = client.app.state.database.fetch_one(
+        "SELECT create_time, local_id FROM wechat_sync_state WHERE session_id = 'retry-session'"
+    )
+    assert cursor == {"create_time": base + 10 * 60, "local_id": 2}
+
+    repaired = {**failed, "media": {**failed["media"], "extractionStatus": "completed"}}
+    retry_payload = window_payload([first, repaired, later], session_id="retry-session")
+    retried = client.post(
+        "/api/wechat/windows", json=retry_payload, headers=worker_headers()
+    )
+    duplicate = client.post(
+        "/api/wechat/windows", json=retry_payload, headers=worker_headers()
+    )
+
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["created"] is True
+    assert duplicate.json() == {"created": False, "reason": "duplicate"}
+    seen = client.app.state.database.fetch_one(
+        "SELECT COUNT(*) AS count FROM wechat_seen_messages WHERE session_id = 'retry-session'"
+    )
+    assert seen == {"count": 3}
+    cursor = client.app.state.database.fetch_one(
+        "SELECT create_time, local_id FROM wechat_sync_state WHERE session_id = 'retry-session'"
+    )
+    assert cursor == {"create_time": base + 20 * 60, "local_id": 3}
+
+
+def test_successful_media_evidence_survives_storage_and_batch_review(
+    client: TestClient,
+) -> None:
+    login(client)
+    now = int(datetime.now(UTC).timestamp())
+    image_message = message(50, now, "") | {
+        "kind": "image",
+        "media": {
+            "type": "image",
+            "localPath": "/tmp/contract.png",
+            "extractionStatus": "completed",
+        },
+    }
+    created = client.post(
+        "/api/wechat/windows",
+        json=window_payload([image_message], session_id="media-evidence-session"),
+        headers=worker_headers(),
+    )
+    assert created.status_code == 200, created.text
+    _complete_next_wechat_job(
+        client,
+        {
+            "classification": "relevant",
+            "summary": "合同付款资料需要复核",
+            "confidence": 0.90,
+            "evidence": ["图片显示合同付款资料待复核"],
+            "extracted": {
+                "matter_title": "合同付款复核",
+                "actions": [{"kind": "task", "title": "复核合同付款资料"}],
+            },
+            "media_evidence": [
+                {
+                    "source": "/tmp/contract.png",
+                    "media_type": "image/png",
+                    "status": "model_processed",
+                }
+            ],
+        },
+    )
+
+    before = client.app.state.database.fetch_one(
+        "SELECT status, extracted_json FROM wechat_candidates WHERE id = ?",
+        (created.json()["candidate_id"],),
+    )
+    assert before["status"] == "pending"
+    assert (
+        json.loads(before["extracted_json"])["media_evidence"][0]["status"]
+        == "model_processed"
+    )
+
+    result = client.app.state.wechat.consolidate_pending_candidates()
+
+    assert result == {"ignored": 0, "merged": 0, "continued": 0}
+    after = client.app.state.database.fetch_one(
+        "SELECT status, extracted_json FROM wechat_candidates WHERE id = ?",
+        (created.json()["candidate_id"],),
+    )
+    assert after["status"] == "pending"
+    assert json.loads(after["extracted_json"])["media_evidence"] == json.loads(
+        before["extracted_json"]
+    )["media_evidence"]
+
+
 def test_conversations_list_active_by_latest_then_blocked(client: TestClient) -> None:
     login(client)
     base = int(datetime.now(UTC).timestamp())

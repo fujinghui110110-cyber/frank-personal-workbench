@@ -17,6 +17,9 @@ class Settings:
     mcp_token: str = "local-mcp-token"
     max_upload_bytes: int = 512 * 1024 * 1024
     lease_seconds: int = 300
+    email_attachment_staging_dir: Path = Path(
+        "~/Library/Application Support/FinanceWorkbench/email-attachments"
+    ).expanduser()
     policy_vault_dir: Path = Path(
         "/Users/frank/知识库/04-制度资料/公司最新规定"
     )
@@ -41,6 +44,12 @@ class Settings:
                 os.getenv("WORKBENCH_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024))
             ),
             lease_seconds=int(os.getenv("WORKBENCH_LEASE_SECONDS", "300")),
+            email_attachment_staging_dir=Path(
+                os.getenv(
+                    "WORKBENCH_EMAIL_ATTACHMENT_STAGING_DIR",
+                    "~/Library/Application Support/FinanceWorkbench/email-attachments",
+                )
+            ).expanduser(),
             policy_vault_dir=Path(
                 os.getenv(
                     "WORKBENCH_POLICY_VAULT_DIR",

@@ -5,7 +5,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from uuid import uuid4
 
 
@@ -13,6 +14,11 @@ class WorkbenchClient:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self._open = (
+            build_opener(ProxyHandler({})).open
+            if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}
+            else urlopen
+        )
 
     def request_json(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -24,7 +30,7 @@ class WorkbenchClient:
             headers["Content-Type"] = "application/json"
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=60) as response:
+            with self._open(request, timeout=60) as response:
                 content = response.read()
         except HTTPError as error:
             content = error.read()
@@ -42,7 +48,7 @@ class WorkbenchClient:
             method="GET",
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with self._open(request, timeout=120) as response:
                 return response.read()
         except HTTPError as error:
             raise RuntimeError(error.read().decode("utf-8", errors="replace")) from error
@@ -98,7 +104,7 @@ class WorkbenchClient:
             f"{self.base_url}/api/intake", data=body, headers=headers, method="POST"
         )
         try:
-            with urlopen(request, timeout=180) as response:
+            with self._open(request, timeout=180) as response:
                 content = response.read()
         except HTTPError as error:
             raise RuntimeError(error.read().decode("utf-8", errors="replace")) from error

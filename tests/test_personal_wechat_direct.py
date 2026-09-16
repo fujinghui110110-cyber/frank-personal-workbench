@@ -558,6 +558,27 @@ def test_failed_media_decode_never_creates_placeholder_task_text(
     assert result["media"]["extractionStatus"] == "failed"
 
 
+def test_readable_image_without_text_does_not_fail_the_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(personal_wechat_sync, "_ocr_image", lambda _path: "")
+
+    result = enrich_media(
+        [
+            {
+                "kind": "image",
+                "text": "",
+                "media": {"type": "image", "localPath": str(image)},
+            }
+        ]
+    )[0]
+
+    assert result["text"] == ""
+    assert result["media"]["extractionStatus"] == "completed"
+
+
 @pytest.mark.parametrize("signature", [b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"])
 def test_decrypts_wechat_4_image_with_manual_keys(
     tmp_path: Path, signature: bytes
@@ -591,7 +612,7 @@ def test_wxgf_conversion_passes_only_hevc_bitstream_to_ffmpeg(monkeypatch) -> No
     assert seen["input"] == b"\x00\x00\x00\x01hevc"
 
 
-def test_failed_media_stops_before_any_message_write(
+def test_failed_media_is_sent_as_a_retry_barrier_without_aborting_sync(
     tmp_path: Path, monkeypatch
 ) -> None:
     dataset = WechatDataset("account", tmp_path / "account/db_storage", ())
@@ -605,6 +626,7 @@ def test_failed_media_stops_before_any_message_write(
     class Client:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+            self.payloads: list[dict] = []
 
         def request_json(self, method: str, path: str, payload=None):
             self.calls.append((method, path))
@@ -613,7 +635,10 @@ def test_failed_media_stops_before_any_message_write(
                 "/api/wechat/conversations?source=personal_wechat",
             ):
                 return []
-            raise AssertionError("媒体读取失败时不应写入工作台")
+            if (method, path) == ("POST", "/api/wechat/windows"):
+                self.payloads.append(payload)
+                return {"created": False, "reason": "retry_pending"}
+            raise AssertionError((method, path))
 
     client = Client()
     monkeypatch.setenv("PERSONAL_WECHAT_DIRECT_ENABLED_AT", "2026-09-01T00:00:00+08:00")
@@ -642,9 +667,46 @@ def test_failed_media_stops_before_any_message_write(
         },
     )
 
-    with pytest.raises(RuntimeError, match="将在下次检查时重试"):
-        personal_wechat_sync.run_direct_wechat_sync(client)
-    assert client.calls == [("GET", "/api/wechat/conversations?source=personal_wechat")]
+    result = personal_wechat_sync.run_direct_wechat_sync(client)
+
+    assert result == {"messages": 1, "windows": 0, "skipped": 0}
+    assert client.payloads[0]["messages"][0]["media"]["extractionStatus"] == "failed"
+
+
+def test_retry_barrier_survives_forty_source_windows_without_message_duplication() -> None:
+    messages = [
+        {
+            "timestamp": 1_800_000_000 + index,
+            "timestampMs": (1_800_000_000 + index) * 1000,
+            "cursor": {
+                "sortSeq": index,
+                "createTime": 1_800_000_000 + index,
+                "localId": index,
+            },
+            "kind": "text",
+            "text": f"消息 {index}",
+        }
+        for index in range(1, 8_001)
+    ]
+    messages[99]["kind"] = "image"
+    messages[99]["media"] = {
+        "type": "image",
+        "localPath": "/missing/image.dat",
+        "extractionStatus": "failed",
+    }
+
+    windows = personal_wechat_sync._retry_safe_windows(messages)
+
+    assert len(windows) == 41
+    assert all(len(window) <= 200 for window in windows)
+    assert all(messages[99] in window for window in windows[1:])
+    delivered = [
+        item["cursor"]["localId"]
+        for window in windows
+        for item in window
+        if item is not messages[99]
+    ]
+    assert delivered == [index for index in range(1, 8_001) if index != 100]
 
 
 def test_direct_failure_happens_before_any_message_write(
